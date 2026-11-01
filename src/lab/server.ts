@@ -138,6 +138,14 @@ export interface FixtureOptions {
     authenticatedStatus?: number;
     /** Drop the connection on every request with a valid token. */
     hangUpAuthenticated?: boolean;
+    /** Assign an Mcp-Session-Id on initialize (default true). */
+    sessions?: boolean;
+    /** Accept a request that carries a known session ID but no token. */
+    sessionWithoutToken?: boolean;
+    /** Accept the token as ?access_token= in the URL. */
+    acceptQueryToken?: boolean;
+    /** CORS policy for foreign origins (default none). */
+    cors?: "none" | "reflect" | "reflect-credentials" | "wildcard";
   };
 }
 
@@ -217,7 +225,8 @@ export async function startFixture(options: FixtureOptions = {}): Promise<Fixtur
   let authzRequests = 0;
   const authz: Required<Omit<AuthorizationBehaviour, "rateLimitAfter">> & { rateLimitAfter?: number } = { match: "exact", noSession: "login", registration: "strict", management: true, issInResponse: true, ...options.authorization };
   const codes = new Map<string, { clientId: string; redirectUri: string; challenge: string; used: boolean; family?: string }>();
-  const mcpOpts = { checkAudience: true, validateOrigin: true, ...options.mcp };
+  const mcpOpts = { checkAudience: true, validateOrigin: true, sessions: true, cors: "none", ...options.mcp };
+  const mcpSessions = new Set<string>();
   /** access token -> { audience, family } */
   const accessTokens = new Map<string, { audience: string; family: string }>();
   const clients = new Map<string, { redirectUris: string[]; managementToken: string }>();
@@ -581,8 +590,22 @@ ${formTag}${hidden}${token}${challenge}${checkbox}
     {
       if (path === "/mcp") {
         const origin = req.headers.origin;
+        const cors: Record<string, string> = {};
+        if (origin !== undefined && mcpOpts.cors !== "none") {
+          cors["access-control-allow-origin"] = mcpOpts.cors === "wildcard" ? "*" : origin;
+          if (mcpOpts.cors === "reflect-credentials") cors["access-control-allow-credentials"] = "true";
+        }
+        if (req.method === "OPTIONS") {
+          res.writeHead(204, { ...cors, ...(mcpOpts.cors !== "none" ? { "access-control-allow-methods": "POST, GET, DELETE", "access-control-allow-headers": "authorization, content-type, mcp-session-id, mcp-protocol-version" } : {}) });
+          res.end();
+          return;
+        }
+        for (const [k, v] of Object.entries(cors)) res.setHeader(k, v);
         if (mcpOpts.validateOrigin && origin !== undefined && origin !== base) return json(res, 403, { error: "forbidden_origin" });
-        const bearer = /^Bearer\s+(\S+)$/i.exec(req.headers.authorization ?? "")?.[1];
+        const query = new URL(req.url ?? "/", base).searchParams.get("access_token");
+        const bearer = /^Bearer\s+(\S+)$/i.exec(req.headers.authorization ?? "")?.[1] ?? (mcpOpts.acceptQueryToken && query ? query : undefined);
+        const sessionId = req.headers["mcp-session-id"];
+        const knownSession = typeof sessionId === "string" && mcpSessions.has(sessionId);
         const at = bearer ? accessTokens.get(bearer) : undefined;
         const tokenOk = at !== undefined && !revokedFamilies.has(at.family) && (!mcpOpts.checkAudience || at.audience === `${base}/mcp`);
         if (tokenOk && mcpOpts.hangUpAuthenticated) {
@@ -591,8 +614,27 @@ ${formTag}${hidden}${token}${challenge}${checkbox}
         }
         if (tokenOk && mcpOpts.authenticatedStatus !== undefined) return json(res, mcpOpts.authenticatedStatus, { error: "unavailable" });
         if (bearer && !tokenOk && mcpOpts.invalidTokenStatus !== undefined) return json(res, mcpOpts.invalidTokenStatus, { error: "invalid_token" });
-        if (opts.anonymous || tokenOk) {
-          return json(res, 200, { jsonrpc: "2.0", id: 1, result: { protocolVersion: "2025-11-25", capabilities: {}, serverInfo: { name: "fixture", version: "0" } } });
+        if (req.method === "DELETE") {
+          if (tokenOk && typeof sessionId === "string") mcpSessions.delete(sessionId);
+          res.writeHead(tokenOk ? 204 : 401);
+          res.end();
+          return;
+        }
+        if (opts.anonymous || tokenOk || (mcpOpts.sessionWithoutToken && knownSession)) {
+          const extra: Record<string, string> = {};
+          let rpc: { method?: string } = {};
+          try {
+            rpc = JSON.parse(body) as { method?: string };
+          } catch {
+            /* not JSON-RPC */
+          }
+          if (mcpOpts.sessions && rpc.method === "initialize") {
+            const sid = randomBytes(16).toString("hex");
+            mcpSessions.add(sid);
+            extra["mcp-session-id"] = sid;
+          }
+          if (typeof sessionId === "string" && !knownSession && mcpOpts.sessions) return json(res, 404, { error: "session_not_found" });
+          return json(res, 200, { jsonrpc: "2.0", id: 1, result: rpc.method === "initialize" ? { protocolVersion: "2025-11-25", capabilities: {}, serverInfo: { name: "fixture", version: "0" } } : {} }, extra);
         }
         const headers: Record<string, string> = opts.challenge
           ? { "www-authenticate": `Bearer resource_metadata="${base}/.well-known/oauth-protected-resource/mcp", scope="mcp"` }

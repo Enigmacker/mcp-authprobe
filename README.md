@@ -40,7 +40,7 @@ Passive scanners read what a remote [Model Context Protocol](https://modelcontex
 Besides its own test suite and lab, mcp-authprobe was run against real authorization stacks before each release:
 
 - **node-oidc-provider** (an OpenID Certified authorization server) with dynamic registration, resource indicators and JWT access tokens, in front of an MCP server built with the official TypeScript SDK that validates the token audience and the `Origin` header. Every check that can be judged from outside passed; `MAP-THR01` failed, as expected, since that provider leaves rate limiting to the deployment; and its consent page, protected by a per-flow identifier instead of an anti-CSRF field, is reported as inconclusive with the reason.
-- **The MCP TypeScript SDK's OAuth example server**, a demonstration that is not meant for production. The results matched its code: `redirect_uri` not bound to the code, no `Origin` validation, unsafe redirect URIs accepted at registration, no refresh tokens, and crashes reported as inconclusive rather than passes.
+- **The MCP TypeScript SDK's OAuth example server**, a demonstration that is not meant for production. The results matched its code: `redirect_uri` not bound to the code, no `Origin` validation, unsafe redirect URIs accepted at registration, no refresh tokens, and crashes reported as inconclusive rather than passes. Its sessions correctly require the token on every request (`MAP-SES01` passes).
 
 These runs led to several fixes: results kept when a server issues no refresh token or crashes during login, a throttling check that copes with a broken refresh grant, and the per-flow identifier analysis above.
 
@@ -98,7 +98,7 @@ Log in with the account `test` / `test` and click **Allow**.
 
 | Profile | What you should see |
 | --- | --- |
-| `vulnerable` (default) | Refresh token replay accepted, unsafe redirect URIs registered, PKCE not enforced, token audience ignored, foreign `Origin` accepted, no throttling, consent page without CSRF protection. `MAP-RDR02` is reported as **inconclusive**: this server sends unknown visitors to its login page before looking at `redirect_uri`, which cannot be told apart from outside, and the scanner never turns that into a pass. |
+| `vulnerable` (default) | Refresh token replay accepted, unsafe redirect URIs registered, PKCE not enforced, token audience ignored, foreign `Origin` accepted, token accepted in the URL, session ID accepted without a token, CORS open to any origin with credentials, no throttling, consent page without CSRF protection. `MAP-RDR02` is reported as **inconclusive**: this server sends unknown visitors to its login page before looking at `redirect_uri`, which cannot be told apart from outside, and the scanner never turns that into a pass. |
 | `secure` | Every check passes (or is not applicable); `MAP-CSR01` runs with `consent-check`. |
 
 The lab only listens on `127.0.0.1` or `::1` (`--host`, `--port`, default 8787; names such as `localhost` are refused so that no resolver can move it elsewhere), keeps everything in memory, and stops with Ctrl-C. Its access tokens are unsigned JWTs, so `MAP-AUD01` can read their audience. It is vulnerable on purpose: never expose it.
@@ -212,7 +212,7 @@ mcp-authprobe login https://mcp.example.com/mcp --out ./test-grant.json
 - `login` itself does not require an ownership proof: it only does what any MCP client does when you connect it (one registration, your own browser login, one code exchange). Only the extra login checks below require the proof.
 - If login fails, the client it registered is deleted when the server allows it.
 
-**Five checks are observed during login**, because they need a fresh authorization code or a valid access token. They run only when ownership of every contacted host is proven (`--no-probe` skips them), in this order:
+**Seven checks are observed during login**, because they need a fresh authorization code or a valid access token. They run only when ownership of every contacted host is proven (`--no-probe` skips them), in this order:
 
 | Check | What `login` does | Fails when |
 | --- | --- | --- |
@@ -220,6 +220,8 @@ mcp-authprobe login https://mcp.example.com/mcp --out ./test-grant.json
 | `MAP-RDR03` | Presents the code with a **different** `redirect_uri` | The token endpoint issues tokens |
 | *(exchange)* | Exchanges the code normally | |
 | `MAP-ORG01` | Sends `initialize` with its access token (control, must succeed), then the same request with `Origin: https://attacker.mcp-authprobe.invalid`, then the control again | The foreign request is processed like any other. Passes on 403 only if the token still works afterwards |
+| `MAP-TOK01` | Sends `initialize` with the token as `?access_token=` and no `Authorization` header, then the control again | The token in the URL is accepted (the MCP specification forbids it: URLs end up in logs, history and `Referer` headers). The token never appears in the report |
+| `MAP-SES01` | Opens an MCP session with its token, sends `ping` with the session ID and the token (control), then with the session ID only, and ends the session | The request without a token is processed. Not applicable to stateless servers that assign no session ID |
 | `MAP-AUD01` | Uses the refresh token to request a token for `https://other.mcp-authprobe.invalid/mcp` and presents it to your MCP endpoint (only after a successful control) | The MCP endpoint accepts a token whose audience is the other resource (read from a JWT `aud`). Passes when the authorization server answers `invalid_target`, or the MCP endpoint answers 401/403. When the token is opaque, or the authorization server ignored `resource` and issued a token for your server, the result is inconclusive with an explanation, because the MCP server cannot be blamed |
 | `MAP-COD01` | Presents the already used code a second time, then tries the newest refresh token once | The code is exchanged again. Revoking the tokens issued from a reused code (`invalid_grant` on that refresh) is reported as recommended; any other answer leaves revocation unknown |
 
@@ -355,10 +357,13 @@ The server is built so that the assistant, or a prompt injection reaching it, ca
 | `MAP-COD01` | active | available (via `login`) | An authorization code cannot be used twice |
 | `MAP-AUD01` | active | available (via `login`) | Tokens are bound to their audience (RFC 8707) |
 | `MAP-ORG01` | passive | available | MCP endpoint rejects requests from a foreign `Origin` |
+| `MAP-TOK01` | active | available (via `login`) | MCP endpoint refuses access tokens in the URL |
+| `MAP-SES01` | active | available (via `login`) | An MCP session ID is not accepted instead of a token |
+| `MAP-COR01` | passive | available | MCP endpoint does not allow credentialed requests from any origin (CORS) |
 
-Families: **DSC** discovery, **RTK** refresh tokens, **RDR** redirect URIs, **THR** throttling, **CSR** consent CSRF, **PKC** PKCE, **COD** authorization codes, **AUD** token audience, **ORG** Origin validation.
+Families: **DSC** discovery, **RTK** refresh tokens, **RDR** redirect URIs, **THR** throttling, **CSR** consent CSRF, **PKC** PKCE, **COD** authorization codes, **AUD** token audience, **ORG** Origin validation, **TOK** token transport, **SES** sessions, **COR** CORS.
 
-`MAP-ORG01` runs in every scan without an ownership proof: it sends two ordinary `initialize` requests, one with a foreign `Origin`. Most servers ask for a token before looking at `Origin`; the scan then reports it as inconclusive, and `login` observes it with a valid token.
+`MAP-ORG01` runs in every scan without an ownership proof: it sends two ordinary `initialize` requests, one with a foreign `Origin`. Most servers ask for a token before looking at `Origin`; the scan then reports it as inconclusive, and `login` observes it with a valid token. `MAP-COR01` also runs in every scan: a CORS preflight and an ordinary request with a foreign `Origin`; it fails only when that origin is reflected together with `Access-Control-Allow-Credentials: true`.
 
 ### Choosing checks
 
@@ -409,7 +414,7 @@ jobs:
   scan:
     runs-on: ubuntu-latest
     steps:
-      - uses: Enigmacker/mcp-authprobe@v0.5.0
+      - uses: Enigmacker/mcp-authprobe@v0.6.0
         with:
           url: https://staging.example.com/mcp
           secret: ${{ secrets.MCP_AUTHPROBE_SECRET }}
@@ -422,7 +427,7 @@ The results table is added to the job summary. The step fails when a check fails
 | Input | Default | Meaning |
 | --- | --- | --- |
 | `url` | (required) | MCP endpoint to scan |
-| `secret` | | Ownership secret, from a repository secret. Without it, only discovery and `MAP-ORG01` run |
+| `secret` | | Ownership secret, from a repository secret. Without it, only discovery, `MAP-ORG01` and `MAP-COR01` run |
 | `fail-on` | `high` | Fail on a failing check at or above this severity |
 | `fail-on-inconclusive` | `false` | Also fail when a check is inconclusive (otherwise a warning). An unreachable target always fails |
 | `only` / `skip` | | Same as `--only` / `--skip` |
@@ -430,7 +435,7 @@ The results table is added to the job summary. The step fails when a check fails
 | `upload-sarif` | `false` | Upload the SARIF report to code scanning (needs `security-events: write`) |
 | `allow-private` | `false` | For a lab started in the same job only |
 | `node-version` | `22` | Node.js used to run the scanner |
-| `package` | this release | npm package spec to run, e.g. `mcp-authprobe@0.5.0` |
+| `package` | this release | npm package spec to run, e.g. `mcp-authprobe@0.6.0` |
 
 Outputs: `exit-code`, `failed` (number of failing checks), `json-file`, `sarif-file`, `markdown-file`.
 
@@ -488,6 +493,9 @@ The scanner talks to servers that may be hostile, and it may be driven by an AI 
 
 **0.5.0**
 - ~~Field trial against node-oidc-provider and the MCP SDK's OAuth example, with the fixes it led to~~ done.
+
+**0.6.0**
+- ~~Token in the URL (TOK01), session ID without a token (SES01), CORS with credentials (COR01)~~ done.
 
 **Next**
 - Optional integration with mcp-posture: run it alongside, or import its JSON report, and merge both into one report where active results confirm or refute what the metadata announces.

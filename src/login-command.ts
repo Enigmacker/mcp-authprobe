@@ -35,7 +35,7 @@ export async function runLoginCommand(o: LoginCommandOptions): Promise<number> {
       const results = [];
       for (const host of hostsToVerify(o.mcpUrl, discovery)) results.push(await verifyOwnership(host, o.secret, { http }));
       probe = results.every((r) => r.verified);
-      if (!probe) err("Ownership not proven for every host: the login checks (MAP-PKC01, MAP-RDR03, MAP-COD01, MAP-AUD01, MAP-ORG01) will not be observed.");
+      if (!probe) err("Ownership not proven for every host: the login checks (MAP-PKC01, MAP-RDR03, MAP-COD01, MAP-AUD01, MAP-ORG01, MAP-TOK01, MAP-SES01) will not be observed.");
     }
 
     const result = await login({

@@ -15,7 +15,7 @@ export interface HttpOptions {
 
 export interface HttpRequest {
   url: string;
-  method?: "GET" | "POST" | "DELETE";
+  method?: "GET" | "POST" | "DELETE" | "OPTIONS";
   headers?: Record<string, string>;
   body?: string;
   /** Redirects are never followed automatically; callers inspect them. */

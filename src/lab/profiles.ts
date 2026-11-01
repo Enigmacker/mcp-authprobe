@@ -12,7 +12,7 @@ export const LAB_PROFILES = {
       tokens: { rotate: true, rejectReplay: false, bindRedirect: false, pkce: "optional", codeReuse: "allow" },
       authorization: { match: "prefix", registration: "lax" },
       consent: { csrf: "none", sameSite: "unset" },
-      mcp: { checkAudience: false, validateOrigin: false },
+      mcp: { checkAudience: false, validateOrigin: false, acceptQueryToken: true, sessionWithoutToken: true, cors: "reflect-credentials" },
     },
   },
   secure: {

@@ -183,6 +183,42 @@ export const CATALOGUE: readonly CheckDefinition[] = [
     references: [{ title: "MCP specification - Transports (Streamable HTTP, security warning)", url: "https://modelcontextprotocol.io/specification/2025-11-25/basic/transports" }, MCP_SEC],
   },
   {
+    id: "MAP-TOK01",
+    family: "TOK",
+    title: "MCP endpoint refuses access tokens in the URL",
+    severity: "medium",
+    active: true,
+    availability: "available",
+    rationale:
+      "The MCP specification forbids access tokens in the URI query string: URLs end up in server and proxy logs, browser history and Referer headers. Observed during login: an initialize request carries the token as ?access_token= without an Authorization header, and must be refused.",
+    remediation: "Accept access tokens only in the Authorization header (Bearer), and refuse requests that carry an access_token query parameter.",
+    references: [MCP_AUTH, OAUTH21, { title: "RFC 6750 - Bearer Token Usage, section 2.3", url: "https://www.rfc-editor.org/rfc/rfc6750#section-2.3" }],
+  },
+  {
+    id: "MAP-SES01",
+    family: "SES",
+    title: "An MCP session ID is not accepted instead of a token",
+    severity: "high",
+    active: true,
+    availability: "available",
+    rationale:
+      "The MCP specification requires the Authorization header on every request, even within the same session, and its security best practices forbid using sessions for authentication. Observed during login: a session is opened with a valid token, then a request that carries only the Mcp-Session-Id must be refused with 401. Not applicable to stateless servers that assign no session ID.",
+    remediation: "Authenticate every request with its access token; treat Mcp-Session-Id as a routing identifier only, and bind sessions to the user they were created for.",
+    references: [MCP_AUTH, MCP_SEC],
+  },
+  {
+    id: "MAP-COR01",
+    family: "COR",
+    title: "MCP endpoint does not allow credentialed requests from any origin",
+    severity: "medium",
+    active: false,
+    availability: "available",
+    rationale:
+      "If the MCP endpoint answers a foreign Origin with Access-Control-Allow-Origin set to that origin and Access-Control-Allow-Credentials: true, any website can make a logged-in user's browser call it with their cookies and read the answers. A CORS preflight and an ordinary request are sent with a foreign Origin and the CORS headers are read.",
+    remediation: "Do not reflect arbitrary origins. Allow only the origins you serve, and never combine a broad origin policy with Access-Control-Allow-Credentials: true.",
+    references: [MCP_SEC, { title: "Fetch Standard - CORS protocol", url: "https://fetch.spec.whatwg.org/#http-cors-protocol" }],
+  },
+  {
     id: "MAP-THR01",
     family: "THR",
     title: "Repeated failed token requests are throttled",

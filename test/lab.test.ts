@@ -99,6 +99,9 @@ describe("lab", () => {
       "MAP-PKC01": "fail",
       "MAP-AUD01": "fail",
       "MAP-ORG01": "fail",
+      "MAP-TOK01": "fail",
+      "MAP-SES01": "fail",
+      "MAP-COR01": "fail",
       "MAP-THR01": "fail",
     });
   });

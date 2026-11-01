@@ -30,7 +30,7 @@ export interface ScanOptions {
   loopbackExempt?: boolean;
   /** Failed token requests sent by MAP-THR01 (clamped to 5-20, default 10). */
   throttleAttempts?: number;
-  /** Results observed during `login` (PKC01, RDR03, COD01, AUD01, ORG01), read from the grant file. */
+  /** Results observed during `login` (PKC01, RDR03, COD01, AUD01, ORG01, TOK01, SES01), read from the grant file. */
   observations?: Observation[];
   /** Test hooks. */
   resolveTxtRecords?: VerifyOptions["resolveTxtRecords"];
@@ -168,6 +168,52 @@ function notSelected(checkId: string, target: string): Finding {
 }
 
 /**
+ * MAP-COR01. Passive: a CORS preflight and an ordinary request, both with a
+ * foreign Origin and no credentials; only the CORS response headers are read.
+ */
+async function runCorsCheck(target: string, http: HttpClient): Promise<Finding> {
+  const def = CATALOGUE.find((c) => c.id === "MAP-COR01") as CheckDefinition;
+  const evidence: string[] = [];
+  let worst: "credentials" | "reflected" | "wildcard" | "none" = "none";
+  const judge = (label: string, headers: Record<string, string>, status: number): void => {
+    const acao = headers["access-control-allow-origin"];
+    const acac = (headers["access-control-allow-credentials"] ?? "").toLowerCase() === "true";
+    evidence.push(`${label}: HTTP ${status}, Access-Control-Allow-Origin ${acao === undefined ? "absent" : `"${acao}"`}${acac ? ", Access-Control-Allow-Credentials true" : ""}`);
+    const reflected = acao !== undefined && acao.toLowerCase() === FOREIGN_ORIGIN;
+    if (reflected && acac) worst = "credentials";
+    else if (reflected && worst !== "credentials") worst = "reflected";
+    else if (acao === "*" && worst === "none") worst = "wildcard";
+  };
+  try {
+    const pre = await http.request({
+      url: target,
+      method: "OPTIONS",
+      headers: { origin: FOREIGN_ORIGIN, "access-control-request-method": "POST", "access-control-request-headers": "authorization, content-type, mcp-session-id" },
+    });
+    judge("preflight (OPTIONS) from a foreign Origin", pre.headers, pre.status);
+    const res = await http.request({
+      url: target,
+      method: "POST",
+      headers: { origin: FOREIGN_ORIGIN, "content-type": "application/json", accept: "application/json, text/event-stream" },
+      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "ping" }),
+    });
+    judge("request from a foreign Origin", res.headers, res.status);
+  } catch (err) {
+    return finding(def, target, "error", `Request failed: ${(err as Error).message}`, evidence);
+  }
+  switch (worst as string) {
+    case "credentials":
+      return finding(def, target, "fail", "A foreign Origin is reflected in Access-Control-Allow-Origin together with Access-Control-Allow-Credentials: true: any website can call the endpoint with the user's cookies and read the answers.", evidence);
+    case "reflected":
+      return finding(def, target, "pass", "A foreign Origin is reflected, but without credentials: a website cannot use the user's cookies, and bearer tokens are not sent by browsers on their own. Prefer an explicit allow-list.", evidence);
+    case "wildcard":
+      return finding(def, target, "pass", "CORS allows any origin (*) without credentials, which browsers never combine with cookies.", evidence);
+    default:
+      return finding(def, target, "pass", "No CORS access is granted to a foreign origin.", evidence);
+  }
+}
+
+/**
  * MAP-ORG01. Passive: two ordinary initialize requests, one with a foreign
  * Origin. Without a token most servers answer 401 before looking at Origin;
  * `login` then observes it with a valid token.
@@ -231,6 +277,7 @@ export async function scan(mcpUrl: string, options: ScanOptions = {}): Promise<S
     const wanted: CheckSelector = options.select ?? (() => true);
     const anyOf = (ids: string[]): boolean => ids.some(wanted);
     if (wanted("MAP-ORG01")) findings.push(await runOriginCheck(target, http, options.observations ?? []));
+    if (wanted("MAP-COR01")) findings.push(await runCorsCheck(target, http));
 
     const active = CATALOGUE.filter((c) => c.active);
     if (!verified) {
@@ -241,7 +288,7 @@ export async function scan(mcpUrl: string, options: ScanOptions = {}): Promise<S
       // The refresh token checks are one sequence: they run together, or not at all (the grant is untouched).
       if (anyOf(RTK_IDS)) findings.push(...(await runRefreshFamily(target, discovery, http, options)));
       if (anyOf(["MAP-RDR01", "MAP-RDR02", "MAP-RDR04"])) findings.push(...(await runRedirectFamily(target, discovery, http, wanted)));
-      for (const id of ["MAP-RDR03", "MAP-PKC01", "MAP-COD01", "MAP-AUD01"]) {
+      for (const id of ["MAP-RDR03", "MAP-PKC01", "MAP-COD01", "MAP-AUD01", "MAP-TOK01", "MAP-SES01"]) {
         findings.push(fromObservation(id, target, options.observations ?? []));
       }
       const csr = CATALOGUE.find((c) => c.id === "MAP-CSR01") as CheckDefinition;

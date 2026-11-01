@@ -55,13 +55,13 @@ describe("login", () => {
   it("obtains a working test grant and observes the login checks as passing", async () => {
     const result = await runLogin({});
     expect(result.grant).toMatchObject({ authMethod: "none", target: (fixture as Fixture).mcpUrl, tokenEndpoint: `${(fixture as Fixture).baseUrl}/token` });
-    expect(statuses(result)).toEqual({ "MAP-PKC01": "pass", "MAP-RDR03": "pass", "MAP-AUD01": "pass", "MAP-ORG01": "pass", "MAP-COD01": "pass" });
+    expect(statuses(result)).toEqual({ "MAP-PKC01": "pass", "MAP-RDR03": "pass", "MAP-AUD01": "pass", "MAP-ORG01": "pass", "MAP-TOK01": "pass", "MAP-SES01": "pass", "MAP-COD01": "pass" });
     expect(result.observations.find((o) => o.checkId === "MAP-COD01")?.message).toMatch(/revoking them on reuse is recommended/);
 
     // The grant (refresh token rotated by the probes) and observations feed a full scan.
     const report = await scan((fixture as Fixture).mcpUrl, { allowPrivate: true, grant: result.grant as TestGrant, observations: result.observations });
     const status = (id: string) => report.findings.find((f) => f.checkId === id)?.status;
-    for (const id of ["MAP-RTK01", "MAP-RTK02", "MAP-RTK03", "MAP-RDR03", "MAP-PKC01", "MAP-COD01", "MAP-AUD01", "MAP-ORG01"]) expect([id, status(id)]).toEqual([id, "pass"]);
+    for (const id of ["MAP-RTK01", "MAP-RTK02", "MAP-RTK03", "MAP-RDR03", "MAP-PKC01", "MAP-COD01", "MAP-AUD01", "MAP-ORG01", "MAP-TOK01", "MAP-SES01", "MAP-COR01"]) expect([id, status(id)]).toEqual([id, "pass"]);
     expect(report.findings.find((f) => f.checkId === "MAP-RDR03")?.evidence.at(-1)).toMatch(/observed during login/);
     expect(report.findings.filter((f) => /Not implemented/.test(f.message))).toEqual([]);
   });
@@ -166,6 +166,29 @@ describe("login", () => {
     expect(result.grant).not.toBeNull();
   });
 
+  it("flags an MCP endpoint that accepts the token in the URL", async () => {
+    const result = await runLogin({ mcp: { acceptQueryToken: true } });
+    expect(statuses(result)["MAP-TOK01"]).toBe("fail");
+    // The token never appears in the evidence.
+    expect(JSON.stringify(result.observations)).not.toMatch(/access_token=ey/);
+  });
+
+  it("flags a session ID that works without a token, and ends the sessions it opened", async () => {
+    const result = await runLogin({ mcp: { sessionWithoutToken: true } });
+    expect(statuses(result)["MAP-SES01"]).toBe("fail");
+    expect((fixture as Fixture).requests.filter((r) => r.method === "DELETE" && r.path === "/mcp").length).toBeGreaterThan(0);
+  });
+
+  it("reports SES01 as not applicable on a stateless server", async () => {
+    const result = await runLogin({ mcp: { sessions: false } });
+    expect(statuses(result)["MAP-SES01"]).toBe("not_applicable");
+  });
+
+  it("does not judge TOK01 or SES01 on an endpoint that also serves anonymous requests", async () => {
+    const result = await runLogin({ anonymous: true });
+    expect(statuses(result)).toMatchObject({ "MAP-TOK01": "error", "MAP-SES01": "error" });
+  });
+
   it("flags an MCP endpoint that does not validate Origin", async () => {
     const result = await runLogin({ mcp: { validateOrigin: false } });
     expect(statuses(result)["MAP-ORG01"]).toBe("fail");
@@ -195,6 +218,25 @@ describe("login", () => {
     const result = await runLogin({});
     const text = JSON.stringify({ o: result.observations, n: result.notes });
     expect(text).not.toMatch(/(rt|at|code)_[0-9a-f]{32}/);
+  });
+});
+
+describe("MAP-COR01 during a scan", () => {
+  const cor = async (cors: "none" | "reflect" | "reflect-credentials" | "wildcard") => {
+    fixture = await startFixture({ mcp: { cors } });
+    const report = await scan(fixture.mcpUrl, { allowPrivate: true });
+    return report.findings.find((f) => f.checkId === "MAP-COR01");
+  };
+
+  it.each([
+    ["none", "pass"],
+    ["wildcard", "pass"],
+    ["reflect", "pass"],
+    ["reflect-credentials", "fail"],
+  ] as const)("CORS %s -> %s", async (mode, expected) => {
+    const f = await cor(mode);
+    expect(f?.status).toBe(expected);
+    expect(f?.evidence[0]).toMatch(/preflight/);
   });
 });
 
