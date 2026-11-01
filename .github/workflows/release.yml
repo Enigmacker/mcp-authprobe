@@ -40,8 +40,10 @@ jobs:
   publish:
     needs: verify
     runs-on: ubuntu-latest
-    # Optional manual approval: create an "npm" environment with required reviewers.
-    environment: npm
+    # Once the repository is public, you can add `environment: npm` here with
+    # required reviewers for a manual approval step (environments are not
+    # available for private repositories on the free plan). If you do, set
+    # the same environment name in the npm trusted publisher settings.
     permissions:
       contents: write   # create the GitHub release
       id-token: write   # npm trusted publishing (OIDC)
