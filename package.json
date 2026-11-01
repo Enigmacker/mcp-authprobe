@@ -1,6 +1,6 @@
 {
   "name": "mcp-authprobe",
-  "version": "0.1.0-dev",
+  "version": "0.1.0",
   "description": "Active authorization testing for remote MCP servers you own: refresh token rotation, redirect_uri strictness and more, as a CLI and an MCP server.",
   "license": "MIT",
   "author": "Enigmacker",
@@ -37,7 +37,7 @@
     "CHANGELOG.md"
   ],
   "scripts": {
-    "build": "tsc -p tsconfig.build.json",
+    "build": "node -e \"require('node:fs').rmSync('dist',{recursive:true,force:true})\" && tsc -p tsconfig.build.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "vitest run",
     "test:watch": "vitest",

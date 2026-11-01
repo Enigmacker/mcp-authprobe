@@ -1,5 +1,6 @@
 import type { HttpClient } from "./net/http.js";
 import { safeText } from "./redact.js";
+import { TOOL_NAME, TOOL_VERSION } from "./version.js";
 
 /**
  * OAuth discovery for a remote MCP server, following the MCP Authorization
@@ -86,7 +87,7 @@ export async function discover(mcpUrl: string, http: HttpClient): Promise<Discov
     params: {
       protocolVersion: "2025-11-25",
       capabilities: {},
-      clientInfo: { name: "mcp-authprobe", version: "0.1.0" },
+      clientInfo: { name: TOOL_NAME, version: TOOL_VERSION },
     },
   };
 

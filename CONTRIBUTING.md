@@ -30,3 +30,10 @@ Short imperative subject line (`Add refresh token replay check`), optional body 
 ## Reporting vulnerabilities
 
 See [SECURITY.md](SECURITY.md). Please do not open public issues for vulnerabilities.
+
+## Releasing (maintainers)
+
+1. Move the `Unreleased` entries of `CHANGELOG.md` under a new `## [x.y.z] - YYYY-MM-DD` heading and update the links at the bottom.
+2. Set the same version in `package.json` and `src/version.ts` (a test checks they match and that the changelog has the entry).
+3. Commit, then tag and push: `git tag vx.y.z && git push origin vx.y.z`.
+4. The `Release` workflow checks that the tag matches `package.json`, runs the full check and the audit, publishes to npm with trusted publishing (no token stored), and creates the GitHub release from the changelog section.

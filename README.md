@@ -9,7 +9,7 @@ Passive scanners read what a remote [Model Context Protocol](https://modelcontex
 
 `mcp-authprobe` runs those active checks, against servers whose ownership you have proven, and reports the results as JSON, SARIF and Markdown.
 
-> **Status: early development (0.1.0-dev).** Available today: ownership proof, OAuth discovery, the refresh token checks (rotation, replay, family revocation) the redirect URI checks (unregistered URI, exact matching, registration policy), the throttling check, and an MCP server mode so an AI assistant can run the audit, and an interactive `login` that creates the test grant for you. The other active families are documented and being implemented; see [Roadmap](#roadmap).
+> **Status: 0.1.0, first release.** Nine of the ten checks are available: OAuth discovery, refresh token rotation and replay, redirect URI strictness, and token endpoint throttling, behind an ownership proof. It works as a CLI, with an interactive `login` that creates the test grant, and as an MCP server so an AI assistant can run the audit. Consent CSRF (`MAP-CSR01`) is planned; see [Roadmap](#roadmap).
 
 > **Only test servers you own or are explicitly authorized to test.** Active checks change state on the target. The tool enforces an ownership proof before running them, but responsibility stays with the operator.
 
@@ -49,7 +49,18 @@ Good tools already exist, and this one is meant to sit next to them, not replace
 Requires Node.js 20.18.1 or later.
 
 ```sh
-# from source, until the first npm release
+# run without installing
+npx mcp-authprobe --help
+
+# or install globally
+npm install -g mcp-authprobe
+```
+
+Releases are published from GitHub Actions with npm trusted publishing; check the provenance on the package page before installing a security tool.
+
+From source:
+
+```sh
 git clone https://github.com/Enigmacker/mcp-authprobe.git
 cd mcp-authprobe
 npm ci
@@ -221,7 +232,7 @@ Add it to your client's MCP configuration (most clients use this `mcpServers` fo
 }
 ```
 
-Until the npm release, use `"command": "node"` with `"args": ["/path/to/mcp-authprobe/dist/cli.js", "mcp"]`.
+From a source checkout, use `"command": "node"` with `"args": ["/path/to/mcp-authprobe/dist/cli.js", "mcp"]`.
 
 | Tool | What it does | Annotations |
 | --- | --- | --- |
@@ -323,7 +334,7 @@ The scanner talks to servers that may be hostile, and it may be driven by an AI 
 - ~~`MAP-RDR03`~~ done, observed during login.
 - ~~Throttling check (THR01)~~ done.
 - ~~MCP server mode (stdio)~~ done.
-- npm release.
+- ~~npm release~~ done.
 
 **0.2.0**
 - Consent CSRF check (CSR01), driven through a browser session.

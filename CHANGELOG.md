@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.1.0] - 2026-11-01
+
+First release.
+
 ### Added
 
 - Hardened HTTP client: connect-time refusal of loopback, private, link-local, CGNAT, multicast, reserved and cloud-metadata addresses (after DNS resolution), timeouts, 1 MiB body cap, no automatic redirects, no compression.
@@ -22,3 +26,6 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - `MAP-RDR03` (token endpoint binds the code to its redirect_uri), observed during `login` when ownership is proven, stored in the grant file and reported by the next scan of the same target.
 - `MAP-THR01` (repeated failed token requests are throttled): 5 to 20 sequential requests (default 10, hard-capped, `--throttle-attempts`) carrying random refresh tokens for the operator's test client or a temporary deleted-afterwards client; stops at the first 429, Retry-After, `slow_down` or `temporarily_unavailable`; runs last in a scan.
 - Local fixture server with a stateful token endpoint, dynamic registration and an authorization endpoint and test suite; GitHub Actions CI.
+
+[Unreleased]: https://github.com/Enigmacker/mcp-authprobe/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/Enigmacker/mcp-authprobe/releases/tag/v0.1.0
