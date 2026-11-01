@@ -234,6 +234,8 @@ Add it to your client's MCP configuration (most clients use this `mcpServers` fo
 }
 ```
 
+The server is also listed in the official MCP Registry as `io.github.Enigmacker/mcp-authprobe`, so registry-aware clients can install it directly.
+
 From a source checkout, use `"command": "node"` with `"args": ["/path/to/mcp-authprobe/dist/cli.js", "mcp"]`.
 
 | Tool | What it does | Annotations |

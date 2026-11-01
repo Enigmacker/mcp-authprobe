@@ -46,7 +46,7 @@ jobs:
     # the same environment name in the npm trusted publisher settings.
     permissions:
       contents: write   # create the GitHub release
-      id-token: write   # npm trusted publishing (OIDC)
+      id-token: write   # npm trusted publishing and MCP Registry login (OIDC)
     steps:
       - uses: actions/checkout@v7
         with:
@@ -69,6 +69,31 @@ jobs:
           else
             npm publish --access public
           fi
+      - name: Publish to the official MCP Registry (GitHub OIDC)
+        env:
+          MCP_PUBLISHER_VERSION: v1.8.1
+          MCP_PUBLISHER_SHA256: a06c9096dcb9727c13555b6be26c7effa707b01f06a4c561ba7a3635443cf2cc
+        run: |
+          version="$(node -p "require('./package.json').version")"
+          name="$(node -p "require('./package.json').mcpName")"
+          # Wait until npm serves the version: the registry verifies the package.
+          for i in $(seq 1 30); do
+            npm view "mcp-authprobe@$version" version >/dev/null 2>&1 && break
+            sleep 10
+          done
+          published="$(curl -fsS "https://registry.modelcontextprotocol.io/v0.1/servers?search=$name&version=$version" \
+            | node -e 'let d="";process.stdin.on("data",c=>d+=c).on("end",()=>{const j=JSON.parse(d);console.log((j.servers||[]).some(s=>s.server&&s.server.name===process.argv[1]&&s.server.version===process.argv[2]))})' "$name" "$version" || echo false)"
+          if [ "$published" = "true" ]; then
+            echo "::notice::$name $version is already in the MCP Registry; skipping."
+            exit 0
+          fi
+          curl -fsSL -o mcp-publisher.tar.gz \
+            "https://github.com/modelcontextprotocol/registry/releases/download/${MCP_PUBLISHER_VERSION}/mcp-publisher_linux_amd64.tar.gz"
+          echo "${MCP_PUBLISHER_SHA256}  mcp-publisher.tar.gz" | sha256sum -c -
+          mkdir -p "$RUNNER_TEMP/mcp-publisher"
+          tar xzf mcp-publisher.tar.gz -C "$RUNNER_TEMP/mcp-publisher"
+          "$RUNNER_TEMP/mcp-publisher/mcp-publisher" login github-oidc
+          "$RUNNER_TEMP/mcp-publisher/mcp-publisher" publish
       - name: Create the GitHub release from the changelog
         env:
           GH_TOKEN: ${{ github.token }}

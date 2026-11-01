@@ -1,0 +1,64 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.Enigmacker/mcp-authprobe",
+  "title": "mcp-authprobe",
+  "description": "Active OAuth tests for remote MCP servers you own: token rotation, redirect_uri, throttling.",
+  "repository": {
+    "url": "https://github.com/Enigmacker/mcp-authprobe",
+    "source": "github"
+  },
+  "websiteUrl": "https://github.com/Enigmacker/mcp-authprobe#readme",
+  "version": "0.1.1",
+  "packages": [
+    {
+      "registryType": "npm",
+      "identifier": "mcp-authprobe",
+      "version": "0.1.1",
+      "transport": {
+        "type": "stdio"
+      },
+      "packageArguments": [
+        {
+          "type": "positional",
+          "value": "mcp"
+        }
+      ],
+      "environmentVariables": [
+        {
+          "name": "MCP_AUTHPROBE_SECRET_FILE",
+          "description": "Path to the ownership secret (create it with `mcp-authprobe ownership init <host>`). Without a secret, only discovery runs.",
+          "format": "filepath",
+          "isRequired": false
+        },
+        {
+          "name": "MCP_AUTHPROBE_SECRET",
+          "description": "Ownership secret, if not read from MCP_AUTHPROBE_SECRET_FILE.",
+          "isRequired": false,
+          "isSecret": true
+        },
+        {
+          "name": "MCP_AUTHPROBE_CREDENTIALS_FILE",
+          "description": "Path to a test grant written by `mcp-authprobe login`, for the refresh token checks. It is consumed by a scan.",
+          "format": "filepath",
+          "isRequired": false
+        },
+        {
+          "name": "MCP_AUTHPROBE_ALLOW_PRIVATE",
+          "description": "Set to 1 to allow loopback and private targets (local labs only).",
+          "isRequired": false
+        },
+        {
+          "name": "MCP_AUTHPROBE_LAB_ORIGINS",
+          "description": "Comma-separated lab origins exempt from the ownership proof, e.g. http://127.0.0.1:8080.",
+          "isRequired": false
+        },
+        {
+          "name": "MCP_AUTHPROBE_TIMEOUT_MS",
+          "description": "Per-request timeout in milliseconds (default 10000).",
+          "format": "number",
+          "isRequired": false
+        }
+      ]
+    }
+  ]
+}
