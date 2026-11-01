@@ -32,8 +32,9 @@ export interface TestGrant {
 }
 
 /**
- * A check result observed outside a scan, during `login` (for example
- * MAP-RDR03, which needs a fresh authorization code). Stored in the grant
+ * A check result observed outside a scan, during `login` (MAP-PKC01,
+ * MAP-RDR03, MAP-COD01, MAP-AUD01 and MAP-ORG01, which need a fresh
+ * authorization code or a valid access token). Stored in the grant
  * file so the next scan of the same target can report it.
  */
 export interface Observation extends Finding {

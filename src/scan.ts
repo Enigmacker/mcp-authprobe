@@ -4,6 +4,7 @@ import { runRefreshTokenChecks } from "./checks/refresh-tokens.js";
 import { runThrottlingCheck } from "./checks/throttling.js";
 import type { Observation, TestGrant } from "./credentials.js";
 import { discover, type DiscoveryResult } from "./discovery.js";
+import { FOREIGN_ORIGIN, initializeStatus } from "./oauth/mcp-call.js";
 import { HttpClient } from "./net/http.js";
 import { verifyOwnership, type OwnershipResult, type VerifyOptions } from "./ownership.js";
 import { safeText } from "./redact.js";
@@ -26,7 +27,7 @@ export interface ScanOptions {
   loopbackExempt?: boolean;
   /** Failed token requests sent by MAP-THR01 (clamped to 5-20, default 10). */
   throttleAttempts?: number;
-  /** Results observed during `login` (MAP-RDR03), read from the grant file. */
+  /** Results observed during `login` (PKC01, RDR03, COD01, AUD01, ORG01), read from the grant file. */
   observations?: Observation[];
   /** Test hooks. */
   resolveTxtRecords?: VerifyOptions["resolveTxtRecords"];
@@ -157,6 +158,33 @@ async function runRedirectFamily(target: string, d: DiscoveryResult | null, http
   return runRedirectUriChecks(ctx);
 }
 
+/**
+ * MAP-ORG01. Passive: two ordinary initialize requests, one with a foreign
+ * Origin. Without a token most servers answer 401 before looking at Origin;
+ * `login` then observes it with a valid token.
+ */
+async function runOriginCheck(target: string, http: HttpClient, observations: Observation[]): Promise<Finding> {
+  const def = CATALOGUE.find((c) => c.id === "MAP-ORG01") as CheckDefinition;
+  if (observations.some((o) => o.checkId === def.id && o.target === target)) return fromObservation(def.id, target, observations);
+  let baseline: number;
+  let foreign: number;
+  try {
+    baseline = await initializeStatus(http, target);
+    foreign = await initializeStatus(http, target, { origin: FOREIGN_ORIGIN });
+  } catch (err) {
+    return finding(def, target, "error", `Request failed: ${(err as Error).message}`);
+  }
+  const evidence = [`initialize without Origin: HTTP ${baseline}`, `initialize with Origin: ${FOREIGN_ORIGIN}: HTTP ${foreign}`];
+  if (foreign === 403 && baseline !== 403) return finding(def, target, "pass", "A request from a foreign Origin is refused with 403.", evidence);
+  if (baseline >= 200 && baseline < 300 && foreign === baseline) {
+    return finding(def, target, "fail", "A request from a foreign Origin is processed like any other: the Origin header is not validated.", evidence);
+  }
+  if (baseline === 401 && foreign === 401) {
+    return finding(def, target, "error", "Inconclusive: the server asks for authentication before looking at Origin. Run `mcp-authprobe login` (ownership proven) to observe it with a valid token.", evidence);
+  }
+  return finding(def, target, "error", "Unexpected answers; inconclusive.", evidence);
+}
+
 export async function scan(mcpUrl: string, options: ScanOptions = {}): Promise<ScanReport> {
   const startedAt = new Date().toISOString();
   const target = new URL(mcpUrl).toString();
@@ -191,6 +219,8 @@ export async function scan(mcpUrl: string, options: ScanOptions = {}): Promise<S
       detail: results.map((r) => `${r.host}: ${r.detail}`).join(" "),
     };
 
+    findings.push(await runOriginCheck(target, http, options.observations ?? []));
+
     const active = CATALOGUE.filter((c) => c.active);
     if (!verified) {
       for (const def of active) {
@@ -199,7 +229,9 @@ export async function scan(mcpUrl: string, options: ScanOptions = {}): Promise<S
     } else {
       findings.push(...(await runRefreshFamily(target, discovery, http, options)));
       findings.push(...(await runRedirectFamily(target, discovery, http)));
-      findings.push(fromObservation("MAP-RDR03", target, options.observations ?? []));
+      for (const id of ["MAP-RDR03", "MAP-PKC01", "MAP-COD01", "MAP-AUD01"]) {
+        findings.push(fromObservation(id, target, options.observations ?? []));
+      }
       const csr = CATALOGUE.find((c) => c.id === "MAP-CSR01") as CheckDefinition;
       findings.push(finding(csr, target, "skipped", "Needs a logged-in browser session: run `mcp-authprobe consent-check` separately."));
       // Last on purpose: once throttled, the token endpoint may refuse other checks.

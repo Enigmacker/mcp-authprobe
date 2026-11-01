@@ -13,6 +13,8 @@ export interface RefreshOutcome {
   /** OAuth "error" field on failure, e.g. "invalid_grant". */
   error: string | null;
   accessTokenIssued: boolean;
+  /** The access token, if any. In memory only: never logged or reported. */
+  accessToken: string | null;
   /** New refresh token, if any. In memory only. */
   refreshToken: string | null;
   /** HTTP 429 or a Retry-After header: the server is throttling. */
@@ -23,8 +25,9 @@ function formEncode(params: Record<string, string>): string {
   return new URLSearchParams(params).toString();
 }
 
-export async function refresh(http: HttpClient, tokenEndpoint: string, grant: TestGrant, refreshToken: string): Promise<RefreshOutcome> {
+export async function refresh(http: HttpClient, tokenEndpoint: string, grant: TestGrant, refreshToken: string, resource?: string): Promise<RefreshOutcome> {
   const params: Record<string, string> = { grant_type: "refresh_token", refresh_token: refreshToken };
+  if (resource) params["resource"] = resource;
   const headers: Record<string, string> = {
     "content-type": "application/x-www-form-urlencoded",
     accept: "application/json",
@@ -57,6 +60,7 @@ export async function refresh(http: HttpClient, tokenEndpoint: string, grant: Te
     status: res.status,
     error: typeof error === "string" ? error : null,
     accessTokenIssued: res.status === 200 && typeof accessToken === "string" && accessToken.length > 0,
+    accessToken: res.status === 200 && typeof accessToken === "string" && accessToken.length > 0 ? accessToken : null,
     refreshToken: typeof newRefresh === "string" && newRefresh.length > 0 ? newRefresh : null,
     throttled: res.status === 429 || res.headers["retry-after"] !== undefined,
   };
@@ -76,15 +80,15 @@ export type CodeExchangeOutcome = RefreshOutcome;
 export async function exchangeCode(
   http: HttpClient,
   tokenEndpoint: string,
-  params: { clientId: string; clientSecret?: string | null; code: string; codeVerifier: string; redirectUri: string; resource?: string },
+  params: { clientId: string; clientSecret?: string | null; code: string; codeVerifier?: string; redirectUri: string; resource?: string },
 ): Promise<CodeExchangeOutcome> {
   const form: Record<string, string> = {
     grant_type: "authorization_code",
     code: params.code,
-    code_verifier: params.codeVerifier,
     redirect_uri: params.redirectUri,
     client_id: params.clientId,
   };
+  if (params.codeVerifier !== undefined) form["code_verifier"] = params.codeVerifier;
   if (params.clientSecret) form["client_secret"] = params.clientSecret;
   if (params.resource) form["resource"] = params.resource;
   const res = await http.request({
@@ -107,6 +111,7 @@ export async function exchangeCode(
     status: res.status,
     error: typeof error === "string" ? error : null,
     accessTokenIssued: res.status === 200 && typeof access === "string" && access.length > 0,
+    accessToken: res.status === 200 && typeof access === "string" && access.length > 0 ? access : null,
     refreshToken: typeof refreshToken === "string" && refreshToken.length > 0 ? refreshToken : null,
     throttled: res.status === 429 || res.headers["retry-after"] !== undefined,
   };

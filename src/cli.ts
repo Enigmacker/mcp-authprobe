@@ -57,7 +57,7 @@ Consent check options (needs the optional playwright-core package and Chrome or 
 Login options:
   --out <file>          Where to write the test grant (mode 600, never overwritten without --force)
   --force               Overwrite an existing grant file
-  --no-probe            Do not observe MAP-RDR03 during login
+  --no-probe            Do not observe the login checks (PKC01, RDR03, COD01, AUD01, ORG01)
   --no-browser          Print the authorization URL instead of opening a browser
   --allow-private, --secret-file, --timeout  as for scan
 

@@ -43,36 +43,81 @@ async function runLogin(
     mcpUrl: fixture.mcpUrl,
     discovery,
     openUrl: browser(extra.tamper),
-    probeRedirectBinding: extra.probe ?? true,
+    probe: extra.probe ?? true,
     timeoutMs: extra.timeoutMs ?? 5000,
   });
 }
 
 describe("login", () => {
-  it("obtains a working test grant and observes MAP-RDR03 as passing", async () => {
+  const statuses = (r: LoginResult): Record<string, string> => Object.fromEntries(r.observations.map((o) => [o.checkId, o.status]));
+
+  it("obtains a working test grant and observes the login checks as passing", async () => {
     const result = await runLogin({});
     expect(result.grant).toMatchObject({ authMethod: "none", target: (fixture as Fixture).mcpUrl, tokenEndpoint: `${(fixture as Fixture).baseUrl}/token` });
-    expect(result.observations.map((o) => [o.checkId, o.status])).toEqual([["MAP-RDR03", "pass"]]);
+    expect(statuses(result)).toEqual({ "MAP-PKC01": "pass", "MAP-RDR03": "pass", "MAP-AUD01": "pass", "MAP-ORG01": "pass", "MAP-COD01": "pass" });
+    expect(result.observations.find((o) => o.checkId === "MAP-COD01")?.message).toMatch(/revoking them on reuse is recommended/);
 
-    // The grant and observation feed a full scan.
+    // The grant (refresh token rotated by the probes) and observations feed a full scan.
     const report = await scan((fixture as Fixture).mcpUrl, { allowPrivate: true, grant: result.grant as TestGrant, observations: result.observations });
     const status = (id: string) => report.findings.find((f) => f.checkId === id)?.status;
-    expect([status("MAP-RTK01"), status("MAP-RTK02"), status("MAP-RTK03"), status("MAP-RDR03")]).toEqual(["pass", "pass", "pass", "pass"]);
+    for (const id of ["MAP-RTK01", "MAP-RTK02", "MAP-RTK03", "MAP-RDR03", "MAP-PKC01", "MAP-COD01", "MAP-AUD01", "MAP-ORG01"]) expect([id, status(id)]).toEqual([id, "pass"]);
     expect(report.findings.find((f) => f.checkId === "MAP-RDR03")?.evidence.at(-1)).toMatch(/observed during login/);
+    expect(report.findings.filter((f) => /Not implemented/.test(f.message))).toEqual([]);
   });
 
   it("flags a token endpoint that ignores redirect_uri, and keeps the tokens it issued", async () => {
     const result = await runLogin({ tokens: { bindRedirect: false } });
-    expect(result.observations[0]).toMatchObject({ checkId: "MAP-RDR03", status: "fail" });
+    expect(statuses(result)).toMatchObject({ "MAP-PKC01": "pass", "MAP-RDR03": "fail" });
     expect(result.grant).not.toBeNull();
   });
 
   it("explains a strict server that burns the code after a refused attempt, and removes the client", async () => {
     const result = await runLogin({ tokens: { consumeCodeOnFailure: true } });
-    expect(result.observations[0]?.status).toBe("pass");
+    // Only the first refusal is meaningful: the other attempts met an invalidated code.
+    expect(statuses(result)).toEqual({ "MAP-PKC01": "error", "MAP-RDR03": "error" });
+    expect(result.observations[0]?.evidence[0]).toMatch(/without a code_verifier \(PKCE\): HTTP 400/);
     expect(result.grant).toBeNull();
     expect(result.notes.join(" ")).toMatch(/--no-probe/);
     expect((fixture as Fixture).registeredClients()).toEqual([]);
+  });
+
+  it.each(["optional", "ignore"] as const)("flags a token endpoint with PKCE %s, and keeps the tokens the probe obtained", async (pkce) => {
+    const result = await runLogin({ tokens: { pkce } });
+    expect(statuses(result)["MAP-PKC01"]).toBe("fail");
+    expect(statuses(result)["MAP-RDR03"]).toBeUndefined(); // the code was already spent
+    expect(statuses(result)["MAP-COD01"]).toBeUndefined();
+    expect(result.observations.find((o) => o.checkId === "MAP-PKC01")?.evidence.join(" ")).toMatch(/not run/);
+    expect(result.grant).not.toBeNull();
+  });
+
+  it("flags an authorization code that can be used twice", async () => {
+    const result = await runLogin({ tokens: { codeReuse: "allow" } });
+    expect(statuses(result)["MAP-COD01"]).toBe("fail");
+    expect(result.grant).not.toBeNull();
+  });
+
+  it("reports revocation on code reuse, and asks for a new login", async () => {
+    const result = await runLogin({ tokens: { codeReuse: "revoke" } });
+    expect(statuses(result)["MAP-COD01"]).toBe("pass");
+    expect(result.observations.find((o) => o.checkId === "MAP-COD01")?.message).toMatch(/were revoked/);
+    expect(result.grant).toBeNull();
+    expect(result.notes.join(" ")).toMatch(/--no-probe/);
+  });
+
+  it.each([
+    [{ tokens: { resource: "ignore" as const } }, "fail"],
+    [{ mcp: { checkAudience: false } }, "fail"],
+    [{ tokens: { resource: "refuse" as const } }, "pass"],
+    [{ tokens: { resource: "refuse" as const }, mcp: { checkAudience: false } }, "pass"],
+  ])("judges audience binding (%j)", async (options, expected) => {
+    const result = await runLogin(options);
+    expect(statuses(result)["MAP-AUD01"]).toBe(expected);
+    expect(result.grant).not.toBeNull();
+  });
+
+  it("flags an MCP endpoint that does not validate Origin", async () => {
+    const result = await runLogin({ mcp: { validateOrigin: false } });
+    expect(statuses(result)["MAP-ORG01"]).toBe("fail");
   });
 
   it("skips the probe when ownership is not proven", async () => {
@@ -99,6 +144,26 @@ describe("login", () => {
     const result = await runLogin({});
     const text = JSON.stringify({ o: result.observations, n: result.notes });
     expect(text).not.toMatch(/(rt|at|code)_[0-9a-f]{32}/);
+  });
+});
+
+describe("MAP-ORG01 during a scan", () => {
+  const org = async (options: FixtureOptions): Promise<string | undefined> => {
+    fixture = await startFixture(options);
+    const report = await scan(fixture.mcpUrl, { allowPrivate: true });
+    return report.findings.find((f) => f.checkId === "MAP-ORG01")?.status;
+  };
+
+  it("passes when a foreign Origin gets 403, even without ownership proof", async () => {
+    expect(await org({})).toBe("pass");
+  });
+
+  it("fails when an anonymous endpoint processes a foreign Origin", async () => {
+    expect(await org({ anonymous: true, mcp: { validateOrigin: false } })).toBe("fail");
+  });
+
+  it("is inconclusive when the endpoint asks for a token first", async () => {
+    expect(await org({ mcp: { validateOrigin: false } })).toBe("error");
   });
 });
 

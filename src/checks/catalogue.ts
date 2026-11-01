@@ -29,6 +29,10 @@ const RFC8414: Reference = { title: "RFC 8414 - OAuth 2.0 Authorization Server M
  *   RDR  redirect_uri strictness (active)
  *   THR  throttling of failed authentication (active, bounded)
  *   CSR  consent page CSRF (active, needs a browser session)
+ *   PKC  PKCE enforcement at the token endpoint (active, during login)
+ *   COD  authorization code single use (active, during login)
+ *   AUD  token audience binding (active, during login)
+ *   ORG  Origin validation on the MCP endpoint (passive)
  */
 export const CATALOGUE: readonly CheckDefinition[] = [
   {
@@ -129,6 +133,54 @@ export const CATALOGUE: readonly CheckDefinition[] = [
       "If anyone can register a client, the registration endpoint is the first line of defense: it should only accept HTTPS or loopback redirect URIs and refuse dangerous schemes.",
     remediation: "Validate redirect_uris at registration: HTTPS, loopback HTTP, or private-use schemes for native apps only.",
     references: [MCP_AUTH, OAUTH21],
+  },
+  {
+    id: "MAP-PKC01",
+    family: "PKC",
+    title: "Token endpoint enforces PKCE",
+    severity: "high",
+    active: true,
+    availability: "available",
+    rationale:
+      "PKCE only protects an intercepted authorization code if the token endpoint actually verifies the code_verifier. Observed during login: the code is first presented without a code_verifier, then with a wrong one; both must be refused.",
+    remediation: "Require a code_verifier for every code issued with a code_challenge, verify it with S256, and refuse codes issued without PKCE for public clients.",
+    references: [OAUTH21, RFC9700, MCP_AUTH, { title: "RFC 7636 - Proof Key for Code Exchange", url: "https://www.rfc-editor.org/rfc/rfc7636" }],
+  },
+  {
+    id: "MAP-COD01",
+    family: "COD",
+    title: "An authorization code cannot be used twice",
+    severity: "high",
+    active: true,
+    availability: "available",
+    rationale:
+      "Authorization codes are single-use. Observed during login: after the code has been exchanged, it is presented again and must be refused. Revoking the tokens already issued from it is recommended and reported.",
+    remediation: "Reject a second use of any authorization code, and revoke the tokens issued from it when a reuse is detected.",
+    references: [OAUTH21, RFC9700],
+  },
+  {
+    id: "MAP-AUD01",
+    family: "AUD",
+    title: "Tokens are bound to their audience",
+    severity: "high",
+    active: true,
+    availability: "available",
+    rationale:
+      "A token requested for another resource must not be usable on this MCP server (RFC 8707, and the MCP ban on token passthrough). Observed during login: the refresh token is used to ask for a token for an unrelated resource; the authorization server must refuse, or the MCP server must reject that token. A token for this server is used as a control.",
+    remediation: "Honour the resource parameter at the authorization server (refuse unknown resources with invalid_target), and validate the token audience on the MCP server.",
+    references: [MCP_AUTH, MCP_SEC, { title: "RFC 8707 - Resource Indicators for OAuth 2.0", url: "https://www.rfc-editor.org/rfc/rfc8707" }],
+  },
+  {
+    id: "MAP-ORG01",
+    family: "ORG",
+    title: "MCP endpoint rejects requests from a foreign Origin",
+    severity: "medium",
+    active: false,
+    availability: "available",
+    rationale:
+      "The MCP Streamable HTTP transport requires servers to validate the Origin header and answer 403 to an invalid one, so a web page cannot reach the server through the browser (DNS rebinding). One initialize request is sent with a foreign Origin and compared with the same request without Origin; when the server asks for a token first, login observes it again with a valid token.",
+    remediation: "Validate the Origin header on every request to the MCP endpoint and answer 403 Forbidden when it is not an allowed origin.",
+    references: [{ title: "MCP specification - Transports (Streamable HTTP, security warning)", url: "https://modelcontextprotocol.io/specification/2025-11-25/basic/transports" }, MCP_SEC],
   },
   {
     id: "MAP-THR01",

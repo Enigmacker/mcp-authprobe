@@ -30,6 +30,12 @@ export interface TokenBehaviour {
   rateLimitStyle?: "429" | "slow_down";
   /** Answer every token request with 503 and Retry-After (outage). */
   outage?: boolean;
+  /** PKCE at the token endpoint: "enforce" (default), "optional" (a missing verifier is accepted), "ignore". */
+  pkce?: "enforce" | "optional" | "ignore";
+  /** A second use of a code: "refuse" (default), "revoke" (refuse and revoke its tokens), "allow". */
+  codeReuse?: "refuse" | "revoke" | "allow";
+  /** The resource parameter: "bind" (default, audience = resource), "ignore" (audience always this server), "refuse" (invalid_target for another resource). */
+  resource?: "bind" | "ignore" | "refuse";
 }
 
 export interface AuthorizationBehaviour {
@@ -98,6 +104,13 @@ export interface FixtureOptions {
    * A non-loopback local address lets tests exercise the ownership gate.
    */
   host?: string;
+  /** The MCP endpoint with a token. */
+  mcp?: {
+    /** Reject tokens whose audience is not this MCP server (default true). */
+    checkAudience?: boolean;
+    /** Answer 403 to a request with a foreign Origin header (default true). */
+    validateOrigin?: boolean;
+  };
 }
 
 export interface Fixture {
@@ -151,11 +164,17 @@ export async function startFixture(options: FixtureOptions = {}): Promise<Fixtur
     consumeCodeOnFailure: false,
     rateLimitStyle: "429",
     outage: false,
+    pkce: "enforce",
+    codeReuse: "refuse",
+    resource: "bind",
     ...options.tokens,
   };
   let authzRequests = 0;
   const authz: Required<Omit<AuthorizationBehaviour, "rateLimitAfter">> & { rateLimitAfter?: number } = { match: "exact", noSession: "login", registration: "strict", management: true, issInResponse: true, ...options.authorization };
-  const codes = new Map<string, { clientId: string; redirectUri: string; challenge: string; used: boolean }>();
+  const codes = new Map<string, { clientId: string; redirectUri: string; challenge: string; used: boolean; family?: string }>();
+  const mcpOpts = { checkAudience: true, validateOrigin: true, ...options.mcp };
+  /** access token -> { audience, family } */
+  const accessTokens = new Map<string, { audience: string; family: string }>();
   const clients = new Map<string, { redirectUris: string[]; managementToken: string }>();
   const requests: Fixture["requests"] = [];
   const refreshTokens = new Map<string, RefreshRecord>();
@@ -183,18 +202,30 @@ export async function startFixture(options: FixtureOptions = {}): Promise<Fixtur
     if (tok.clientSecret !== undefined && secret !== tok.clientSecret) return json(res, 401, { error: "invalid_client" });
     if (form.get("grant_type") === "authorization_code") {
       const code = codes.get(form.get("code") ?? "");
-      if (!code || code.used || code.clientId !== clientId) return json(res, 400, { error: "invalid_grant" });
-      const verifier = form.get("code_verifier") ?? "";
+      if (!code || code.clientId !== clientId) return json(res, 400, { error: "invalid_grant" });
+      if (code.used && tok.codeReuse !== "allow") {
+        if (tok.codeReuse === "revoke" && code.family) revokedFamilies.add(code.family);
+        return json(res, 400, { error: "invalid_grant" });
+      }
+      const verifier = form.get("code_verifier");
       const fail = (): void => {
         if (tok.consumeCodeOnFailure) code.used = true;
         json(res, 400, { error: "invalid_grant" });
       };
-      if (createHash("sha256").update(verifier).digest("base64url") !== code.challenge) return fail();
+      const pkceOk =
+        tok.pkce === "ignore" ||
+        (verifier === null && tok.pkce === "optional") ||
+        (verifier !== null && createHash("sha256").update(verifier).digest("base64url") === code.challenge);
+      if (!pkceOk) return fail();
       if (tok.bindRedirect && form.get("redirect_uri") !== code.redirectUri) return fail();
+      const audience = audienceFor(form.get("resource"));
+      if (audience === null) return json(res, 400, { error: "invalid_target" });
       code.used = true;
+      const family = newToken("fam");
+      code.family = family;
       const refreshOut = newToken("rt");
-      refreshTokens.set(refreshOut, { family: newToken("fam"), clientId: code.clientId, used: false });
-      return json(res, 200, { access_token: newToken("at"), token_type: "Bearer", expires_in: 3600, refresh_token: refreshOut });
+      refreshTokens.set(refreshOut, { family, clientId: code.clientId, used: false });
+      return json(res, 200, { access_token: accessToken(audience, family), token_type: "Bearer", expires_in: 3600, refresh_token: refreshOut });
     }
     if (form.get("grant_type") !== "refresh_token") return json(res, 400, { error: "unsupported_grant_type" });
 
@@ -209,6 +240,8 @@ export async function startFixture(options: FixtureOptions = {}): Promise<Fixtur
       return json(res, 400, { error: "invalid_grant", error_description: "refresh token reuse detected" });
     }
 
+    const audience = audienceFor(form.get("resource"));
+    if (audience === null) return json(res, 400, { error: "invalid_target" });
     let refreshOut = presented;
     if (tok.rotate) {
       record.used = true;
@@ -217,7 +250,20 @@ export async function startFixture(options: FixtureOptions = {}): Promise<Fixtur
         refreshTokens.set(refreshOut, { family: record.family, clientId: record.clientId, used: false });
       }
     }
-    return json(res, 200, { access_token: newToken("at"), token_type: "Bearer", expires_in: 3600, refresh_token: refreshOut });
+    return json(res, 200, { access_token: accessToken(audience, record.family), token_type: "Bearer", expires_in: 3600, refresh_token: refreshOut });
+  }
+
+  /** Audience of a token requested for `resource`, or null to refuse it (invalid_target). */
+  function audienceFor(resource: string | null): string | null {
+    const own = `${base}/mcp`;
+    if (resource === null || resource === own || tok.resource === "ignore") return own;
+    return tok.resource === "refuse" ? null : resource;
+  }
+
+  function accessToken(audience: string, family: string): string {
+    const t = newToken("at");
+    accessTokens.set(t, { audience, family });
+    return t;
   }
 
   function safeRedirect(uri: string): boolean {
@@ -438,7 +484,12 @@ ${formTag}${hidden}${token}${challenge}${checkbox}
 
     void readBody(req).then((body) => {
       if (path === "/mcp") {
-        if (opts.anonymous) {
+        const origin = req.headers.origin;
+        if (mcpOpts.validateOrigin && origin !== undefined && origin !== base) return json(res, 403, { error: "forbidden_origin" });
+        const bearer = /^Bearer\s+(\S+)$/i.exec(req.headers.authorization ?? "")?.[1];
+        const at = bearer ? accessTokens.get(bearer) : undefined;
+        const tokenOk = at !== undefined && !revokedFamilies.has(at.family) && (!mcpOpts.checkAudience || at.audience === `${base}/mcp`);
+        if (opts.anonymous || tokenOk) {
           return json(res, 200, { jsonrpc: "2.0", id: 1, result: { protocolVersion: "2025-11-25", capabilities: {}, serverInfo: { name: "fixture", version: "0" } } });
         }
         const headers: Record<string, string> = opts.challenge

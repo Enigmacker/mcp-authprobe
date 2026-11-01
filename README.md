@@ -175,12 +175,25 @@ mcp-authprobe login https://mcp.example.com/mcp --out ./test-grant.json
 - It uses PKCE S256, a random `state`, the RFC 8707 `resource`, and checks the RFC 9207 `iss` parameter against the discovered issuer.
 - It writes the grant with mode 600, never through a symbolic link, and never over an existing file unless you pass `--force`. Tokens are never printed.
 - The grant records the **target and token endpoint** it belongs to. A scan of any other target, or a server announcing another token endpoint, will not use it.
-- `login` itself does not require an ownership proof: it only does what any MCP client does when you connect it (one registration, your own browser login, one code exchange). Only the extra `MAP-RDR03` probe requires the proof.
+- `login` itself does not require an ownership proof: it only does what any MCP client does when you connect it (one registration, your own browser login, one code exchange). Only the extra login checks below require the proof.
 - If login fails, the client it registered is deleted when the server allows it.
 
-**`MAP-RDR03` is observed during login**, because it needs a fresh authorization code. When ownership of every contacted host is proven, `login` first presents the code with a *different* `redirect_uri`, which a compliant token endpoint must refuse, then exchanges it normally. The result is stored in the grant file and reported by the next scan of the same target. Use `--no-probe` to skip it.
+**Five checks are observed during login**, because they need a fresh authorization code or a valid access token. They run only when ownership of every contacted host is proven (`--no-probe` skips them), in this order:
 
-Some strict servers invalidate a code after any failed attempt. That is acceptable behaviour: `MAP-RDR03` passes, and `login` asks you to run it again with `--no-probe` to obtain the grant.
+| Check | What `login` does | Fails when |
+| --- | --- | --- |
+| `MAP-PKC01` | Presents the code **without** `code_verifier`, then with a **wrong** one | The token endpoint issues tokens |
+| `MAP-RDR03` | Presents the code with a **different** `redirect_uri` | The token endpoint issues tokens |
+| *(exchange)* | Exchanges the code normally | |
+| `MAP-AUD01` | Checks that its own access token works on the MCP endpoint (control), then uses the refresh token to request a token for `https://other.mcp-authprobe.invalid/mcp` and presents it to your MCP endpoint | The MCP endpoint accepts that token. Passes when the authorization server answers `invalid_target`, or the MCP endpoint answers 401/403 |
+| `MAP-ORG01` | Sends `initialize` with a valid token and `Origin: https://attacker.mcp-authprobe.invalid` | The request is processed like any other (passes on 403) |
+| `MAP-COD01` | Presents the already used code a second time, then tries the refresh token once | The code is exchanged again. Revoking the tokens issued from a reused code is reported as recommended |
+
+The results are stored in the grant file and reported by the next scan of the same target. The refresh token kept in the grant is always the newest one, so rotation during these probes does not break the scan.
+
+If a probe obtains tokens (the check fails), the code is spent: the remaining probes are reported as not run, and the tokens obtained are kept as the grant.
+
+Some strict servers invalidate a code after any failed attempt. That is acceptable behaviour: only the first refusal is trusted, the following probes are reported as inconclusive, and `login` asks you to run it again with `--no-probe` to obtain the grant. Likewise, a server that revokes the tokens after a code reuse (recommended) passes `MAP-COD01`, and `login` asks you to log in again with `--no-probe`.
 
 ## Redirect URI checks
 
@@ -302,8 +315,14 @@ The server is built so that the assistant, or a prompt injection reaching it, ca
 | `MAP-RDR04` | active | available | Dynamic client registration refuses unsafe redirect URIs |
 | `MAP-THR01` | active | available | Repeated failed token requests are throttled (5 to 20 sequential requests with random values) |
 | `MAP-CSR01` | active | available (via `consent-check`) | Consent decision is protected against CSRF |
+| `MAP-PKC01` | active | available (via `login`) | Token endpoint enforces PKCE (no `code_verifier`, wrong `code_verifier`) |
+| `MAP-COD01` | active | available (via `login`) | An authorization code cannot be used twice |
+| `MAP-AUD01` | active | available (via `login`) | Tokens are bound to their audience (RFC 8707) |
+| `MAP-ORG01` | passive | available | MCP endpoint rejects requests from a foreign `Origin` |
 
-Families: **DSC** discovery, **RTK** refresh tokens, **RDR** redirect URIs, **THR** throttling, **CSR** consent CSRF.
+Families: **DSC** discovery, **RTK** refresh tokens, **RDR** redirect URIs, **THR** throttling, **CSR** consent CSRF, **PKC** PKCE, **COD** authorization codes, **AUD** token audience, **ORG** Origin validation.
+
+`MAP-ORG01` runs in every scan without an ownership proof: it sends two ordinary `initialize` requests, one with a foreign `Origin`. Most servers ask for a token before looking at `Origin`; the scan then reports it as inconclusive, and `login` observes it with a valid token.
 
 ## Reports and exit codes
 
@@ -370,6 +389,7 @@ The scanner talks to servers that may be hostile, and it may be driven by an AI 
 
 **0.2.0**
 - ~~Consent CSRF check (CSR01), driven through a browser session~~ done.
+- ~~PKCE enforcement (PKC01), code reuse (COD01), token audience (AUD01), Origin validation (ORG01)~~ done (Unreleased).
 - Optional integration with mcp-posture: run it alongside, or import its JSON report, and merge both into one report where active results confirm or refute what the metadata announces.
 
 ## Development
