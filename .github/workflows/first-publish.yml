@@ -2,8 +2,9 @@ name: First publish (one-time)
 
 # One-time bootstrap: npm trusted publishing can only be configured once the
 # package exists. This workflow publishes the very first version with a
-# short-lived granular token stored as the NPM_TOKEN secret of the "npm"
-# environment. After it succeeds: configure trusted publishing on npmjs.com,
+# short-lived granular token stored as the NPM_TOKEN repository secret
+# (Settings > Secrets and variables > Actions). Environments are not
+# available for private repositories on the free GitHub plan. After it succeeds: configure trusted publishing on npmjs.com,
 # revoke the token, delete the secret, and delete this file.
 
 on:
@@ -20,7 +21,6 @@ jobs:
   publish:
     if: github.event.inputs.confirm == 'publish'
     runs-on: ubuntu-latest
-    environment: npm
     steps:
       - uses: actions/checkout@v4
         with:
