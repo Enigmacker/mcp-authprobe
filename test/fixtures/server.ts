@@ -63,9 +63,19 @@ export interface ConsentBehaviour {
    * "unverified": a token is rendered but never checked;
    * "origin": no token, but a foreign Origin is refused.
    */
-  csrf?: "token" | "none" | "unverified" | "origin";
-  /** SameSite attribute of the session cookie (default Lax). */
-  sameSite?: "Lax" | "Strict" | "None";
+  csrf?: "token" | "none" | "unverified" | "origin" | "presence" | "hex";
+  /** SameSite attribute of the session cookie (default Lax); "unset" omits it. */
+  sameSite?: "Lax" | "Strict" | "None" | "unset";
+  /** Button labels: English (default), French, or "Don't allow" before "Allow". */
+  labels?: "en" | "fr" | "dont-allow";
+  /** A required, unchecked "I agree" checkbox that must be ticked. */
+  requireCheckbox?: boolean;
+  /** Grant through a 302 to an authorization-server resume URL (Hydra style). */
+  resume?: boolean;
+  /** Add a random consent_challenge field (request identifier, not a CSRF token). */
+  challenge?: boolean;
+  /** The form is submitted by JavaScript to a JSON API: the form itself has no action. */
+  spa?: boolean;
 }
 
 export interface FixtureOptions {
@@ -259,7 +269,13 @@ export async function startFixture(options: FixtureOptions = {}): Promise<Fixtur
   // --- consent mode -------------------------------------------------------
   const sessions = new Map<string, string>(); // sid -> csrf token
   let granted = 0;
-  const consentOpts = { csrf: "token" as const, sameSite: "Lax" as const, ...options.consent };
+  const consentOpts: Required<Pick<ConsentBehaviour, "csrf" | "sameSite" | "labels">> & ConsentBehaviour = {
+    csrf: "token",
+    sameSite: "Lax",
+    labels: "en",
+    ...options.consent,
+  };
+  const resumes = new Map<string, string>(); // verifier -> final redirect URL
 
   function cookieOf(req: IncomingMessage, name: string): string | null {
     const header = req.headers.cookie ?? "";
@@ -277,7 +293,8 @@ export async function startFixture(options: FixtureOptions = {}): Promise<Fixtur
   }
 
   function sessionCookie(sid: string): string {
-    return `sid=${sid}; Path=/; HttpOnly; SameSite=${consentOpts.sameSite}${consentOpts.sameSite === "None" ? "; Secure" : ""}`;
+    const same = consentOpts.sameSite === "unset" ? "" : `; SameSite=${consentOpts.sameSite}`;
+    return `sid=${sid}; Path=/; HttpOnly${same}${consentOpts.sameSite === "None" ? "; Secure" : ""}`;
   }
 
   const esc = (v: string): string => v.replace(/&/g, "&amp;").replace(/"/g, "&quot;").replace(/</g, "&lt;");
@@ -296,12 +313,19 @@ export async function startFixture(options: FixtureOptions = {}): Promise<Fixtur
     const hidden = ["client_id", "redirect_uri", "state", "code_challenge", "code_challenge_method", "resource", "scope"]
       .map((k) => `<input type="hidden" name="${k}" value="${esc(q.get(k) ?? "")}">`)
       .join("");
-    const token = consentOpts.csrf === "token" || consentOpts.csrf === "unverified" ? `<input type="hidden" name="csrf_token" value="${esc(csrf)}">` : "";
+    const hexCsrf = Buffer.from(csrf).toString("hex");
+    const tokenValue = consentOpts.csrf === "hex" ? hexCsrf : csrf;
+    const token = ["token", "unverified", "presence", "hex"].includes(consentOpts.csrf) ? `<input type="hidden" name="csrf_token" value="${esc(tokenValue)}">` : "";
+    const challenge = consentOpts.challenge ? `<input type="hidden" name="consent_challenge" value="${newToken("chal")}">` : "";
+    const checkbox = consentOpts.requireCheckbox ? `<label><input type="checkbox" name="agree" value="yes" required> I agree</label>` : "";
+    const [deny, allow] =
+      consentOpts.labels === "fr" ? ["Refuser", "Autoriser"] : consentOpts.labels === "dont-allow" ? ["Don't allow", "Allow"] : ["Deny", "Allow"];
+    const formTag = consentOpts.spa ? `<form id="f" method="post" onsubmit="event.preventDefault(); fetch('/api/consent', {method: 'POST'})">` : `<form method="post" action="/consent">`;
     res.writeHead(200, { "content-type": "text/html; charset=utf-8" });
     res.end(`<!doctype html><title>Consent</title><h1>Allow test client?</h1>
-<form method="post" action="/consent">${hidden}${token}
-<button type="submit" name="decision" value="deny">Deny</button>
-<button type="submit" name="decision" value="allow">Allow</button></form>`);
+${formTag}${hidden}${token}${challenge}${checkbox}
+<button type="submit" name="decision" value="deny">${deny}</button>
+<button type="submit" name="decision" value="allow">${allow}</button></form>`);
   }
 
   function consentSubmit(req: IncomingMessage, body: string, res: ServerResponse): void {
@@ -310,6 +334,21 @@ export async function startFixture(options: FixtureOptions = {}): Promise<Fixtur
     if (!sid || csrf === undefined) return json(res, 401, { error: "login_required" });
     const form = new URLSearchParams(body);
     if (consentOpts.csrf === "token" && form.get("csrf_token") !== csrf) return json(res, 403, { error: "invalid_csrf_token" });
+    if (consentOpts.csrf === "presence" && !form.get("csrf_token")) return json(res, 403, { error: "missing_csrf_token" });
+    if (consentOpts.csrf === "hex") {
+      // Lenient hex decoding, as Buffer.from does: it stops at the first invalid character.
+      const given = Buffer.from(form.get("csrf_token") ?? "", "hex");
+      const expected = Buffer.from(csrf);
+      if (given.length !== expected.length || !given.equals(expected)) return json(res, 403, { error: "invalid_csrf_token" });
+    }
+    if (consentOpts.challenge && !form.get("consent_challenge")) return json(res, 400, { error: "missing_challenge" });
+    if (consentOpts.requireCheckbox && form.get("agree") !== "yes") {
+      const back = new URL(form.get("redirect_uri") ?? "");
+      back.searchParams.set("error", "access_denied");
+      res.writeHead(302, { location: back.toString() });
+      res.end();
+      return;
+    }
     if (consentOpts.csrf === "origin" && req.headers.origin !== undefined && req.headers.origin !== base) return json(res, 403, { error: "bad_origin" });
     const redirectUri = form.get("redirect_uri") ?? "";
     const client = clients.get(form.get("client_id") ?? "");
@@ -324,7 +363,22 @@ export async function startFixture(options: FixtureOptions = {}): Promise<Fixtur
       codes.set(code, { clientId: form.get("client_id") ?? "", redirectUri, challenge: form.get("code_challenge") ?? "", used: false });
       back.searchParams.set("code", code);
     }
+    if (consentOpts.resume && form.get("decision") === "allow") {
+      const verifier = newToken("ver");
+      resumes.set(verifier, back.toString());
+      res.writeHead(302, { location: `${base}/resume?consent_verifier=${verifier}` });
+      res.end();
+      return;
+    }
     res.writeHead(302, { location: back.toString() });
+    res.end();
+  }
+
+  function resumeEndpoint(url: URL, res: ServerResponse): void {
+    const target = resumes.get(url.searchParams.get("consent_verifier") ?? "");
+    if (!target) return json(res, 400, { error: "invalid_verifier" });
+    resumes.delete(url.searchParams.get("consent_verifier") ?? "");
+    res.writeHead(302, { location: target });
     res.end();
   }
 
@@ -420,6 +474,8 @@ export async function startFixture(options: FixtureOptions = {}): Promise<Fixtur
       if (options.consent && path === "/authorize" && req.method === "GET") return consentAuthorize(req, new URL(req.url ?? "/", base), res);
       if (options.consent && path === "/consent" && req.method === "POST") return consentSubmit(req, body, res);
       if (options.consent && path === "/login") return loginPage(req, new URL(req.url ?? "/", base), body, res);
+      if (options.consent && path === "/resume") return resumeEndpoint(new URL(req.url ?? "/", base), res);
+      if (options.consent && path === "/authorize" && req.method === "POST") return json(res, 405, { error: "method_not_allowed" });
       if (path === "/authorize" && req.method === "GET") return authorizeEndpoint(new URL(req.url ?? "/", base), res);
       if (path === "/.well-known/mcp-authprobe.txt" && opts.ownershipFile !== null) {
         res.writeHead(200, { "content-type": "text/plain" });

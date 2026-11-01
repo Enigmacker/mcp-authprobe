@@ -1,7 +1,7 @@
 import { parse, type HTMLElement } from "node-html-parser";
 import { CATALOGUE } from "../checks/catalogue.js";
+import type { HttpClient, HttpResponse } from "../net/http.js";
 import { SAFE_DOMAIN } from "../oauth/registration.js";
-import type { HttpClient } from "../net/http.js";
 import { safeText } from "../redact.js";
 import type { Finding } from "../types.js";
 
@@ -10,19 +10,23 @@ import type { Finding } from "../types.js";
  * forgery?
  *
  * Input is a snapshot of the consent page as a logged-in test user sees it
- * (rendered HTML, URL, cookies), taken by the browser driver. Analysis and
- * replay are plain HTTP, so they can be tested without a browser.
+ * (rendered HTML, URL, cookies with their raw SameSite attribute), taken by
+ * the browser driver. Analysis and replay are plain HTTP, so they can be
+ * tested without a browser.
  *
- * Replay probes, all sent with the session cookies and a foreign Origin,
- * at most three POSTs, never followed:
- *   1. the approve form WITHOUT any anti-CSRF field   -> must be refused
- *   2. the approve form with the anti-CSRF field ALTERED -> must be refused
- *   3. the approve form as is, but from a foreign Origin -> informational
- * Accepted means the server redirected to the client's redirect_uri with a
- * code: consent was granted by a request a third-party site could forge.
+ * Probes, at most four form submissions with the session cookies:
+ *   1. without the anti-CSRF field, foreign Origin      -> must be refused
+ *   2. with the anti-CSRF field altered, foreign Origin -> must be refused
+ *   3. untouched, foreign Origin                        -> informational
+ *   C. untouched, the page's own Origin (control)       -> must grant
+ * A "pass" requires the control to prove that the tool reproduces a real
+ * grant (from probe 3 or C). Without it, a refusal could come from a badly
+ * rebuilt request, so the result is inconclusive, never a pass.
  */
 
 export const FOREIGN_ORIGIN = `https://attacker.${SAFE_DOMAIN}`;
+
+export type SameSite = "Strict" | "Lax" | "None" | "Unspecified";
 
 export interface SnapshotCookie {
   name: string;
@@ -31,7 +35,8 @@ export interface SnapshotCookie {
   path: string;
   secure: boolean;
   httpOnly: boolean;
-  sameSite: "Strict" | "Lax" | "None";
+  /** Raw attribute as sent by the server; "Unspecified" when absent or unknown. */
+  sameSite: SameSite;
 }
 
 export interface ConsentSnapshot {
@@ -39,7 +44,7 @@ export interface ConsentSnapshot {
   url: string;
   /** Rendered HTML of the consent page. */
   html: string;
-  /** Cookies the browser holds for the consent page origin. Values stay in memory. */
+  /** Cookies the browser holds. Values stay in memory. */
   cookies: SnapshotCookie[];
   /** The redirect_uri registered for the test client. */
   redirectUri: string;
@@ -57,17 +62,22 @@ export interface ConsentForm {
   fields: FormField[];
   /** The submit control that approves, if it carries a name. */
   approve: FormField | null;
-  /** Names of fields that look like anti-CSRF tokens. */
+  /** Fields recognised by name as anti-CSRF tokens. */
   csrfFields: string[];
+  /** Random-looking hidden fields that are not recognised by name (kept in every probe). */
+  unclassified: string[];
 }
 
-const APPROVE = /\b(allow|approve|authori[sz]e|accept|consent|grant|continue|confirm|yes|agree)\b/i;
-const DENY = /\b(deny|cancel|reject|refuse|decline|no)\b/i;
-const CSRF_NAME = /csrf|xsrf|authenticity|_token$|^token$|form[_-]?token|request[_-]?token|anti[_-]?forgery|__requestverificationtoken|nonce/i;
-/** OAuth request parameters echoed in consent forms: never anti-CSRF tokens. */
+const APPROVE =
+  /\b(allow|approve|authori[sz]e|accept|consent|grant|continue|confirm|yes|agree|autoriser|accepter|valider|confirmer|erlauben|zulassen|akzeptieren|zustimmen|permitir|aceptar|autorizar|consentire|autorizza|consenti)\b/i;
+const DENY =
+  /\b(deny|cancel|reject|refuse|decline|no|not now|never|don'?t|do not|refuser|annuler|ne pas|ablehnen|abbrechen|verweigern|rechazar|cancelar|denegar|rifiuta|annulla)\b/i;
+const CSRF_NAME = /csrf|xsrf|authenticity|_token$|^token$|form[_-]?token|request[_-]?verification|anti[_-]?forgery/i;
+/** OAuth / OIDC request parameters echoed in consent forms: never anti-CSRF tokens. */
 const OAUTH_PARAMS = new Set([
-  "client_id", "redirect_uri", "response_type", "scope", "state", "code_challenge",
-  "code_challenge_method", "resource", "audience", "prompt", "response_mode",
+  "client_id", "redirect_uri", "response_type", "scope", "state", "code_challenge", "code_challenge_method",
+  "resource", "audience", "prompt", "response_mode", "nonce", "login_challenge", "consent_challenge",
+  "request_uri", "transaction_id", "interaction_id",
 ]);
 
 function looksRandom(value: string): boolean {
@@ -75,48 +85,79 @@ function looksRandom(value: string): boolean {
 }
 
 function controlText(el: HTMLElement): string {
-  return `${el.getAttribute("name") ?? ""} ${el.getAttribute("value") ?? ""} ${el.text ?? ""} ${el.getAttribute("id") ?? ""}`;
+  return `${el.getAttribute("name") ?? ""} ${el.getAttribute("value") ?? ""} ${el.text ?? ""} ${el.getAttribute("aria-label") ?? ""}`;
+}
+
+function isApprove(el: HTMLElement): boolean {
+  const t = controlText(el);
+  return APPROVE.test(t) && !DENY.test(t);
 }
 
 /** Extract the approve form of a consent page, or null when there is none. */
 export function findConsentForm(html: string, pageUrl: string): ConsentForm | null {
   const root = parse(html);
+  const baseHref = root.querySelector("base[href]")?.getAttribute("href");
+  let base = pageUrl;
+  try {
+    if (baseHref) base = new URL(baseHref, pageUrl).toString();
+  } catch {
+    /* keep the page URL */
+  }
   const candidates: Array<ConsentForm & { score: number }> = [];
 
   for (const form of root.querySelectorAll("form")) {
-    const method = (form.getAttribute("method") ?? "get").toLowerCase();
-    if (method !== "post") continue;
     if (form.querySelector("input[type=password]")) continue; // a login form, not consent
+    const id = form.getAttribute("id");
+    const outside = id ? root.querySelectorAll(`[form="${id}"]`) : [];
+    const controls = (selector: string): HTMLElement[] => [...form.querySelectorAll(selector), ...outside.filter((el) => el.matches(selector))];
+
+    const submits = [...controls("button"), ...controls("input[type=submit]")].filter((b) => (b.getAttribute("type") ?? "submit").toLowerCase() === "submit");
+    if (submits.length > 0 && submits.every((s) => DENY.test(controlText(s)) && !APPROVE.test(controlText(s)))) continue;
+    const approveEl = submits.find(isApprove);
+
+    const method = (approveEl?.getAttribute("formmethod") ?? form.getAttribute("method") ?? "get").toLowerCase();
+    if (method !== "post") continue;
     let action: string;
     try {
-      action = new URL(form.getAttribute("action") ?? pageUrl, pageUrl).toString();
+      action = new URL(approveEl?.getAttribute("formaction") ?? form.getAttribute("action") ?? pageUrl, base).toString();
     } catch {
       continue;
     }
 
     const fields: FormField[] = [];
-    for (const input of form.querySelectorAll("input")) {
+    for (const input of controls("input")) {
       const name = input.getAttribute("name");
       const type = (input.getAttribute("type") ?? "text").toLowerCase();
-      if (!name || type === "submit" || type === "button" || type === "image") continue;
-      if ((type === "checkbox" || type === "radio") && input.getAttribute("checked") === undefined) continue;
+      if (!name || ["submit", "button", "image", "reset", "file"].includes(type)) continue;
+      if (type === "checkbox" || type === "radio") {
+        const checked = input.getAttribute("checked") !== undefined;
+        const required = input.getAttribute("required") !== undefined;
+        // A required "I agree" box is what a real user ticks before approving.
+        if (!checked && !(required && type === "checkbox")) continue;
+        fields.push({ name, value: input.getAttribute("value") ?? "on", type });
+        continue;
+      }
       fields.push({ name, value: input.getAttribute("value") ?? "", type });
     }
-
-    const submits = [...form.querySelectorAll("button"), ...form.querySelectorAll("input[type=submit]")];
-    const approveEl = submits.find((s) => APPROVE.test(controlText(s)) && !DENY.test(controlText(s)));
-    const denyOnly = submits.length > 0 && submits.every((s) => DENY.test(controlText(s)));
-    if (denyOnly) continue;
+    for (const ta of controls("textarea")) {
+      const name = ta.getAttribute("name");
+      if (name) fields.push({ name, value: ta.text, type: "textarea" });
+    }
+    for (const sel of controls("select")) {
+      const name = sel.getAttribute("name");
+      if (!name) continue;
+      const opt = sel.querySelector("option[selected]") ?? sel.querySelector("option");
+      if (opt) fields.push({ name, value: opt.getAttribute("value") ?? opt.text, type: "select" });
+    }
 
     const approveName = approveEl?.getAttribute("name");
     const approve = approveEl && approveName ? { name: approveName, value: approveEl.getAttribute("value") ?? "", type: "submit" } : null;
-
-    const csrfFields = fields
-      .filter((f) => f.type === "hidden" && !OAUTH_PARAMS.has(f.name.toLowerCase()) && (CSRF_NAME.test(f.name) || looksRandom(f.value)))
-      .map((f) => f.name);
+    const hidden = fields.filter((f) => f.type === "hidden" && !OAUTH_PARAMS.has(f.name.toLowerCase()));
+    const csrfFields = hidden.filter((f) => CSRF_NAME.test(f.name)).map((f) => f.name);
+    const unclassified = hidden.filter((f) => !CSRF_NAME.test(f.name) && looksRandom(f.value)).map((f) => f.name);
 
     const score = (approveEl ? 2 : 0) + (fields.some((f) => OAUTH_PARAMS.has(f.name.toLowerCase())) ? 1 : 0);
-    candidates.push({ action, method, fields, approve, csrfFields, score });
+    candidates.push({ action, method, fields, approve, csrfFields, unclassified, score });
   }
   candidates.sort((a, b) => b.score - a.score);
   const best = candidates[0];
@@ -132,69 +173,127 @@ function body(form: ConsentForm, mutate: (fields: FormField[]) => FormField[]): 
   return params.toString();
 }
 
-export type ProbeVerdict = "accepted" | "refused" | "inconclusive";
-
-/** True when a response grants consent: a redirect to the redirect_uri carrying a code. */
-export function grantsConsent(status: number, location: string | undefined, redirectUri: string, base: string): boolean {
-  if (status < 300 || status >= 400 || !location) return false;
-  let loc: URL;
-  let red: URL;
-  try {
-    loc = new URL(location, base);
-    red = new URL(redirectUri);
-  } catch {
-    return false;
-  }
-  return loc.origin === red.origin && loc.pathname === red.pathname && loc.searchParams.has("code");
+/**
+ * Alter a token without changing its length or alphabet, so lenient decoders
+ * (hex or base64 parsers that stop at an invalid character) still see a
+ * different value.
+ */
+export function alterToken(value: string): string {
+  const chars = [...value];
+  const i = chars.findIndex((c) => /[A-Za-z0-9]/.test(c));
+  if (i < 0) return `${value}A`;
+  const c = chars[i] as string;
+  const next = (from: string, to: string): string => (c === to ? from : String.fromCharCode(c.charCodeAt(0) + 1));
+  // Stay within hex digits when the value is hex.
+  const isHex = /^[0-9a-fA-F]+$/.test(value);
+  if (/[0-9]/.test(c)) chars[i] = next("0", "9");
+  else if (/[a-z]/.test(c)) chars[i] = isHex ? (c === "f" ? "a" : next("a", "z")) : next("a", "z");
+  else chars[i] = isHex ? (c === "F" ? "A" : next("A", "Z")) : next("A", "Z");
+  return chars.join("");
 }
 
-async function probe(http: HttpClient, snap: ConsentSnapshot, form: ConsentForm, payload: string): Promise<{ verdict: ProbeVerdict; detail: string }> {
-  const formOrigin = new URL(form.action).origin;
-  // Send only the cookies the browser would attach to this origin.
-  const cookies = snap.cookies.filter((c) => {
-    const host = new URL(form.action).hostname;
-    const domain = c.domain.replace(/^\./, "");
-    return host === domain || host.endsWith(`.${domain}`);
-  });
-  const res = await http.request({
-    url: form.action,
+// --- cookies -------------------------------------------------------------
+
+/** RFC 6265 domain, path and secure matching; host-only cookies have no leading dot. */
+export function cookieApplies(c: SnapshotCookie, url: URL): boolean {
+  const host = url.hostname.toLowerCase();
+  const hostOnly = !c.domain.startsWith(".");
+  const domain = c.domain.replace(/^\./, "").toLowerCase();
+  const domainOk = hostOnly ? host === domain : host === domain || host.endsWith(`.${domain}`);
+  if (!domainOk) return false;
+  const path = url.pathname || "/";
+  const cp = c.path || "/";
+  const pathOk = path === cp || (path.startsWith(cp) && (cp.endsWith("/") || path[cp.length] === "/"));
+  if (!pathOk) return false;
+  return !c.secure || url.protocol === "https:";
+}
+
+/** Browser-side defence: are the session cookies sent with the form explicitly SameSite Lax or Strict? */
+export function assessCookies(snap: ConsentSnapshot, action: URL): { protective: boolean; lines: string[] } {
+  const sent = snap.cookies.filter((c) => cookieApplies(c, action));
+  // Session cookies are normally HttpOnly; judge those when there are any.
+  const session = sent.some((c) => c.httpOnly) ? sent.filter((c) => c.httpOnly) : sent;
+  const lines = sent.map((c) => `cookie ${c.name}: SameSite=${c.sameSite}${c.secure ? ", Secure" : ""}${c.httpOnly ? ", HttpOnly" : ""}`);
+  const protective = session.length > 0 && session.every((c) => c.sameSite === "Lax" || c.sameSite === "Strict");
+  return { protective, lines };
+}
+
+// --- probes --------------------------------------------------------------
+
+export type ProbeVerdict = "accepted" | "refused" | "inconclusive";
+
+/** True when a response grants consent: a redirect (or an auto-submitting page) to the redirect_uri carrying a code. */
+export function grantsConsent(res: Pick<HttpResponse, "status" | "headers" | "body">, redirectUri: string, base: string): boolean {
+  const red = new URL(redirectUri);
+  const location = res.headers["location"];
+  if (res.status >= 300 && res.status < 400 && location) {
+    try {
+      const loc = new URL(location, base);
+      return loc.origin === red.origin && loc.pathname === red.pathname && loc.searchParams.has("code");
+    } catch {
+      return false;
+    }
+  }
+  if (res.status === 200 && res.body) {
+    // meta refresh, JS redirect, or response_mode=form_post page.
+    const target = `${red.origin}${red.pathname}`;
+    const text = res.body.replace(/&amp;/g, "&");
+    return text.includes(target) && /[?&"' ]code[=" ']/.test(text.slice(text.indexOf(target)));
+  }
+  return false;
+}
+
+interface ProbeContext {
+  http: HttpClient;
+  snap: ConsentSnapshot;
+  form: ConsentForm;
+  allowedHosts: string[];
+}
+
+function cookieHeader(snap: ConsentSnapshot, url: URL): Record<string, string> {
+  const cookies = snap.cookies.filter((c) => cookieApplies(c, url));
+  return cookies.length > 0 ? { cookie: cookies.map((c) => `${c.name}=${c.value}`).join("; ") } : {};
+}
+
+async function probe(ctx: ProbeContext, payload: string, origin: string): Promise<{ verdict: ProbeVerdict; detail: string }> {
+  const action = new URL(ctx.form.action);
+  const referer = origin === FOREIGN_ORIGIN ? `${FOREIGN_ORIGIN}/` : ctx.snap.url;
+  const res = await ctx.http.request({
+    url: action.toString(),
     method: "POST",
     headers: {
       "content-type": "application/x-www-form-urlencoded",
       accept: "text/html,application/json",
-      origin: FOREIGN_ORIGIN,
-      referer: `${FOREIGN_ORIGIN}/`,
-      ...(cookies.length > 0 ? { cookie: cookies.map((c) => `${c.name}=${c.value}`).join("; ") } : {}),
+      origin,
+      referer,
+      ...cookieHeader(ctx.snap, action),
     },
     body: payload,
   });
-  const location = res.headers["location"];
-  if (grantsConsent(res.status, location, snap.redirectUri, formOrigin)) return { verdict: "accepted", detail: `HTTP ${res.status}, redirected to the client with an authorization code` };
+  if (grantsConsent(res, ctx.snap.redirectUri, action.toString())) return { verdict: "accepted", detail: `HTTP ${res.status}, authorization code issued to the client` };
   if (res.status === 429 || res.status >= 500 || res.headers["retry-after"] !== undefined) return { verdict: "inconclusive", detail: `HTTP ${res.status}, rate limited or server error` };
   if (res.status >= 400) return { verdict: "refused", detail: `HTTP ${res.status}` };
-  if (res.status >= 300 && location) {
+
+  const location = res.headers["location"];
+  if (res.status >= 300 && res.status < 400 && location) {
+    let loc: URL;
     try {
-      const loc = new URL(location, form.action);
-      const red = new URL(snap.redirectUri);
-      if (loc.origin === red.origin && loc.pathname === red.pathname) return { verdict: "refused", detail: `HTTP ${res.status}, redirected to the client with an error` };
+      loc = new URL(location, action);
     } catch {
-      /* fall through */
+      return { verdict: "inconclusive", detail: `HTTP ${res.status}, unreadable redirect` };
     }
-    return { verdict: "inconclusive", detail: `HTTP ${res.status}, redirected elsewhere` };
+    const red = new URL(ctx.snap.redirectUri);
+    if (loc.origin === red.origin && loc.pathname === red.pathname) return { verdict: "refused", detail: `HTTP ${res.status}, redirected to the client without a code` };
+    // One more hop on a proven host (e.g. an authorization server resuming the flow).
+    if (ctx.allowedHosts.includes(loc.hostname.toLowerCase())) {
+      const hop = await ctx.http.request({ url: loc.toString(), headers: { accept: "text/html", ...cookieHeader(ctx.snap, loc) } });
+      if (grantsConsent(hop, ctx.snap.redirectUri, loc.toString())) return { verdict: "accepted", detail: `HTTP ${res.status} then ${hop.status}, authorization code issued to the client` };
+      if (hop.status >= 400 && hop.status !== 429 && hop.status < 500) return { verdict: "refused", detail: `HTTP ${res.status} then ${hop.status}` };
+      return { verdict: "inconclusive", detail: `HTTP ${res.status} then ${hop.status}, outcome unclear` };
+    }
+    return { verdict: "inconclusive", detail: `HTTP ${res.status}, redirected to an unproven host (not followed)` };
   }
   return { verdict: "inconclusive", detail: `HTTP ${res.status}, no redirect` };
-}
-
-/** Browser-side defence: are the session cookies of the consent origin SameSite Lax or Strict? */
-export function assessCookies(snap: ConsentSnapshot): { protective: boolean; lines: string[] } {
-  const host = new URL(snap.url).hostname;
-  const relevant = snap.cookies.filter((c) => {
-    const domain = c.domain.replace(/^\./, "");
-    return host === domain || host.endsWith(`.${domain}`);
-  });
-  const lines = relevant.map((c) => `cookie ${c.name}: SameSite=${c.sameSite}${c.secure ? ", Secure" : ""}${c.httpOnly ? ", HttpOnly" : ""}`);
-  const protective = relevant.length > 0 && relevant.every((c) => c.sameSite === "Lax" || c.sameSite === "Strict");
-  return { protective, lines };
 }
 
 function finding(status: Finding["status"], target: string, message: string, evidence: string[]): Finding {
@@ -208,46 +307,70 @@ function finding(status: Finding["status"], target: string, message: string, evi
  *   when the consent form posts to one of them.
  */
 export async function runConsentCheck(http: HttpClient, target: string, snap: ConsentSnapshot, allowedHosts: readonly string[]): Promise<Finding> {
-  const cookies = assessCookies(snap);
+  const allowed = allowedHosts.map((h) => h.toLowerCase());
   const form = findConsentForm(snap.html, snap.url);
   if (!form) {
-    return finding("error", target, "No consent form was found on the page that was captured; make sure the consent page is displayed when you confirm.", cookies.lines);
+    return finding("error", target, "No consent form was found on the page that was captured; make sure the consent page is displayed when you confirm.", []);
   }
-  const actionHost = new URL(form.action).hostname.toLowerCase();
-  if (!allowedHosts.map((h) => h.toLowerCase()).includes(actionHost)) {
-    return finding("error", target, `The consent form posts to ${actionHost}, whose ownership is not proven; no request was sent to it.`, cookies.lines);
+  const action = new URL(form.action);
+  const cookies = assessCookies(snap, action);
+  if (!allowed.includes(action.hostname.toLowerCase())) {
+    return finding("error", target, `The consent form posts to ${action.hostname}, whose ownership is not proven; no request was sent to it.`, cookies.lines);
   }
+  const ctx: ProbeContext = { http, snap, form, allowedHosts: allowed };
   const evidence = [
-    `consent form: POST ${new URL(form.action).origin}${new URL(form.action).pathname}`,
-    form.csrfFields.length > 0 ? `anti-CSRF field(s): ${form.csrfFields.join(", ")}` : "no anti-CSRF field found in the form",
+    `consent form: POST ${action.origin}${action.pathname}${form.approve ? `, approve control "${form.approve.name}"` : ", no named approve control"}`,
+    form.csrfFields.length > 0 ? `anti-CSRF field(s): ${form.csrfFields.join(", ")}` : "no field recognised as an anti-CSRF token",
+    ...(form.unclassified.length > 0 ? [`request identifier(s) kept in every probe: ${form.unclassified.join(", ")}`] : []),
     ...cookies.lines,
   ];
+  const ownOrigin = new URL(snap.url).origin;
 
-  // Probe 1: no anti-CSRF field at all, foreign Origin.
-  const stripped = await probe(http, snap, form, body(form, (fs) => fs.filter((f) => !form.csrfFields.includes(f.name))));
-  evidence.push(`probe 1, without anti-CSRF field, foreign Origin: ${stripped.verdict} (${stripped.detail})`);
-  if (stripped.verdict === "accepted") {
+  // 1. Without the anti-CSRF field, from a foreign Origin.
+  const p1 = await probe(ctx, body(form, (fs) => fs.filter((f) => !form.csrfFields.includes(f.name))), FOREIGN_ORIGIN);
+  evidence.push(`probe 1, without anti-CSRF field, foreign Origin: ${p1.verdict} (${p1.detail})`);
+  if (p1.verdict === "accepted") {
+    const reliance =
+      form.csrfFields.length === 0 && form.unclassified.length > 0
+        ? ` Protection then relies only on ${form.unclassified.join(", ")} being bound to the user's session; check that it is.`
+        : "";
     const mitigation = cookies.protective
-      ? " SameSite cookies block this from other sites in modern browsers, but not from same-site subdomains or older clients."
-      : " The session cookies are not SameSite Lax/Strict, so any website can make a logged-in user grant access.";
-    return finding("fail", target, `Consent was granted by a request without any anti-CSRF token, from a foreign Origin.${mitigation}`, evidence);
+      ? " The session cookies are SameSite Lax/Strict, which blocks this from other sites in modern browsers, but not from same-site subdomains or older clients."
+      : " The session cookies are not explicitly SameSite Lax/Strict, so a website can make a logged-in user grant access.";
+    return finding("fail", target, `Consent was granted by a request without any anti-CSRF token, from a foreign Origin.${mitigation}${reliance}`, evidence);
   }
 
-  // Probe 2: altered token, only meaningful when the form has one.
+  // 2. Altered token, only when a token was recognised.
+  let p2: { verdict: ProbeVerdict; detail: string } | null = null;
   if (form.csrfFields.length > 0) {
-    const altered = await probe(http, snap, form, body(form, (fs) => fs.map((f) => (form.csrfFields.includes(f.name) ? { ...f, value: `${f.value}x` } : f))));
-    evidence.push(`probe 2, altered anti-CSRF field, foreign Origin: ${altered.verdict} (${altered.detail})`);
-    if (altered.verdict === "accepted") {
+    p2 = await probe(ctx, body(form, (fs) => fs.map((f) => (form.csrfFields.includes(f.name) ? { ...f, value: alterToken(f.value) } : f))), FOREIGN_ORIGIN);
+    evidence.push(`probe 2, altered anti-CSRF field, foreign Origin: ${p2.verdict} (${p2.detail})`);
+    if (p2.verdict === "accepted") {
       return finding("fail", target, "Consent was granted with an altered anti-CSRF token: the token is present but not verified.", evidence);
     }
   }
 
-  // Probe 3: the untouched form from a foreign Origin (informational).
-  const foreign = await probe(http, snap, form, body(form, (fs) => fs));
-  evidence.push(`probe 3, valid form, foreign Origin: ${foreign.verdict} (${foreign.detail})${foreign.verdict === "accepted" ? " - the server does not check Origin; the anti-CSRF token is the only server-side defence" : ""}`);
-
-  if (stripped.verdict === "refused") {
-    return finding("pass", target, "Consent submissions without a valid anti-CSRF token are refused.", evidence);
+  // 3. Untouched form, foreign Origin (informational), then the control.
+  const p3 = await probe(ctx, body(form, (fs) => fs), FOREIGN_ORIGIN);
+  evidence.push(`probe 3, untouched form, foreign Origin: ${p3.verdict} (${p3.detail})${p3.verdict === "accepted" ? " - Origin is not checked; the anti-CSRF token is the only server-side defence" : ""}`);
+  let replayWorks = p3.verdict === "accepted";
+  if (!replayWorks) {
+    const control = await probe(ctx, body(form, (fs) => fs), ownOrigin);
+    evidence.push(`control, untouched form, page's own Origin: ${control.verdict} (${control.detail})`);
+    replayWorks = control.verdict === "accepted";
   }
-  return finding("error", target, "Inconclusive: the server's answers could not be classified as a grant or a refusal.", evidence);
+
+  if (!replayWorks) {
+    return finding(
+      "error",
+      target,
+      "Inconclusive: the tool could not reproduce a grant even with the untouched form, so the refusals above may come from a badly rebuilt request (labels not recognised, consent sent by JavaScript, multi-step flow, single-use token).",
+      evidence,
+    );
+  }
+  const verdicts = [p1.verdict, ...(p2 ? [p2.verdict] : [])];
+  if (verdicts.some((v) => v === "inconclusive")) {
+    return finding("error", target, "Inconclusive: some forged submissions got an answer that is neither a grant nor a refusal.", evidence);
+  }
+  return finding("pass", target, "Forged consent submissions without a valid anti-CSRF token are refused, while the genuine form is accepted.", evidence);
 }

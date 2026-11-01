@@ -225,13 +225,16 @@ npx -p mcp-authprobe -p playwright-core mcp-authprobe consent-check https://mcp.
 1. The ownership of every contacted host must be proven first.
 2. It registers a temporary client and opens **your installed Chrome** (or `--browser msedge`, or `--browser-path <executable>`) on the authorization page. No browser is downloaded; `playwright-core` is an optional dependency used only by this command.
 3. You log in with the test account. When the consent page is shown, **do not click anything**: go back to the terminal and press Enter.
-4. The tool reads the consent form and the cookie attributes as the browser sees them, closes the browser, then sends at most three form submissions with the session cookies and a **foreign Origin**:
-   - without any anti-CSRF field: must be refused;
-   - with the anti-CSRF field altered: must be refused;
-   - the untouched form: informational, shows whether the server also checks Origin.
+4. The tool reads the consent form and the cookie attributes exactly as the server set them, closes the browser, then sends form submissions with the session cookies:
+   - without any anti-CSRF field, from a foreign Origin: must be refused;
+   - with the anti-CSRF field altered (same length and alphabet), from a foreign Origin: must be refused;
+   - the untouched form, from a foreign Origin: informational, shows whether the server also checks Origin;
+   - a **control**: the untouched form from the page's own Origin, which must be accepted.
 5. It deletes the temporary client. The loopback redirect URI is served by the tool itself, so even an accidental approval delivers the code nowhere else.
 
-The check **fails** when consent is granted without a valid anti-CSRF token. The finding also reports whether the session cookies are `SameSite=Lax/Strict`, which blocks the attack from other sites in modern browsers, but not from same-site subdomains or older clients. It is not available in MCP server mode, because it needs you to log in.
+The check **fails** when consent is granted without a valid anti-CSRF token. It only **passes** when the control proves that the tool reproduces a real grant; otherwise (labels it cannot recognise, consent sent by JavaScript, multi-step flows, single-use tokens) the result is **inconclusive**, never a pass. The finding also reports whether the session cookies are explicitly `SameSite=Lax/Strict`, which blocks the attack from other sites in modern browsers, but not from same-site subdomains or older clients; a cookie without the attribute is reported as `Unspecified`. Ctrl-C, closing the browser or a 10-minute timeout stop the check cleanly and still delete the temporary client.
+
+It is not available in MCP server mode, because it needs you to log in.
 
 ## Use it from an MCP client
 
