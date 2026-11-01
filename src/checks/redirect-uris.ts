@@ -184,7 +184,7 @@ export async function runRedirectUriChecks(ctx: RedirectCheckContext): Promise<F
           client = reg.client;
           created.push(reg.client);
         } else {
-          const msg = `Could not register a test client (HTTP ${reg.status}${reg.error ? `, error=${reg.error}` : ""}).`;
+          const msg = `Could not register a test client (HTTP ${reg.status}${reg.error ? `, error=${reg.error}` : ""})${reg.status === 429 || reg.retryAfter ? ": the registration endpoint is rate limited, run the scan again later" : ""}.`;
           findings.push(result("MAP-RDR01", target, "error", msg), result("MAP-RDR02", target, "error", msg));
         }
       } catch (err) {

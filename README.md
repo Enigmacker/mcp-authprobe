@@ -15,6 +15,7 @@ Passive scanners read what a remote [Model Context Protocol](https://modelcontex
 
 ## Contents
 
+- [Field-tested](#field-tested)
 - [Why another scanner?](#why-another-scanner)
 - [Install](#install)
 - [Try it in a minute: the lab](#try-it-in-a-minute-the-lab)
@@ -33,6 +34,15 @@ Passive scanners read what a remote [Model Context Protocol](https://modelcontex
 - [Roadmap](#roadmap)
 - [Development](#development)
 - [Contributing and security](#contributing-and-security)
+
+## Field-tested
+
+Besides its own test suite and lab, mcp-authprobe was run against real authorization stacks before each release:
+
+- **node-oidc-provider** (an OpenID Certified authorization server) with dynamic registration, resource indicators and JWT access tokens, in front of an MCP server built with the official TypeScript SDK that validates the token audience and the `Origin` header. Every check that can be judged from outside passed; `MAP-THR01` failed, as expected, since that provider leaves rate limiting to the deployment; and its consent page, protected by a per-flow identifier instead of an anti-CSRF field, is reported as inconclusive with the reason.
+- **The MCP TypeScript SDK's OAuth example server**, a demonstration that is not meant for production. The results matched its code: `redirect_uri` not bound to the code, no `Origin` validation, unsafe redirect URIs accepted at registration, no refresh tokens, and crashes reported as inconclusive rather than passes.
+
+These runs led to several fixes: results kept when a server issues no refresh token or crashes during login, a throttling check that copes with a broken refresh grant, and the per-flow identifier analysis above.
 
 ## Why another scanner?
 
@@ -244,7 +254,7 @@ Reading the results: a variant answered exactly like the baseline (for example b
 Without rate limiting, refresh tokens, authorization codes and client secrets can be guessed at line speed. `MAP-THR01` checks that the token endpoint slows down repeated failures, with strict bounds:
 
 - It sends **10** token requests by default (`--throttle-attempts`, between **5 and 20**, hard-capped), **one at a time**.
-- Each request carries a **freshly generated random refresh token** that cannot be valid. Nothing is guessed, and **user passwords and login forms are never involved**.
+- Each request carries a **freshly generated random refresh token** that cannot be valid. Nothing is guessed, and **user passwords and login forms are never involved**. If the very first one gets a server error or `unsupported_grant_type` (a server without a working refresh grant), the check switches once to random authorization codes and starts counting again.
 - It uses your test client when a grant is supplied (your real refresh token is not sent), otherwise a temporary client that is deleted afterwards.
 - It stops at the first sign of throttling: HTTP 429, a `Retry-After` header, or an OAuth `slow_down` / `temporarily_unavailable` error.
 - It runs **last** in a scan, so a throttled token endpoint cannot disturb the other checks.
@@ -268,6 +278,8 @@ npx -p mcp-authprobe -p playwright-core mcp-authprobe consent-check https://mcp.
    - the untouched form, from a foreign Origin: informational, shows whether the server also checks Origin;
    - a **control**: the untouched form from the page's own Origin, which must be accepted.
 5. It deletes the temporary client. The loopback redirect URI is served by the tool itself, so even an accidental approval delivers the code nowhere else.
+
+Many authorization servers (node-oidc-provider, Ory Hydra, Keycloak) have no anti-CSRF field: the consent form carries a **per-flow identifier** issued by the server, in a hidden field or in the form's URL (`/interaction/<id>`). When there is no anti-CSRF field but such an identifier, two extra submissions come first, before anything can be granted: one with the identifier altered and one without any cookie, both from a foreign Origin. If either is accepted, the check fails. If both are refused and the untouched form is accepted, the result is **inconclusive** with an explanation: this design is safe when the identifier is bound to the user's own session, which cannot be proven from a single session.
 
 The check **fails** when consent is granted without a valid anti-CSRF token. It only **passes** when the control proves that the tool reproduces a real grant; otherwise (labels it cannot recognise, consent sent by JavaScript, multi-step flows, single-use tokens) the result is **inconclusive**, never a pass. The finding also reports whether the session cookies are explicitly `SameSite=Lax/Strict`, which blocks the attack from other sites in modern browsers, but not from same-site subdomains or older clients; a cookie without the attribute is reported as `Unspecified`. Ctrl-C, closing the browser or a 10-minute timeout stop the check cleanly and still delete the temporary client.
 

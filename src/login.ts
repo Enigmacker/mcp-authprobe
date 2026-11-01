@@ -231,11 +231,16 @@ export async function login(opts: LoginOptions): Promise<LoginResult> {
 
     // --- The real exchange ---
     let codeBurnt = false;
+    let exchangeFailure: string | null = null;
     if (!tokens) {
       tokens = await exchangeCode(http, tokenEndpoint, correct);
       if (!tokens.accessTokenIssued) {
         if (opts.probe && tokens.error === "invalid_grant") {
           codeBurnt = true;
+        } else if (opts.probe && results.some((r) => r.verdict !== "not_run")) {
+          // Keep what the probes observed; only the first refusal is trusted.
+          codeBurnt = true;
+          exchangeFailure = safeText(describeOutcome(tokens), 200);
         } else {
           throw new LoginError(`Code exchange failed: ${safeText(describeOutcome(tokens), 200)}.`);
         }
@@ -277,27 +282,32 @@ export async function login(opts: LoginOptions): Promise<LoginResult> {
     }
 
     if (codeBurnt) {
-      notes.push("The server invalidated the code after the first refused attempt (a strict, acceptable behaviour). The results are saved; run login again with --no-probe --force --out <same file> to obtain a test grant.");
+      notes.push(
+        exchangeFailure
+          ? `The code exchange failed after the probes (${exchangeFailure}); only the first refusal is trusted. The results are saved; run login again with --no-probe --force --out <same file> to obtain a test grant.`
+          : "The server invalidated the code after the first refused attempt (a strict, acceptable behaviour). The results are saved; run login again with --no-probe --force --out <same file> to obtain a test grant.",
+      );
       return { grant: null, observations, notes };
     }
-    if (!tokens.refreshToken) {
-      notes.push("Login succeeded but no refresh token was issued; the refresh token checks cannot run with this server configuration.");
-      return { grant: null, observations, notes };
-    }
-
-    const grant: TestGrant = {
+    // Without a refresh token there is no grant, but the checks that only need
+    // the access token (ORG01, COD01) still run.
+    const grant: TestGrant | null = tokens.refreshToken ? {
       clientId: client.clientId,
       refreshToken: tokens.refreshToken,
       authMethod: client.clientSecret ? "client_secret_post" : "none",
       // Bind the grant to where it came from: scans of other targets will not use it.
       target: new URL(target).toString(),
       tokenEndpoint: new URL(tokenEndpoint).toString(),
-    };
-    if (client.clientSecret) grant.clientSecret = client.clientSecret;
+    } : null;
+    if (grant && client.clientSecret) grant.clientSecret = client.clientSecret;
 
     if (opts.probe) {
       await postExchangeProbes({ http, target, tokenEndpoint, grant, tokens, correct, tokensFromProbe, observations, notes, results });
       if (notes.some((n) => n.startsWith(REVOKED_NOTE))) return { grant: null, observations, notes };
+    }
+    if (!grant) {
+      notes.push("Login succeeded but no refresh token was issued; the refresh token checks cannot run with this server configuration.");
+      return { grant: null, observations, notes };
     }
     keepClient = true; // the grant belongs to this client
     return { grant, observations, notes };
@@ -337,7 +347,8 @@ interface PostExchange {
   http: HttpClient;
   target: string;
   tokenEndpoint: string;
-  grant: TestGrant;
+  /** Null when no refresh token was issued. */
+  grant: TestGrant | null;
   tokens: CodeExchangeOutcome;
   correct: Parameters<typeof exchangeCode>[2];
   tokensFromProbe: boolean;
@@ -410,6 +421,10 @@ async function postExchangeProbes(c: PostExchange): Promise<void> {
       observations.push(observation("MAP-AUD01", target, "error", "Inconclusive: the token issued for this server was not accepted by it, so audience binding cannot be judged.", lines));
       return;
     }
+    if (!grant) {
+      observations.push(observation("MAP-AUD01", target, "error", "Inconclusive: no refresh token was issued, so a token for another resource cannot be requested.", lines));
+      return;
+    }
     const foreignResource = `https://other.${SAFE_DOMAIN}/mcp`;
     const o = await refresh(http, tokenEndpoint, grant, grant.refreshToken, foreignResource);
     lines.push(`refresh token used to request a token for ${foreignResource}: ${describeOutcome(o)}`);
@@ -451,14 +466,37 @@ async function postExchangeProbes(c: PostExchange): Promise<void> {
     if (c.tokensFromProbe) lines.unshift("the code had already been exchanged by an earlier probe");
     if (reuse.accessTokenIssued) {
       observations.push(observation("MAP-COD01", target, "fail", "The authorization code was exchanged a second time: codes are not single-use.", lines));
-      if (reuse.refreshToken) grant.refreshToken = reuse.refreshToken;
+      if (reuse.refreshToken && grant) grant.refreshToken = reuse.refreshToken;
       return;
     }
     if (reuse.status < 400 || reuse.status >= 500 || reuse.throttled) {
-      observations.push(observation("MAP-COD01", target, "error", "Unexpected answer to the second use of the code; inconclusive.", lines));
+      observations.push(
+        observation(
+          "MAP-COD01",
+          target,
+          "error",
+          reuse.status >= 500
+            ? "Inconclusive: the token endpoint crashed (server error) on the second use of the code instead of answering invalid_grant. No tokens were issued, but a clean refusal is expected."
+            : "Unexpected answer to the second use of the code; inconclusive.",
+          lines,
+        ),
+      );
       return;
     }
     // Were the tokens issued from that code revoked? (recommended)
+    if (!grant) {
+      // No refresh token: look at the access token instead.
+      const st = accessToken ? await initializeStatus(http, target, { token: accessToken }) : null;
+      lines.push(`access token after the reuse attempt: ${st === null ? "not available" : `HTTP ${st}`}`);
+      const message =
+        st !== null && (st === 401 || st === 403) && is2xx(control)
+          ? "A second use of the authorization code is refused, and the access token issued from it was revoked."
+          : is2xx(st)
+            ? "A second use of the authorization code is refused. The access token issued from it stays valid; revoking it on reuse is recommended."
+            : "A second use of the authorization code is refused. Whether the tokens issued from it were revoked is unknown.";
+      observations.push(observation("MAP-COD01", target, "pass", message, lines));
+      return;
+    }
     const after = await refresh(http, tokenEndpoint, grant, grant.refreshToken);
     if (after.accessTokenIssued) {
       if (after.refreshToken) grant.refreshToken = after.refreshToken;

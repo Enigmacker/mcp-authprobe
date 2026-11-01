@@ -143,6 +143,29 @@ describe("login", () => {
     expect(result.grant).not.toBeNull();
   });
 
+  it("still observes ORG01 and COD01 when no refresh token is issued", async () => {
+    const result = await runLogin({ tokens: { issueRefresh: false, codeReuse: "revoke" } });
+    expect(statuses(result)).toMatchObject({ "MAP-PKC01": "pass", "MAP-RDR03": "pass", "MAP-ORG01": "pass", "MAP-AUD01": "error", "MAP-COD01": "pass" });
+    expect(result.observations.find((o) => o.checkId === "MAP-COD01")?.message).toMatch(/access token issued from it was revoked/);
+    expect(result.grant).toBeNull();
+    expect(result.notes.join(" ")).toMatch(/no refresh token/);
+  });
+
+  it("keeps the probe results when the real exchange then crashes", async () => {
+    const result = await runLogin({ tokens: { consumeCodeOnFailure: true, crashOnBadCode: true } });
+    expect(statuses(result)).toEqual({ "MAP-PKC01": "error", "MAP-RDR03": "error" });
+    expect(result.grant).toBeNull();
+    expect(result.notes.join(" ")).toMatch(/code exchange failed after the probes \(HTTP 500/);
+  });
+
+  it("explains a token endpoint that crashes on a reused code", async () => {
+    const result = await runLogin({ tokens: { crashOnBadCode: true } });
+    const cod = result.observations.find((o) => o.checkId === "MAP-COD01");
+    expect(cod?.status).toBe("error");
+    expect(cod?.message).toMatch(/crashed/);
+    expect(result.grant).not.toBeNull();
+  });
+
   it("flags an MCP endpoint that does not validate Origin", async () => {
     const result = await runLogin({ mcp: { validateOrigin: false } });
     expect(statuses(result)["MAP-ORG01"]).toBe("fail");

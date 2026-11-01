@@ -66,6 +66,13 @@ export interface ConsentForm {
   csrfFields: string[];
   /** Random-looking hidden fields that are not recognised by name (kept in every probe). */
   unclassified: string[];
+  /**
+   * Server-issued per-flow identifiers: random-looking hidden fields
+   * (unclassified, or named like consent_challenge) and random-looking parts
+   * of the form's URL (as in /interaction/<id>/confirm).
+   */
+  flowFields: string[];
+  urlSecrets: string[];
 }
 
 const APPROVE =
@@ -79,6 +86,30 @@ const OAUTH_PARAMS = new Set([
   "resource", "audience", "prompt", "response_mode", "nonce", "login_challenge", "consent_challenge",
   "request_uri", "transaction_id", "interaction_id",
 ]);
+
+/** Server-issued identifiers of one authorization flow (Hydra, Keycloak, node-oidc-provider style). */
+const SERVER_FLOW_PARAMS = new Set(["consent_challenge", "login_challenge", "transaction_id", "interaction_id", "request_uri"]);
+/** Request parameters chosen by the client (so known to an attacker): never secrets. */
+const CLIENT_PARAMS = new Set(["client_id", "redirect_uri", "state", "nonce", "code_challenge", "scope", "resource", "audience", "response_type"]);
+
+function urlSecretsOf(action: string): string[] {
+  const u = new URL(action);
+  const out: string[] = [];
+  for (const seg of u.pathname.split("/")) {
+    const v = decodeURIComponentSafe(seg);
+    if (looksRandom(v)) out.push(v);
+  }
+  for (const [k, v] of u.searchParams) if (!CLIENT_PARAMS.has(k.toLowerCase()) && looksRandom(v)) out.push(v);
+  return out;
+}
+
+function decodeURIComponentSafe(v: string): string {
+  try {
+    return decodeURIComponent(v);
+  } catch {
+    return v;
+  }
+}
 
 function looksRandom(value: string): boolean {
   return value.length >= 16 && /^[A-Za-z0-9+/=_.:-]+$/.test(value) && new Set(value).size >= 10;
@@ -155,9 +186,12 @@ export function findConsentForm(html: string, pageUrl: string): ConsentForm | nu
     const hidden = fields.filter((f) => f.type === "hidden" && !OAUTH_PARAMS.has(f.name.toLowerCase()));
     const csrfFields = hidden.filter((f) => CSRF_NAME.test(f.name)).map((f) => f.name);
     const unclassified = hidden.filter((f) => !CSRF_NAME.test(f.name) && looksRandom(f.value)).map((f) => f.name);
+    const serverFlow = fields.filter((f) => SERVER_FLOW_PARAMS.has(f.name.toLowerCase()) && looksRandom(f.value)).map((f) => f.name);
+    const flowFields = [...new Set([...unclassified, ...serverFlow])];
+    const urlSecrets = urlSecretsOf(action);
 
     const score = (approveEl ? 2 : 0) + (fields.some((f) => OAUTH_PARAMS.has(f.name.toLowerCase())) ? 1 : 0);
-    candidates.push({ action, method, fields, approve, csrfFields, unclassified, score });
+    candidates.push({ action, method, fields, approve, csrfFields, unclassified, flowFields, urlSecrets, score });
   }
   candidates.sort((a, b) => b.score - a.score);
   const best = candidates[0];
@@ -255,8 +289,13 @@ function cookieHeader(snap: ConsentSnapshot, url: URL): Record<string, string> {
   return cookies.length > 0 ? { cookie: cookies.map((c) => `${c.name}=${c.value}`).join("; ") } : {};
 }
 
-async function probe(ctx: ProbeContext, payload: string, origin: string): Promise<{ verdict: ProbeVerdict; detail: string }> {
-  const action = new URL(ctx.form.action);
+async function probe(
+  ctx: ProbeContext,
+  payload: string,
+  origin: string,
+  opts: { action?: string; noCookies?: boolean } = {},
+): Promise<{ verdict: ProbeVerdict; detail: string }> {
+  const action = new URL(opts.action ?? ctx.form.action);
   const referer = origin === FOREIGN_ORIGIN ? `${FOREIGN_ORIGIN}/` : ctx.snap.url;
   const res = await ctx.http.request({
     url: action.toString(),
@@ -266,7 +305,7 @@ async function probe(ctx: ProbeContext, payload: string, origin: string): Promis
       accept: "text/html,application/json",
       origin,
       referer,
-      ...cookieHeader(ctx.snap, action),
+      ...(opts.noCookies ? {} : cookieHeader(ctx.snap, action)),
     },
     body: payload,
   });
@@ -326,9 +365,42 @@ export async function runConsentCheck(http: HttpClient, target: string, snap: Co
   ];
   const ownOrigin = new URL(snap.url).origin;
 
+  // 0. No named anti-CSRF token, but per-flow identifiers issued by the server
+  //    (node-oidc-provider, Hydra, Keycloak style): they can play the same role.
+  //    Before anything is granted (a flow is often single-use): are they checked,
+  //    and are they useless without the session cookies?
+  const perFlow = form.csrfFields.length === 0 && (form.flowFields.length > 0 || form.urlSecrets.length > 0);
+  let flowChecked = false;
+  if (perFlow) {
+    const where = [...form.flowFields.map((n) => `field ${n}`), ...form.urlSecrets.map(() => "a random part of the form URL")];
+    evidence.push(`per-flow identifier(s) issued by the server: ${[...new Set(where)].join(", ")}`);
+    let alteredAction = form.action;
+    for (const secret of form.urlSecrets) alteredAction = alteredAction.split(encodeURIComponent(secret)).join(encodeURIComponent(alterToken(secret))).split(secret).join(alterToken(secret));
+    const altered = body(form, (fs) => fs.map((f) => (form.flowFields.includes(f.name) ? { ...f, value: alterToken(f.value) } : f)));
+    const pa = await probe(ctx, altered, FOREIGN_ORIGIN, { action: alteredAction });
+    evidence.push(`probe 0a, per-flow identifier(s) altered, foreign Origin: ${pa.verdict} (${pa.detail})`);
+    if (pa.verdict === "accepted") {
+      return finding("fail", target, "Consent was granted with altered per-flow identifiers and no anti-CSRF token, from a foreign Origin: nothing in the request is checked against the user's session.", evidence);
+    }
+    const pb = await probe(ctx, body(form, (fs) => fs), FOREIGN_ORIGIN, { noCookies: true });
+    evidence.push(`probe 0b, untouched form without any cookie, foreign Origin: ${pb.verdict} (${pb.detail})`);
+    if (pb.verdict === "accepted") {
+      return finding("fail", target, "Consent was granted by a request carrying no cookie at all: anyone who learns the per-flow identifier can grant access on the user's behalf.", evidence);
+    }
+    flowChecked = pa.verdict === "refused" && pb.verdict === "refused";
+  }
+
   // 1. Without the anti-CSRF field, from a foreign Origin.
   const p1 = await probe(ctx, body(form, (fs) => fs.filter((f) => !form.csrfFields.includes(f.name))), FOREIGN_ORIGIN);
   evidence.push(`probe 1, without anti-CSRF field, foreign Origin: ${p1.verdict} (${p1.detail})`);
+  if (p1.verdict === "accepted" && flowChecked) {
+    return finding(
+      "error",
+      target,
+"Inconclusive: no anti-CSRF token, but the form carries server-issued per-flow identifiers that are checked (altered: refused) and useless without the session cookies (no cookie: refused), as with node-oidc-provider or Ory Hydra. This is safe only if they are bound to the user's own session and never leak (Referer, logs); that cannot be proven from one session, so check it.",
+      evidence,
+    );
+  }
   if (p1.verdict === "accepted") {
     const reliance =
       form.csrfFields.length === 0 && form.unclassified.length > 0

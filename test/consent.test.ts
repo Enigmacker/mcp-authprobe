@@ -370,3 +370,29 @@ describe("waitForEnter", () => {
     await expect(p).rejects.toThrow(/closed/);
   });
 });
+
+describe("MAP-CSR01 with per-flow identifiers (node-oidc-provider style)", () => {
+  it("is inconclusive, not failing, when a session-bound flow id in the form URL is the only protection", async () => {
+    const f = await check({ csrf: "none", flowUrl: "bound" });
+    expect(f.status).toBe("error");
+    expect(f.message).toMatch(/per-flow identifiers/);
+    expect(f.evidence.join("\n")).toMatch(/probe 0a, per-flow identifier\(s\) altered, foreign Origin: refused/);
+    expect(f.evidence.join("\n")).toMatch(/probe 0b, untouched form without any cookie, foreign Origin: refused/);
+  });
+
+  it("fails when the flow id grants consent without any cookie", async () => {
+    const f = await check({ csrf: "none", flowUrl: "unbound" });
+    expect(f.status).toBe("fail");
+    expect(f.message).toMatch(/no cookie at all/);
+  });
+
+  it("still passes a real anti-CSRF token next to a flow id", async () => {
+    expect((await check({ csrf: "token", flowUrl: "bound" })).status).not.toBe("fail");
+  });
+
+  it("fails a flow id that is not checked (consent_challenge only required to be present)", async () => {
+    const f = await check({ csrf: "none", challenge: true });
+    expect(f.status).toBe("fail");
+  });
+});
+

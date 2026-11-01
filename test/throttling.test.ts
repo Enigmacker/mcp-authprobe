@@ -64,6 +64,19 @@ describe("MAP-THR01", () => {
     expect(finding.evidence[0]).toBe("HTTP 400 x6");
   });
 
+  it("switches once to random authorization codes when the refresh grant crashes", async () => {
+    const { finding, fx } = await run({ refreshCrashes: true, rateLimitAfter: 3 });
+    expect(finding.status).toBe("pass");
+    expect(finding.evidence[0]).toMatch(/HTTP 500.*switched to random authorization codes; HTTP 400 x3, HTTP 429 x1/);
+    expect(fx.tokenRequests()).toBe(5); // one refresh, then four codes
+  });
+
+  it("reports a server that crashes on both grants as inconclusive", async () => {
+    const { finding } = await run({ outage: true });
+    expect(finding.status).toBe("error");
+    expect(finding.evidence[0]).toMatch(/switched to random authorization codes/);
+  });
+
   it("never sends more than the hard cap, whatever is asked", async () => {
     const { fx } = await run({}, { attempts: 500 });
     expect(fx.tokenRequests()).toBe(MAX_ATTEMPTS);

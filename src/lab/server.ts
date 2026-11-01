@@ -34,6 +34,12 @@ export interface TokenBehaviour {
   outage?: boolean;
   /** PKCE at the token endpoint: "enforce" (default), "optional" (a missing verifier is accepted), "ignore". */
   pkce?: "enforce" | "optional" | "ignore";
+  /** Answer 500 to an unknown or used code, like demo servers that throw (default false). */
+  crashOnBadCode?: boolean;
+  /** Issue a refresh token with the authorization code (default true). */
+  issueRefresh?: boolean;
+  /** The refresh grant is not implemented and crashes with a 500 (like some demo servers). */
+  refreshCrashes?: boolean;
   /** Answer 429 to refresh requests once this many have been served. */
   throttleRefreshAfter?: number;
   /** Invalidate the access tokens of a family when it is refreshed. */
@@ -88,6 +94,12 @@ export interface ConsentBehaviour {
   challenge?: boolean;
   /** The form is submitted by JavaScript to a JSON API: the form itself has no action. */
   spa?: boolean;
+  /**
+   * Post the consent form to /interaction/<random id> (node-oidc-provider
+   * style). "bound": the id belongs to the session and is single-use;
+   * "unbound": any request with a known id grants consent, even without cookies.
+   */
+  flowUrl?: "bound" | "unbound";
 }
 
 export interface FixtureOptions {
@@ -197,6 +209,9 @@ export async function startFixture(options: FixtureOptions = {}): Promise<Fixtur
     codeReuse: "refuse",
     resource: "bind",
     revokeAccessOnRefresh: false,
+    issueRefresh: true,
+    crashOnBadCode: false,
+    refreshCrashes: false,
     ...options.tokens,
   };
   let authzRequests = 0;
@@ -233,7 +248,11 @@ export async function startFixture(options: FixtureOptions = {}): Promise<Fixtur
     if (tok.clientSecret !== undefined && secret !== tok.clientSecret) return json(res, 401, { error: "invalid_client" });
     if (form.get("grant_type") === "authorization_code") {
       const code = codes.get(form.get("code") ?? "");
-      if (!code || code.clientId !== clientId) return json(res, 400, { error: "invalid_grant" });
+      if (tok.crashOnBadCode && (!code || code.used)) return json(res, 500, { error: "server_error" });
+      if (!code || code.clientId !== clientId) {
+        failures += 1;
+        return json(res, 400, { error: "invalid_grant" });
+      }
       if (code.used && tok.codeReuse !== "allow") {
         if (tok.codeReuse === "revoke" && code.family) revokedFamilies.add(code.family);
         return json(res, 400, { error: "invalid_grant" });
@@ -256,10 +275,13 @@ export async function startFixture(options: FixtureOptions = {}): Promise<Fixtur
       code.family = family;
       const refreshOut = newToken("rt");
       refreshTokens.set(refreshOut, { family, clientId: code.clientId, used: false });
-      return json(res, 200, { access_token: accessToken(audience, family), token_type: "Bearer", expires_in: 3600, refresh_token: refreshOut });
+      const issued: Record<string, unknown> = { access_token: accessToken(audience, family), token_type: "Bearer", expires_in: 3600 };
+      if (tok.issueRefresh) issued["refresh_token"] = refreshOut;
+      return json(res, 200, issued);
     }
     if (form.get("grant_type") !== "refresh_token") return json(res, 400, { error: "unsupported_grant_type" });
     refreshCount += 1;
+    if (tok.refreshCrashes) return json(res, 500, { error: "server_error" });
     if (tok.throttleRefreshAfter !== undefined && refreshCount > tok.throttleRefreshAfter) return json(res, 429, { error: "slow_down" }, { "retry-after": "30" });
 
     const presented = form.get("refresh_token") ?? "";
@@ -402,7 +424,13 @@ export async function startFixture(options: FixtureOptions = {}): Promise<Fixtur
     const checkbox = consentOpts.requireCheckbox ? `<label><input type="checkbox" name="agree" value="yes" required> I agree</label>` : "";
     const [deny, allow] =
       consentOpts.labels === "fr" ? ["Refuser", "Autoriser"] : consentOpts.labels === "dont-allow" ? ["Don't allow", "Allow"] : ["Deny", "Allow"];
-    const formTag = consentOpts.spa ? `<form id="f" method="post" onsubmit="event.preventDefault(); fetch('/api/consent', {method: 'POST'})">` : `<form method="post" action="/consent">`;
+    let consentAction = "/consent";
+    if (consentOpts.flowUrl) {
+      const uid = randomBytes(24).toString("base64url");
+      flows.set(uid, { sid, used: false });
+      consentAction = `/interaction/${uid}`;
+    }
+    const formTag = consentOpts.spa ? `<form id="f" method="post" onsubmit="event.preventDefault(); fetch('/api/consent', {method: 'POST'})">` : `<form method="post" action="${consentAction}">`;
     res.writeHead(200, { "content-type": "text/html; charset=utf-8" });
     res.end(`<!doctype html><title>Consent</title><h1>Allow test client?</h1>
 ${formTag}${hidden}${token}${challenge}${checkbox}
@@ -410,17 +438,27 @@ ${formTag}${hidden}${token}${challenge}${checkbox}
 <button type="submit" name="decision" value="allow">${allow}</button></form>`);
   }
 
-  function consentSubmit(req: IncomingMessage, body: string, res: ServerResponse): void {
+  const flows = new Map<string, { sid: string; used: boolean }>();
+
+  function flowSubmit(req: IncomingMessage, uid: string, body: string, res: ServerResponse): void {
+    const flow = flows.get(uid);
+    if (!flow || flow.used) return json(res, 400, { error: "invalid_request", error_description: "interaction not found" });
+    if (consentOpts.flowUrl === "bound" && cookieOf(req, "sid") !== flow.sid) return json(res, 400, { error: "invalid_request", error_description: "interaction session mismatch" });
+    flow.used = true;
+    consentSubmit(req, body, res, consentOpts.flowUrl === "unbound");
+  }
+
+  function consentSubmit(req: IncomingMessage, body: string, res: ServerResponse, skipSession = false): void {
     const sid = cookieOf(req, "sid");
     const csrf = sid ? sessions.get(sid) : undefined;
-    if (!sid || csrf === undefined) return json(res, 401, { error: "login_required" });
+    if (!skipSession && (!sid || csrf === undefined)) return json(res, 401, { error: "login_required" });
     const form = new URLSearchParams(body);
     if (consentOpts.csrf === "token" && form.get("csrf_token") !== csrf) return json(res, 403, { error: "invalid_csrf_token" });
     if (consentOpts.csrf === "presence" && !form.get("csrf_token")) return json(res, 403, { error: "missing_csrf_token" });
     if (consentOpts.csrf === "hex") {
       // Lenient hex decoding, as Buffer.from does: it stops at the first invalid character.
       const given = Buffer.from(form.get("csrf_token") ?? "", "hex");
-      const expected = Buffer.from(csrf);
+      const expected = Buffer.from(csrf ?? "");
       if (given.length !== expected.length || !given.equals(expected)) return json(res, 403, { error: "invalid_csrf_token" });
     }
     if (consentOpts.challenge && !form.get("consent_challenge")) return json(res, 400, { error: "missing_challenge" });
@@ -588,6 +626,7 @@ ${formTag}${hidden}${token}${challenge}${checkbox}
       if (path.startsWith("/register/")) return manageEndpoint(req, path.slice("/register/".length), res);
       if (options.consent && path === "/authorize" && req.method === "GET") return consentAuthorize(req, new URL(req.url ?? "/", base), res);
       if (options.consent && path === "/consent" && req.method === "POST") return consentSubmit(req, body, res);
+      if (options.consent?.flowUrl && path.startsWith("/interaction/") && req.method === "POST") return flowSubmit(req, path.slice("/interaction/".length), body, res);
       if (options.consent && path === "/login") return loginPage(req, new URL(req.url ?? "/", base), body, res);
       if (options.consent && path === "/resume") return resumeEndpoint(new URL(req.url ?? "/", base), res);
       if (options.consent && path === "/authorize" && req.method === "POST") return json(res, 405, { error: "method_not_allowed" });

@@ -6,6 +6,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+Fixes from a trial against node-oidc-provider (with an MCP server built on the official SDK) and the MCP SDK's OAuth example server.
+
+### Changed
+
+- `MAP-CSR01` recognises per-flow identifiers issued by the authorization server (hidden fields such as `consent_challenge`, or a random part of the form URL as in node-oidc-provider's `/interaction/<id>`). Without an anti-CSRF field, it first submits the form with the identifier altered and without any cookie: either one accepted is a failure; both refused makes the result inconclusive with an explanation, instead of a failure.
+- `login` still observes `MAP-ORG01` and `MAP-COD01` when the server issues no refresh token (COD01 then looks at the access token), and keeps the probe results when the real code exchange fails after the probes.
+- `MAP-THR01` switches once to random authorization codes when the refresh grant answers a server error or `unsupported_grant_type`.
+- Clearer messages for a token endpoint that crashes on a reused code, and for a rate-limited registration endpoint.
+
 ## [0.4.0] - 2026-11-01
 
 ### Added
