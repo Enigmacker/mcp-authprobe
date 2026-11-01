@@ -25,6 +25,10 @@ export interface TestGrant {
   refreshToken: string;
   clientSecret?: string;
   authMethod: TokenEndpointAuthMethod;
+  /** MCP server URL the grant was created for (written by `login`). */
+  target?: string;
+  /** Token endpoint the grant belongs to (written by `login`). */
+  tokenEndpoint?: string;
 }
 
 /**
@@ -81,6 +85,16 @@ export function parseGrant(raw: unknown): TestGrant {
     if (typeof secret !== "string" || secret === "") throw new Error(`Credentials file: "client_secret" is required for ${String(method)}.`);
     grant.clientSecret = secret;
   }
+  for (const [key, field] of [["target", "target"], ["token_endpoint", "tokenEndpoint"]] as const) {
+    const value = obj[key];
+    if (value === undefined) continue;
+    if (typeof value !== "string") throw new Error(`Credentials file: "${key}" must be a URL string.`);
+    try {
+      grant[field] = new URL(value).toString();
+    } catch {
+      throw new Error(`Credentials file: "${key}" is not a valid URL.`);
+    }
+  }
   return grant;
 }
 
@@ -111,6 +125,8 @@ export function writeGrantFile(path: string, grant: TestGrant, observations: Obs
     token_endpoint_auth_method: grant.authMethod,
   };
   if (grant.clientSecret) data["client_secret"] = grant.clientSecret;
+  if (grant.target) data["target"] = grant.target;
+  if (grant.tokenEndpoint) data["token_endpoint"] = grant.tokenEndpoint;
   if (observations.length > 0) data["observations"] = observations;
 
   const nofollow = constants.O_NOFOLLOW ?? 0;

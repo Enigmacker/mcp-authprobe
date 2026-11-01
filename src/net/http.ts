@@ -1,7 +1,8 @@
 import { lookup as dnsLookup, type LookupAddress } from "node:dns";
 import { Agent, fetch as undiciFetch, type Dispatcher } from "undici";
 import { USER_AGENT } from "../version.js";
-import { isBlockedAddress } from "./address-policy.js";
+import { isIP } from "node:net";
+import { isBlockedAddress, isLoopbackHost } from "./address-policy.js";
 
 export interface HttpOptions {
   /** Allow loopback/private targets (local labs and tests). Off by default. */
@@ -34,6 +35,24 @@ export class BlockedAddressError extends Error {
     super(`Refusing to connect to ${host} (${address}): private or reserved address. Use --allow-private for a local lab.`);
     this.name = "BlockedAddressError";
   }
+}
+
+export class InsecureTransportError extends Error {
+  constructor(url: string) {
+    super(`Refusing plain HTTP to ${url}: secrets could travel in cleartext. Plain HTTP is only allowed for loopback or private-address labs with --allow-private.`);
+    this.name = "InsecureTransportError";
+  }
+}
+
+/**
+ * Plain HTTP is allowed only for a local lab: --allow-private and a host that
+ * is a loopback name or a private/reserved IP literal. Everything else,
+ * including endpoints announced by a server's metadata, must be HTTPS.
+ */
+export function plainHttpAllowed(url: URL, allowPrivate: boolean): boolean {
+  if (!allowPrivate) return false;
+  const host = url.hostname.replace(/^\[|\]$/g, "");
+  return isLoopbackHost(host) || (isIP(host) !== 0 && isBlockedAddress(host));
 }
 
 const DEFAULT_TIMEOUT_MS = 10_000;
@@ -87,6 +106,9 @@ export class HttpClient {
     const url = new URL(req.url);
     if (url.protocol !== "https:" && url.protocol !== "http:") {
       throw new Error(`Unsupported URL scheme: ${url.protocol}`);
+    }
+    if (url.protocol === "http:" && !plainHttpAllowed(url, this.allowPrivate)) {
+      throw new InsecureTransportError(`${url.origin}${url.pathname}`);
     }
     // IP-literal hosts never go through DNS lookup, so check them here.
     const literal = url.hostname.replace(/^\[|\]$/g, "");

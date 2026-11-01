@@ -30,14 +30,17 @@ const V4_RANGES: ReadonlyArray<[string, number]> = [
 ];
 
 const V6_RANGES: ReadonlyArray<[string, number]> = [
-  ["::", 128],
+  ["::", 96], // includes ::, ::1 and deprecated IPv4-compatible addresses (::a.b.c.d)
   ["::1", 128],
   ["::ffff:0:0", 96],
   ["64:ff9b::", 96],
+  ["64:ff9b:1::", 48], // local-use NAT64
+  ["2002::", 16], // 6to4, can embed a private IPv4 address
   ["100::", 64],
   ["2001:db8::", 32],
   ["fc00::", 7],
   ["fe80::", 10],
+  ["fec0::", 10], // deprecated site-local
   ["ff00::", 8],
 ];
 

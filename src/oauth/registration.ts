@@ -25,6 +25,8 @@ export interface RegisteredClient {
 
 export interface RegistrationOutcome {
   status: number;
+  /** The server sent a Retry-After header. */
+  retryAfter: boolean;
   accepted: boolean;
   error: string | null;
   client: RegisteredClient | null;
@@ -60,7 +62,8 @@ export async function registerClient(
   const clientId = json["client_id"];
   const accepted = res.status >= 200 && res.status < 300 && typeof clientId === "string";
   const error = typeof json["error"] === "string" ? (json["error"] as string) : null;
-  if (!accepted) return { status: res.status, accepted: false, error, client: null };
+  const retryAfter = res.headers["retry-after"] !== undefined;
+  if (!accepted) return { status: res.status, retryAfter, accepted: false, error, client: null };
 
   const uris = Array.isArray(json["redirect_uris"]) ? (json["redirect_uris"] as unknown[]).filter((u): u is string => typeof u === "string") : redirectUris;
   const secret = json["client_secret"];
@@ -68,6 +71,7 @@ export async function registerClient(
   const rat = json["registration_access_token"];
   return {
     status: res.status,
+    retryAfter,
     accepted: true,
     error: null,
     client: {

@@ -120,8 +120,16 @@ export async function discover(mcpUrl: string, http: HttpClient): Promise<Discov
   // Authorization Server Metadata
   let as: DiscoveryResult["as"] = null;
   const issuer = prm?.metadata.authorization_servers?.[0];
-  if (issuer) {
-    for (const url of asMetadataCandidates(issuer)) {
+  let candidates: string[] = [];
+  if (typeof issuer === "string") {
+    try {
+      candidates = asMetadataCandidates(issuer);
+    } catch {
+      notes.push(`The authorization server issuer is not a valid URL: ${safeText(issuer)}.`);
+    }
+  }
+  if (typeof issuer === "string" && candidates.length > 0) {
+    for (const url of candidates) {
       try {
         const { response, json } = await http.getJson(url);
         if (response.status === 200 && isObject(json)) {

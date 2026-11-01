@@ -68,6 +68,11 @@ export interface VerifyOptions {
   resolveTxtRecords?: (name: string) => Promise<string[][]>;
   /** Port to use for the well-known URL (tests and non-default ports). */
   wellKnownBaseUrl?: string;
+  /**
+   * Exempt loopback hosts from the proof when private addresses are allowed
+   * (default true). MCP mode turns it off unless the human pinned the lab.
+   */
+  loopbackExempt?: boolean;
 }
 
 export async function verifyOwnership(
@@ -77,7 +82,7 @@ export async function verifyOwnership(
 ): Promise<OwnershipResult> {
   const h = normalizeHost(host);
 
-  if (options.http.allowPrivate && isLoopbackHost(h)) {
+  if ((options.loopbackExempt ?? true) && options.http.allowPrivate && isLoopbackHost(h)) {
     return { host: h, verified: true, method: "loopback", detail: "Loopback target with --allow-private: local lab, proof not required." };
   }
   if (!secret) {

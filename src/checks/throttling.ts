@@ -51,8 +51,9 @@ function result(status: Finding["status"], target: string, message: string, evid
 
 const THROTTLE_ERRORS = new Set(["slow_down", "temporarily_unavailable"]);
 
+/** Only an explicit rate limit counts: a 5xx with Retry-After is an outage, not throttling. */
 function isThrottled(o: RefreshOutcome): boolean {
-  return o.throttled || (o.error !== null && THROTTLE_ERRORS.has(o.error));
+  return o.status === 429 || (o.error !== null && THROTTLE_ERRORS.has(o.error));
 }
 
 export async function runThrottlingCheck(ctx: ThrottleCheckContext): Promise<Finding> {
@@ -83,6 +84,9 @@ export async function runThrottlingCheck(ctx: ThrottleCheckContext): Promise<Fin
 
       if (outcome.accessTokenIssued) {
         return result("error", target, "A random refresh token was accepted, which should be impossible; inspect the token endpoint urgently.", [`attempt ${i}: ${tally}`]);
+      }
+      if (outcome.status >= 500) {
+        return result("error", target, "The token endpoint answered with a server error; the outcome is inconclusive.", [`attempt ${i}: ${tally}`]);
       }
       if (isThrottled(outcome)) {
         return result("pass", target, `Throttling started after ${i} failed request(s).`, [

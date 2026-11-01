@@ -97,6 +97,19 @@ describe("redirect URI checks", () => {
     expect(byId["MAP-RDR04"]?.evidence.some((e) => e.includes("left on the server"))).toBe(true);
   });
 
+  it("never pass when the authorization endpoint starts rate limiting mid-way (review finding)", async () => {
+    // 1 registration + baseline + unrelated host + 2 variants, then 429 for everything else.
+    const { byId } = await run({ match: "any", noSession: "login", rateLimitAfter: 5 });
+    expect(byId["MAP-RDR02"]?.status).not.toBe("pass");
+    expect(byId["MAP-RDR02"]?.evidence.some((e) => e.includes("rate limited"))).toBe(true);
+  });
+
+  it("never pass MAP-RDR04 when registrations are rate limited (review finding)", async () => {
+    const { byId } = await run({ registration: "lax", rateLimitAfter: 1 });
+    expect(byId["MAP-RDR04"]?.status).toBe("error");
+    expect(byId["MAP-RDR04"]?.message).toMatch(/Inconclusive/);
+  });
+
   it("skip without dynamic registration", async () => {
     const { byId } = await run({ registration: "disabled" });
     expect(statuses(byId)).toEqual({ "MAP-RDR01": "skipped", "MAP-RDR02": "skipped", "MAP-RDR04": "not_applicable" });

@@ -17,6 +17,13 @@ export interface ScanOptions {
   timeoutMs?: number;
   /** Test grant for the refresh token checks. It is consumed by the scan. */
   grant?: TestGrant;
+  /**
+   * Refuse a grant that does not name its target (MCP mode): a hand-written,
+   * unbound grant could otherwise be spent on any proven server.
+   */
+  requireGrantBinding?: boolean;
+  /** Exempt loopback labs from the ownership proof (default true; see VerifyOptions). */
+  loopbackExempt?: boolean;
   /** Failed token requests sent by MAP-THR01 (clamped to 5-20, default 10). */
   throttleAttempts?: number;
   /** Results observed during `login` (MAP-RDR03), read from the grant file. */
@@ -81,8 +88,9 @@ async function runRefreshFamily(target: string, d: DiscoveryResult | null, http:
   if (Array.isArray(grants) && !grants.includes("refresh_token")) {
     return all("not_applicable", "The authorization server does not advertise the refresh_token grant.");
   }
-  if (!options.grant) return all("skipped", "Needs a test grant: pass --credentials-file with a refresh token from a dedicated test account.");
-  return runRefreshTokenChecks({ http, target, tokenEndpoint, grant: options.grant });
+  const { grant, reason } = grantFor(target, tokenEndpoint, options);
+  if (!grant) return all("skipped", reason ?? "No usable test grant.");
+  return runRefreshTokenChecks({ http, target, tokenEndpoint, grant });
 }
 
 /**
@@ -97,6 +105,24 @@ function fromObservation(checkId: string, target: string, observations: Observat
   return finding(def, target, obs.status, obs.message, [...obs.evidence, `observed during login at ${obs.observedAt}`]);
 }
 
+/**
+ * The grant usable for this target, or the reason it is not. A grant written
+ * by `login` names its target and token endpoint; it is never sent elsewhere.
+ */
+export function grantFor(target: string, tokenEndpoint: string, options: ScanOptions): { grant: TestGrant | null; reason: string | null } {
+  const g = options.grant;
+  if (!g) return { grant: null, reason: "Needs a test grant: create one with `mcp-authprobe login`, then pass it with --credentials-file." };
+  if (g.target === undefined) {
+    if (options.requireGrantBinding) return { grant: null, reason: "The test grant does not name its target; create it with `mcp-authprobe login` so it cannot be spent on another server." };
+  } else if (new URL(g.target).toString() !== new URL(target).toString()) {
+    return { grant: null, reason: "The test grant belongs to another target; it was not used." };
+  }
+  if (g.tokenEndpoint !== undefined && new URL(g.tokenEndpoint).toString() !== new URL(tokenEndpoint).toString()) {
+    return { grant: null, reason: "The test grant belongs to another token endpoint than the one discovered; it was not used." };
+  }
+  return { grant: g, reason: null };
+}
+
 async function runThrottleFamily(target: string, d: DiscoveryResult | null, http: HttpClient, options: ScanOptions): Promise<Finding> {
   const meta = d?.as?.metadata;
   const def = CATALOGUE.find((c) => c.id === "MAP-THR01") as CheckDefinition;
@@ -107,7 +133,8 @@ async function runThrottleFamily(target: string, d: DiscoveryResult | null, http
     tokenEndpoint: meta.token_endpoint,
     registrationEndpoint: typeof meta.registration_endpoint === "string" ? meta.registration_endpoint : null,
   };
-  if (options.grant) ctx.grant = options.grant;
+  const { grant } = grantFor(target, meta.token_endpoint, options);
+  if (grant) ctx.grant = grant; // otherwise a temporary client is used
   if (options.throttleAttempts !== undefined) ctx.attempts = options.throttleAttempts;
   return runThrottlingCheck(ctx);
 }
@@ -149,7 +176,7 @@ export async function scan(mcpUrl: string, options: ScanOptions = {}): Promise<S
     }
 
     // Every host an active check would touch must be proven.
-    const verifyOpts: VerifyOptions = { http };
+    const verifyOpts: VerifyOptions = { http, loopbackExempt: options.loopbackExempt ?? true };
     if (options.resolveTxtRecords) verifyOpts.resolveTxtRecords = options.resolveTxtRecords;
     const results: OwnershipResult[] = [];
     for (const host of hostsToVerify(target, discovery)) {

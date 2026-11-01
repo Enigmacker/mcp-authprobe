@@ -3,7 +3,7 @@ import { McpServer } from "@modelcontextprotocol/server";
 import { z } from "zod";
 import { CATALOGUE, getCheck } from "./checks/catalogue.js";
 import { loadGrant, type TestGrant } from "./credentials.js";
-import { HttpClient } from "./net/http.js";
+import { HttpClient, plainHttpAllowed } from "./net/http.js";
 import { DNS_LABEL, proofFor, verifyOwnership, WELL_KNOWN_PATH } from "./ownership.js";
 import { toMarkdown } from "./report/markdown.js";
 import { scan, type ScanOptions } from "./scan.js";
@@ -23,10 +23,17 @@ import { TOOL_NAME, TOOL_VERSION } from "./version.js";
  *   MCP_AUTHPROBE_SECRET / MCP_AUTHPROBE_SECRET_FILE   ownership secret
  *   MCP_AUTHPROBE_CREDENTIALS_FILE                     test grant (consumed by a scan)
  *   MCP_AUTHPROBE_ALLOW_PRIVATE=1                      local labs only
+ *   MCP_AUTHPROBE_LAB_ORIGINS                          comma-separated lab origins exempt from proof
  *   MCP_AUTHPROBE_TIMEOUT_MS                           per-request timeout
  */
 
 export interface ServerConfig {
+  /**
+   * Origins of local labs the human allows without ownership proof, from
+   * MCP_AUTHPROBE_LAB_ORIGINS. Any other loopback target needs a proof, so
+   * an agent cannot point active requests at arbitrary local services.
+   */
+  labOrigins?: string[];
   secret?: string;
   credentialsFile?: string;
   allowPrivate: boolean;
@@ -40,6 +47,20 @@ export function configFromEnv(env: NodeJS.ProcessEnv = process.env): ServerConfi
   const secretFile = env["MCP_AUTHPROBE_SECRET_FILE"];
   const secret = secretFile ? readFileSync(secretFile, "utf8").trim() : env["MCP_AUTHPROBE_SECRET"]?.trim();
   if (secret) config.secret = secret;
+  const labs = env["MCP_AUTHPROBE_LAB_ORIGINS"];
+  if (labs) {
+    config.labOrigins = labs
+      .split(",")
+      .map((o) => o.trim())
+      .filter(Boolean)
+      .flatMap((o) => {
+        try {
+          return [new URL(o).origin];
+        } catch {
+          return [];
+        }
+      });
+  }
   const creds = env["MCP_AUTHPROBE_CREDENTIALS_FILE"];
   if (creds) config.credentialsFile = creds;
   const timeout = Number(env["MCP_AUTHPROBE_TIMEOUT_MS"]);
@@ -141,7 +162,7 @@ export function createAuthprobeServer(config: ServerConfig): McpServer {
       if (config.timeoutMs !== undefined) opts.timeoutMs = config.timeoutMs;
       const http = new HttpClient(opts);
       try {
-        const verifyOpts: Parameters<typeof verifyOwnership>[2] = { http };
+        const verifyOpts: Parameters<typeof verifyOwnership>[2] = { http, loopbackExempt: false };
         if (config.resolveTxtRecords) verifyOpts.resolveTxtRecords = config.resolveTxtRecords;
         const r = await verifyOwnership(host, config.secret, verifyOpts);
         return text(`${r.verified ? "Verified" : "Not verified"} (${host}): ${r.detail}`);
@@ -169,15 +190,19 @@ export function createAuthprobeServer(config: ServerConfig): McpServer {
       } catch {
         return errorResult("Not a valid URL.");
       }
-      if (parsed.protocol !== "https:" && !(parsed.protocol === "http:" && config.allowPrivate)) {
-        return errorResult("Only https URLs can be scanned (plain http is allowed for local labs with MCP_AUTHPROBE_ALLOW_PRIVATE=1).");
+      if (parsed.protocol !== "https:" && !(parsed.protocol === "http:" && plainHttpAllowed(parsed, config.allowPrivate))) {
+        return errorResult("Only https URLs can be scanned (plain http is allowed for loopback or private labs with MCP_AUTHPROBE_ALLOW_PRIVATE=1).");
       }
       if (parsed.username || parsed.password) return errorResult("URLs with embedded credentials are refused.");
       if (scanning) return errorResult("A scan is already running; wait for it to finish.");
 
       scanning = true;
       try {
-        const options: ScanOptions = { allowPrivate: config.allowPrivate };
+        const options: ScanOptions = {
+          allowPrivate: config.allowPrivate,
+          requireGrantBinding: true,
+          loopbackExempt: (config.labOrigins ?? []).includes(parsed.origin),
+        };
         if (config.secret) options.secret = config.secret;
         if (config.timeoutMs !== undefined) options.timeoutMs = config.timeoutMs;
         if (config.resolveTxtRecords) options.resolveTxtRecords = config.resolveTxtRecords;

@@ -52,6 +52,11 @@ describe("MAP-THR01", () => {
     expect(finding.status).toBe("pass");
   });
 
+  it("does not mistake an outage (503 with Retry-After) for throttling (review finding)", async () => {
+    const { finding } = await run({ outage: true });
+    expect(finding.status).toBe("error");
+  });
+
   it("fails after the capped number of attempts without throttling", async () => {
     const { finding, fx } = await run({}, { attempts: 6 });
     expect(finding.status).toBe("fail");

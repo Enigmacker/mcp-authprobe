@@ -51,7 +51,7 @@ async function runLogin(
 describe("login", () => {
   it("obtains a working test grant and observes MAP-RDR03 as passing", async () => {
     const result = await runLogin({});
-    expect(result.grant).toMatchObject({ authMethod: "none" });
+    expect(result.grant).toMatchObject({ authMethod: "none", target: (fixture as Fixture).mcpUrl, tokenEndpoint: `${(fixture as Fixture).baseUrl}/token` });
     expect(result.observations.map((o) => [o.checkId, o.status])).toEqual([["MAP-RDR03", "pass"]]);
 
     // The grant and observation feed a full scan.

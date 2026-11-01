@@ -69,6 +69,8 @@ type VariantVerdict = "accepted" | "refused" | "inconclusive";
 
 function judge(baseline: AuthorizeAnswer, answer: AuthorizeAnswer): VariantVerdict {
   if (answer.kind === "redirect-to-candidate") return "accepted";
+  // A rate limit or a server error says nothing about redirect_uri validation.
+  if (answer.kind === "unavailable") return "inconclusive";
   return signature(answer) === signature(baseline) ? "inconclusive" : "refused";
 }
 
@@ -98,7 +100,7 @@ async function authorizationChecks(ctx: RedirectCheckContext, client: Registered
 
   const baseline = await probeAuthorize(http, { ...base, redirectUri: REGISTERED_REDIRECT });
   const baselineLine = `baseline with the registered URI: ${describeAnswer(baseline)}`;
-  if (baseline.kind === "page" && baseline.status >= 400) {
+  if (baseline.kind === "unavailable" || (baseline.kind === "page" && baseline.status >= 400)) {
     const msg = "The baseline request with the registered redirect URI was itself rejected, so variants cannot be compared.";
     return [result("MAP-RDR01", target, "error", msg, [baselineLine]), result("MAP-RDR02", target, "error", msg, [baselineLine])];
   }
@@ -127,18 +129,25 @@ async function registrationCheck(ctx: RedirectCheckContext, cleanup: RegisteredC
   const endpoint = ctx.registrationEndpoint as string;
   const evidence: string[] = [];
   const accepted: string[] = [];
+  let inconclusive = 0;
   for (const u of UNSAFE_REGISTRATIONS) {
     const outcome = await registerClient(http, endpoint, [u.uri]);
     if (outcome.accepted && outcome.client) {
       accepted.push(u.label);
       cleanup.push(outcome.client);
       evidence.push(`${u.label}: ACCEPTED (HTTP ${outcome.status}, client_id ${outcome.client.clientId})`);
+    } else if (outcome.status === 429 || outcome.status >= 500 || outcome.retryAfter) {
+      inconclusive += 1;
+      evidence.push(`${u.label}: inconclusive (HTTP ${outcome.status}, rate limited or server error)`);
     } else {
       evidence.push(`${u.label}: refused (HTTP ${outcome.status}${outcome.error ? `, error=${outcome.error}` : ""})`);
     }
   }
   if (accepted.length > 0) {
     return result("MAP-RDR04", target, "fail", `Dynamic client registration accepted ${accepted.length} unsafe redirect URI(s): ${accepted.join(", ")}.`, evidence);
+  }
+  if (inconclusive > 0) {
+    return result("MAP-RDR04", target, "error", `Inconclusive: ${inconclusive} registration attempt(s) were rate limited or hit a server error.`, evidence);
   }
   return result("MAP-RDR04", target, "pass", `All ${UNSAFE_REGISTRATIONS.length} unsafe redirect URIs were refused at registration.`, evidence);
 }

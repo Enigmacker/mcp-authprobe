@@ -99,6 +99,27 @@ describe("scan", () => {
     expect(fixture.requests.filter((r) => ["/register", "/authorize", "/token"].includes(r.path))).toEqual([]);
   });
 
+  it("never spends a grant bound to another target or token endpoint (review finding)", async () => {
+    fixture = await startFixture();
+    const base = { clientId: "test-client", refreshToken: fixture.issueRefreshToken(), authMethod: "none" as const };
+    for (const grant of [
+      { ...base, target: "https://other.example/mcp" },
+      { ...base, target: fixture.mcpUrl, tokenEndpoint: "https://other.example/token" },
+    ]) {
+      const report = await scan(fixture.mcpUrl, { allowPrivate: true, grant });
+      const rtk = report.findings.find((f) => f.checkId === "MAP-RTK01");
+      expect(rtk?.status).toBe("skipped");
+      expect(rtk?.message).toMatch(/belongs to another/);
+    }
+    // The real refresh token was never presented: it still works.
+    const res = await fetch(`${fixture.baseUrl}/token`, {
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({ grant_type: "refresh_token", refresh_token: base.refreshToken, client_id: "test-client" }),
+    });
+    expect(res.status).toBe(200);
+  });
+
   it("asks for proof on the authorization server host too", () => {
     const hosts = hostsToVerify("https://mcp.example.com/mcp", {
       mcpUrl: "https://mcp.example.com/mcp",

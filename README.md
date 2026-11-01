@@ -173,6 +173,8 @@ mcp-authprobe login https://mcp.example.com/mcp --out ./test-grant.json
 - The loopback listener accepts a single `GET /callback` carrying the expected `state`, and echoes nothing back.
 - It uses PKCE S256, a random `state`, the RFC 8707 `resource`, and checks the RFC 9207 `iss` parameter against the discovered issuer.
 - It writes the grant with mode 600, never through a symbolic link, and never over an existing file unless you pass `--force`. Tokens are never printed.
+- The grant records the **target and token endpoint** it belongs to. A scan of any other target, or a server announcing another token endpoint, will not use it.
+- `login` itself does not require an ownership proof: it only does what any MCP client does when you connect it (one registration, your own browser login, one code exchange). Only the extra `MAP-RDR03` probe requires the proof.
 - If login fails, the client it registered is deleted when the server allows it.
 
 **`MAP-RDR03` is observed during login**, because it needs a fresh authorization code. When ownership of every contacted host is proven, `login` first presents the code with a *different* `redirect_uri`, which a compliant token endpoint must refuse, then exchanges it normally. The result is stored in the grant file and reported by the next scan of the same target. Use `--no-probe` to skip it.
@@ -246,7 +248,9 @@ The server is built so that the assistant, or a prompt injection reaching it, ca
 
 - **Everything sensitive is set by you in the configuration, never by tool arguments:** the ownership secret, the test grant, and private-address access. The `scan` tool takes a URL and nothing else.
 - **`scan` is annotated as destructive**, so well-behaved clients ask for your confirmation before each call. It consumes the test grant and registers temporary clients.
-- **Only `https` targets** are accepted, unless you set `MCP_AUTHPROBE_ALLOW_PRIVATE=1` for a local lab. URLs with embedded credentials are refused, and only one scan runs at a time.
+- **Only `https` targets** are accepted; plain `http` only for loopback or private-address labs with `MCP_AUTHPROBE_ALLOW_PRIVATE=1`. URLs with embedded credentials are refused, and only one scan runs at a time.
+- **Loopback targets still need a proof** in MCP mode, unless you list their origin in `MCP_AUTHPROBE_LAB_ORIGINS`. An assistant cannot point active requests at arbitrary local services.
+- **The test grant is only used if it names the scanned target** (grants created by `login` do), so it cannot be spent on another server.
 - **Reports are marked as data:** every scan result ends with a notice that server-controlled text in it must not be treated as instructions.
 
 | Environment variable | Purpose |
@@ -254,6 +258,7 @@ The server is built so that the assistant, or a prompt injection reaching it, ca
 | `MCP_AUTHPROBE_SECRET` or `MCP_AUTHPROBE_SECRET_FILE` | Ownership secret (prefer the file) |
 | `MCP_AUTHPROBE_CREDENTIALS_FILE` | Test grant for the refresh token checks |
 | `MCP_AUTHPROBE_ALLOW_PRIVATE=1` | Allow loopback and private targets (local labs only) |
+| `MCP_AUTHPROBE_LAB_ORIGINS` | Comma-separated lab origins (e.g. `http://127.0.0.1:8080`) exempt from the ownership proof |
 | `MCP_AUTHPROBE_TIMEOUT_MS` | Per-request timeout |
 
 ## What it checks
@@ -318,7 +323,9 @@ Run active scans against a staging environment rather than production whenever y
 
 The scanner talks to servers that may be hostile, and it may be driven by an AI agent. It protects both you and third parties:
 
-- **Ownership gate:** no active request without a valid proof for every contacted host.
+- **Ownership gate:** no active request without a valid proof for every contacted host (the only exception is `login`, which behaves like an ordinary MCP client; see above).
+- **HTTPS only:** every request, including endpoints announced by a server's metadata, must use HTTPS. Plain HTTP is accepted only for loopback or private-address labs with `--allow-private`, so tokens and secrets never travel in cleartext over the internet.
+- **Inconclusive is never a pass:** rate limits (429, `Retry-After`) and server errors (5xx) make a check report `error`, never `pass`.
 - **SSRF protection:** loopback, private, link-local, CGNAT, multicast, reserved and cloud-metadata addresses are refused at connect time, after DNS resolution, unless `--allow-private` is passed.
 - **No automatic redirects:** every redirect is inspected, never followed blindly.
 - **Bounded resources:** per-request timeouts, response bodies capped at 1 MiB, no compression requested.

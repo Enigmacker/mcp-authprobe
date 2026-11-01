@@ -15,7 +15,9 @@ export type AuthorizeAnswer =
   /** The server redirected somewhere else, typically a login page. */
   | { kind: "redirect-elsewhere"; status: number; destination: string }
   /** No redirect: an error page, a login page or a consent page. */
-  | { kind: "page"; status: number };
+  | { kind: "page"; status: number }
+  /** Rate limited (429 or Retry-After) or server error (5xx): says nothing about validation. */
+  | { kind: "unavailable"; status: number };
 
 export interface AuthorizeParams {
   authorizationEndpoint: string;
@@ -56,6 +58,7 @@ export async function probeAuthorize(http: HttpClient, p: AuthorizeParams): Prom
   if (p.scope) url.searchParams.set("scope", p.scope);
 
   const res = await http.request({ url: url.toString(), headers: { accept: "text/html,application/json" } });
+  if (res.status === 429 || res.status >= 500 || res.headers["retry-after"] !== undefined) return { kind: "unavailable", status: res.status };
   const location = res.headers["location"];
   if (res.status >= 300 && res.status < 400 && location) {
     let absolute: string;
@@ -85,5 +88,7 @@ export function describeAnswer(a: AuthorizeAnswer): string {
       return `HTTP ${a.status}, redirected to ${a.destination}`;
     case "page":
       return `HTTP ${a.status}, no redirect`;
+    case "unavailable":
+      return `HTTP ${a.status}, rate limited or server error`;
   }
 }

@@ -3,6 +3,7 @@ import { discover } from "./discovery.js";
 import { login, LoginError, openInBrowser } from "./login.js";
 import { HttpClient } from "./net/http.js";
 import { verifyOwnership } from "./ownership.js";
+import { safeText } from "./redact.js";
 import { hostsToVerify } from "./scan.js";
 
 export interface LoginCommandOptions {
@@ -15,8 +16,9 @@ export interface LoginCommandOptions {
   secret: string | undefined;
 }
 
+// Everything printed here may contain server-controlled text: neutralize it.
 const err = (t: string): void => {
-  process.stderr.write(`${t}\n`);
+  process.stderr.write(`${safeText(t, 4000)}\n`);
 };
 
 /** `mcp-authprobe login`: everything goes to stderr; tokens are only written to the grant file. */

@@ -90,10 +90,13 @@ describe("MCP server", () => {
     fixture = await startFixture({ tokens: { rejectReplay: false } });
     const dir = mkdtempSync(join(tmpdir(), "map-mcp-"));
     const creds = join(dir, "grant.json");
-    writeFileSync(creds, JSON.stringify({ client_id: "test-client", refresh_token: fixture.issueRefreshToken() }));
+    writeFileSync(
+      creds,
+      JSON.stringify({ client_id: "test-client", refresh_token: fixture.issueRefreshToken(), target: fixture.mcpUrl, token_endpoint: `${fixture.baseUrl}/token` }),
+    );
     chmodSync(creds, 0o600);
 
-    const c = await connect({ allowPrivate: true, credentialsFile: creds });
+    const c = await connect({ allowPrivate: true, credentialsFile: creds, labOrigins: [new URL(fixture.mcpUrl).origin] });
     const res = await c.callTool({ name: "scan", arguments: { url: fixture.mcpUrl } });
     expect(res.isError).toBeFalsy();
     const out = textOf(res);
@@ -103,6 +106,35 @@ describe("MCP server", () => {
     const report = (res.structuredContent as { report: { findings: Array<{ checkId: string; status: string }> } }).report;
     expect(report.findings.find((f) => f.checkId === "MAP-RTK02")?.status).toBe("fail");
     expect(fixture.registeredClients()).toEqual([]);
+  });
+});
+
+describe("MCP server guard rails", () => {
+  it("requires a proof for loopback targets that are not pinned lab origins", async () => {
+    fixture = await startFixture();
+    const c = await connect({ allowPrivate: true });
+    const res = await c.callTool({ name: "scan", arguments: { url: fixture.mcpUrl } });
+    expect(textOf(res)).toMatch(/Ownership NOT verified/);
+    expect(fixture.requests.filter((r) => ["/register", "/authorize", "/token"].includes(r.path))).toEqual([]);
+  });
+
+  it("does not spend a grant that does not name its target", async () => {
+    fixture = await startFixture();
+    const dir = mkdtempSync(join(tmpdir(), "map-mcp-"));
+    const creds = join(dir, "grant.json");
+    writeFileSync(creds, JSON.stringify({ client_id: "test-client", refresh_token: fixture.issueRefreshToken() }), { mode: 0o600 });
+    const c = await connect({ allowPrivate: true, credentialsFile: creds, labOrigins: [new URL(fixture.mcpUrl).origin] });
+    const res = await c.callTool({ name: "scan", arguments: { url: fixture.mcpUrl } });
+    const report = (res.structuredContent as { report: { findings: Array<{ checkId: string; status: string; message: string }> } }).report;
+    const rtk = report.findings.find((f) => f.checkId === "MAP-RTK01");
+    expect(rtk?.status).toBe("skipped");
+    expect(rtk?.message).toMatch(/does not name its target/);
+  });
+
+  it("refuses plain http to public hosts even with private labs enabled", async () => {
+    const c = await connect({ allowPrivate: true });
+    const res = await c.callTool({ name: "scan", arguments: { url: "http://mcp.example.com/mcp" } });
+    expect(res.isError).toBe(true);
   });
 });
 

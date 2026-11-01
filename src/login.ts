@@ -165,10 +165,10 @@ export async function login(opts: LoginOptions): Promise<LoginResult> {
       clientName: "mcp-authprobe test login",
       grantTypes: ["authorization_code", "refresh_token"],
     });
-    if (!reg.client) throw new LoginError(`Dynamic client registration failed (HTTP ${reg.status}${reg.error ? `, error=${reg.error}` : ""}).`);
+    if (!reg.client) throw new LoginError(`Dynamic client registration failed (HTTP ${reg.status}${reg.error ? `, error=${safeText(reg.error, 80)}` : ""}).`);
     const client = reg.client;
     registered = client;
-    log(`Registered test client ${client.clientId}.`);
+    log(`Registered test client ${safeText(client.clientId, 120)}.`);
 
     authUrl.searchParams.set("response_type", "code");
     authUrl.searchParams.set("client_id", client.clientId);
@@ -220,7 +220,7 @@ export async function login(opts: LoginOptions): Promise<LoginResult> {
           );
           return { grant: null, observations, notes };
         }
-        throw new LoginError(`Code exchange failed: ${describeOutcome(tokens)}.`);
+        throw new LoginError(`Code exchange failed: ${safeText(describeOutcome(tokens), 200)}.`);
       }
     }
     if (!tokens.refreshToken) {
@@ -232,6 +232,9 @@ export async function login(opts: LoginOptions): Promise<LoginResult> {
       clientId: client.clientId,
       refreshToken: tokens.refreshToken,
       authMethod: client.clientSecret ? "client_secret_post" : "none",
+      // Bind the grant to where it came from: scans of other targets will not use it.
+      target: new URL(target).toString(),
+      tokenEndpoint: new URL(tokenEndpoint).toString(),
     };
     if (client.clientSecret) grant.clientSecret = client.clientSecret;
     keepClient = true; // the grant belongs to this client

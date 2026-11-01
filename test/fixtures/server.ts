@@ -28,6 +28,8 @@ export interface TokenBehaviour {
   rateLimitAfter?: number;
   /** Signal throttling with an OAuth slow_down error in a 400 instead of 429. */
   rateLimitStyle?: "429" | "slow_down";
+  /** Answer every token request with 503 and Retry-After (outage). */
+  outage?: boolean;
 }
 
 export interface AuthorizationBehaviour {
@@ -49,6 +51,8 @@ export interface AuthorizationBehaviour {
   registration?: "strict" | "lax" | "disabled";
   /** Offer RFC 7592 deletion of registered clients (default true). */
   management?: boolean;
+  /** Answer 429 to authorize and register requests once this many have been seen. */
+  rateLimitAfter?: number;
 }
 
 export interface FixtureOptions {
@@ -117,9 +121,11 @@ export async function startFixture(options: FixtureOptions = {}): Promise<Fixtur
     bindRedirect: true,
     consumeCodeOnFailure: false,
     rateLimitStyle: "429",
+    outage: false,
     ...options.tokens,
   };
-  const authz: Required<AuthorizationBehaviour> = { match: "exact", noSession: "login", registration: "strict", management: true, issInResponse: true, ...options.authorization };
+  let authzRequests = 0;
+  const authz: Required<Omit<AuthorizationBehaviour, "rateLimitAfter">> & { rateLimitAfter?: number } = { match: "exact", noSession: "login", registration: "strict", management: true, issInResponse: true, ...options.authorization };
   const codes = new Map<string, { clientId: string; redirectUri: string; challenge: string; used: boolean }>();
   const clients = new Map<string, { redirectUris: string[]; managementToken: string }>();
   const requests: Fixture["requests"] = [];
@@ -131,6 +137,7 @@ export async function startFixture(options: FixtureOptions = {}): Promise<Fixtur
   function tokenEndpoint(req: IncomingMessage, body: string, res: ServerResponse): void {
     tokenCount += 1;
     if (tok.throttle) return json(res, 429, { error: "slow_down" }, { "retry-after": "30" });
+    if (tok.outage) return json(res, 503, { error: "temporarily_down" }, { "retry-after": "30" });
     if (tok.rateLimitAfter !== undefined && failures >= tok.rateLimitAfter) {
       return tok.rateLimitStyle === "429" ? json(res, 429, { error: "too_many_requests" }, { "retry-after": "60" }) : json(res, 400, { error: "slow_down" });
     }
@@ -296,6 +303,12 @@ export async function startFixture(options: FixtureOptions = {}): Promise<Fixtur
         });
       }
       if (path === "/token" && req.method === "POST") return tokenEndpoint(req, body, res);
+      if ((path === "/register" && req.method === "POST") || path === "/authorize") {
+        authzRequests += 1;
+        if (authz.rateLimitAfter !== undefined && authzRequests > authz.rateLimitAfter) {
+          return json(res, 429, { error: "too_many_requests" }, { "retry-after": "60" });
+        }
+      }
       if (path === "/register" && req.method === "POST") return registerEndpoint(body, res);
       if (path.startsWith("/register/")) return manageEndpoint(req, path.slice("/register/".length), res);
       if (path === "/authorize" && req.method === "GET") return authorizeEndpoint(new URL(req.url ?? "/", base), res);
