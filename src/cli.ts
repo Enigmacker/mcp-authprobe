@@ -138,7 +138,7 @@ export async function main(argv: string[]): Promise<number> {
   if (command === "lab") {
     const { LabUsageError, startLab } = await import("./lab-command.js");
     try {
-      const { lab, banner } = await startLab({ profile: values.profile, port: Number(values.port), host: values.host });
+      const { lab, banner } = await startLab({ profile: values.profile, port: values.port, host: values.host });
       err(banner);
       const stop = (): void => {
         void lab.close().finally(() => process.exit(EXIT.ok));
@@ -303,7 +303,7 @@ export async function main(argv: string[]): Promise<number> {
       try {
         const loaded = loadGrant(values["credentials-file"]);
         for (const w of loaded.warnings) err(`warning: ${w}\n`);
-        options.grant = loaded.grant;
+        if (loaded.grant) options.grant = loaded.grant;
         options.observations = loaded.observations;
       } catch (e) {
         err(`${(e as Error).message}\n`);

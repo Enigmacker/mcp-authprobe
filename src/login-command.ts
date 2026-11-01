@@ -1,4 +1,5 @@
-import { writeGrantFile } from "./credentials.js";
+import { existsSync } from "node:fs";
+import { loadGrant, writeGrantFile, type Observation } from "./credentials.js";
 import { discover } from "./discovery.js";
 import { login, LoginError, openInBrowser } from "./login.js";
 import { HttpClient } from "./net/http.js";
@@ -14,6 +15,9 @@ export interface LoginCommandOptions {
   browser: boolean;
   allowPrivate: boolean;
   secret: string | undefined;
+  /** Replaces the browser (tests). */
+  openUrl?: (url: string) => Promise<void>;
+  timeoutMs?: number;
 }
 
 // Everything printed here may contain server-controlled text: neutralize it.
@@ -40,22 +44,44 @@ export async function runLoginCommand(o: LoginCommandOptions): Promise<number> {
       discovery,
       probe,
       log: err,
-      openUrl: async (url) => {
-        err(`\nAuthorization URL (open it if no browser appears):\n${url}\n`);
-        if (o.browser) await openInBrowser(url);
-      },
+      ...(o.timeoutMs !== undefined ? { timeoutMs: o.timeoutMs } : {}),
+      openUrl:
+        o.openUrl ??
+        (async (url) => {
+          err(`\nAuthorization URL (open it if no browser appears):\n${url}\n`);
+          if (o.browser) await openInBrowser(url);
+        }),
     });
 
     for (const ob of result.observations) err(`${ob.checkId}: ${ob.status} - ${ob.message}`);
     for (const n of result.notes) err(`Note: ${n}`);
-    if (!result.grant) return 3;
+
+    // Overwriting a file of the same target: keep the results this login did not observe
+    // (after a strict server forced a second login with --no-probe).
+    let observations: Observation[] = result.observations;
+    if (o.force && existsSync(o.out)) {
+      try {
+        const target = new URL(o.mcpUrl).toString();
+        const fresh = new Set(observations.map((x) => x.checkId));
+        const kept = loadGrant(o.out).observations.filter((x) => x.target === target && !fresh.has(x.checkId));
+        if (kept.length > 0) err(`Keeping earlier results from ${o.out}: ${kept.map((x) => x.checkId).join(", ")}.`);
+        observations = [...kept, ...observations];
+      } catch {
+        /* unreadable or not ours: replaced */
+      }
+    }
+    if (!result.grant && observations.length === 0) return 3;
 
     try {
-      writeGrantFile(o.out, result.grant, result.observations, o.force);
+      writeGrantFile(o.out, result.grant, observations, o.force);
     } catch (e) {
       const code = (e as NodeJS.ErrnoException).code;
       err(code === "EEXIST" ? `${o.out} already exists; use --force to overwrite it.` : `Could not write ${o.out}: ${(e as Error).message}`);
       return 2;
+    }
+    if (!result.grant) {
+      err(`Results written to ${o.out} (no test grant). Run login again with --no-probe --force --out ${o.out}: these results are kept.`);
+      return 0;
     }
     err(`Test grant written to ${o.out} (mode 600). It is consumed by the refresh token checks: scan with --credentials-file ${o.out}.`);
     return 0;

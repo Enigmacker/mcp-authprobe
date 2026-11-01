@@ -210,7 +210,7 @@ export function createAuthprobeServer(config: ServerConfig): McpServer {
         if (config.credentialsFile) {
           try {
             const loaded = loadGrant(config.credentialsFile);
-            options.grant = loaded.grant satisfies TestGrant;
+            if (loaded.grant) options.grant = loaded.grant satisfies TestGrant;
             options.observations = loaded.observations;
             notes.push(...loaded.warnings);
           } catch (e) {

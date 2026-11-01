@@ -2,7 +2,8 @@ import { afterEach, describe, expect, it } from "vitest";
 import type { TestGrant } from "../src/credentials.js";
 import { discover } from "../src/discovery.js";
 import { LabUsageError, startLab } from "../src/lab-command.js";
-import type { Fixture } from "../src/lab/server.js";
+import { connect } from "node:net";
+import { startFixture, type Fixture } from "../src/lab/server.js";
 import { login } from "../src/login.js";
 import { HttpClient } from "../src/net/http.js";
 import { scan } from "../src/scan.js";
@@ -47,6 +48,42 @@ describe("lab", () => {
     await expect(startLab({ profile: "vulnerable", port: 0, host: "0.0.0.0" })).rejects.toBeInstanceOf(LabUsageError);
     await expect(startLab({ profile: "nope", port: 0, host: "127.0.0.1" })).rejects.toThrow(/Unknown profile/);
     await expect(startLab({ profile: "secure", port: 70000, host: "127.0.0.1" })).rejects.toThrow(/--port/);
+  });
+
+  it("accepts only literal loopback addresses and decimal ports", async () => {
+    for (const host of ["localhost", "foo.localhost", "127.0.0.2", "::ffff:127.0.0.1"]) {
+      await expect(startLab({ profile: "secure", port: 0, host })).rejects.toBeInstanceOf(LabUsageError);
+    }
+    for (const port of ["", " 0x10 ", "1e3", "8787abc", "-1"]) {
+      await expect(startLab({ profile: "secure", port, host: "127.0.0.1" })).rejects.toThrow(/--port/);
+    }
+    await expect(startFixture({ host: "0.0.0.0" })).rejects.toThrow(/only listens/);
+    const started = await startLab({ profile: "secure", port: "0", host: "[::1]" }).catch((e: Error) => e);
+    if (started instanceof Error) expect(started.message).toMatch(/EADDRNOTAVAIL|EAFNOSUPPORT/); // no IPv6 here
+    else await started.lab.close();
+  });
+
+  it("survives malformed requests", async () => {
+    const started = await startLab({ profile: "vulnerable", port: 0, host: "127.0.0.1" });
+    lab = started.lab;
+    const { port } = new URL(lab.baseUrl);
+    const raw = (text: string): Promise<string> =>
+      new Promise((resolve) => {
+        const sock = connect(Number(port), "127.0.0.1", () => sock.end(text));
+        let out = "";
+        sock.on("data", (d) => (out += d.toString()));
+        sock.on("close", () => resolve(out));
+        sock.on("error", () => resolve(out));
+      });
+    expect(await raw("GET http://[bad/ HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")).toMatch(/^HTTP\/1\.1 400/);
+    const basic = Buffer.from("%zz:x").toString("base64");
+    expect((await fetch(`${lab.baseUrl}/token`, { method: "POST", headers: { authorization: `Basic ${basic}` }, body: "grant_type=refresh_token" })).status).toBe(400);
+    const reg = (await (await fetch(`${lab.baseUrl}/register`, { method: "POST", body: JSON.stringify({ redirect_uris: ["x"] }) })).json()) as { client_id: string };
+    const sid = lab.issueSession();
+    const consent = await fetch(`${lab.baseUrl}/consent`, { method: "POST", headers: { cookie: `sid=${sid}` }, body: new URLSearchParams({ client_id: reg.client_id, redirect_uri: "x", decision: "allow" }) });
+    expect(consent.status).toBe(400);
+    expect((await fetch(`${lab.baseUrl}/register`, { method: "POST", body: "x".repeat(100_000) }).catch(() => null))?.status ?? 413).toBe(413);
+    expect((await fetch(lab.mcpUrl, { method: "POST" })).status).toBe(401); // still alive
   });
 
   it("vulnerable: login and scan report the planted flaws", async () => {

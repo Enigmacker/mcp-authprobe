@@ -9,7 +9,7 @@ export const LAB_PROFILES = {
   vulnerable: {
     description: "Deliberately misconfigured: most checks fail.",
     options: {
-      tokens: { rotate: true, rejectReplay: false, bindRedirect: false, pkce: "optional", codeReuse: "allow", resource: "ignore" },
+      tokens: { rotate: true, rejectReplay: false, bindRedirect: false, pkce: "optional", codeReuse: "allow" },
       authorization: { match: "prefix", registration: "lax" },
       consent: { csrf: "none", sameSite: "unset" },
       mcp: { checkAudience: false, validateOrigin: false },

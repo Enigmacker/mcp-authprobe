@@ -90,7 +90,7 @@ describe("scan", () => {
     .find((a) => a && a.family === "IPv4" && !a.internal)?.address;
 
   it.skipIf(!lanAddress)("sends no active request when the target is reachable but ownership is not proven", async () => {
-    fixture = await startFixture({ host: lanAddress as string });
+    fixture = await startFixture({ host: lanAddress as string, unsafeAllowNonLoopback: true });
     const grant = { clientId: "test-client", refreshToken: fixture.issueRefreshToken(), authMethod: "none" as const };
     const report = await scan(fixture.mcpUrl, { allowPrivate: true, grant, resolveTxtRecords: async () => [] });
     expect(report.findings.find((f) => f.checkId === "MAP-DSC01")?.status).toBe("pass");

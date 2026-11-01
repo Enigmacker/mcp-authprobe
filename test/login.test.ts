@@ -5,6 +5,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { loadGrant, writeGrantFile, type TestGrant } from "../src/credentials.js";
 import { discover } from "../src/discovery.js";
 import { login, LoginError, type LoginResult } from "../src/login.js";
+import { runLoginCommand } from "../src/login-command.js";
 import { HttpClient } from "../src/net/http.js";
 import { scan } from "../src/scan.js";
 import { startFixture, type Fixture, type FixtureOptions } from "./fixtures/server.js";
@@ -84,8 +85,10 @@ describe("login", () => {
   it.each(["optional", "ignore"] as const)("flags a token endpoint with PKCE %s, and keeps the tokens the probe obtained", async (pkce) => {
     const result = await runLogin({ tokens: { pkce } });
     expect(statuses(result)["MAP-PKC01"]).toBe("fail");
-    expect(statuses(result)["MAP-RDR03"]).toBeUndefined(); // the code was already spent
-    expect(statuses(result)["MAP-COD01"]).toBeUndefined();
+    // The code was spent by the first probe: RDR03 is reported as not observed,
+    // and presenting the code normally is itself the second use for COD01.
+    expect(statuses(result)["MAP-RDR03"]).toBe("skipped");
+    expect(statuses(result)["MAP-COD01"]).toBe("pass");
     expect(result.observations.find((o) => o.checkId === "MAP-PKC01")?.evidence.join(" ")).toMatch(/not run/);
     expect(result.grant).not.toBeNull();
   });
@@ -105,13 +108,38 @@ describe("login", () => {
   });
 
   it.each([
-    [{ tokens: { resource: "ignore" as const } }, "fail"],
+    [{ tokens: { resource: "ignore" as const } }, "error"], // the AS's fault, not the MCP server's
     [{ mcp: { checkAudience: false } }, "fail"],
     [{ tokens: { resource: "refuse" as const } }, "pass"],
     [{ tokens: { resource: "refuse" as const }, mcp: { checkAudience: false } }, "pass"],
   ])("judges audience binding (%j)", async (options, expected) => {
     const result = await runLogin(options);
     expect(statuses(result)["MAP-AUD01"]).toBe(expected);
+    expect(result.grant).not.toBeNull();
+  });
+
+  it.each([429, 500])("never fails AUD01 or ORG01 when the MCP endpoint answers %i to a valid token", async (code) => {
+    const result = await runLogin({ mcp: { authenticatedStatus: code, validateOrigin: false, checkAudience: false } });
+    expect(statuses(result)).toMatchObject({ "MAP-AUD01": "error", "MAP-ORG01": "error" });
+    expect(result.grant).not.toBeNull();
+  });
+
+  it("does not pass ORG01 on a 403 caused by a dead token", async () => {
+    const result = await runLogin({ tokens: { revokeAccessOnRefresh: true }, mcp: { validateOrigin: false, invalidTokenStatus: 403 } });
+    expect(statuses(result)["MAP-ORG01"]).toBe("fail");
+  });
+
+  it("keeps the grant and the results when the MCP endpoint drops the connection", async () => {
+    const result = await runLogin({ mcp: { hangUpAuthenticated: true } });
+    expect(statuses(result)).toMatchObject({ "MAP-PKC01": "pass", "MAP-ORG01": "error", "MAP-AUD01": "error", "MAP-COD01": "pass" });
+    expect(result.grant).not.toBeNull();
+  });
+
+  it("does not mistake a throttled refresh for revocation after code reuse", async () => {
+    const result = await runLogin({ tokens: { throttleRefreshAfter: 1 } });
+    const cod = result.observations.find((o) => o.checkId === "MAP-COD01");
+    expect(cod?.status).toBe("pass");
+    expect(cod?.message).toMatch(/unknown/);
     expect(result.grant).not.toBeNull();
   });
 
@@ -164,6 +192,25 @@ describe("MAP-ORG01 during a scan", () => {
 
   it("is inconclusive when the endpoint asks for a token first", async () => {
     expect(await org({ mcp: { validateOrigin: false } })).toBe("error");
+  });
+});
+
+describe("login command", () => {
+  it("saves the results without a grant, and keeps them when logging in again with --no-probe", async () => {
+    fixture = await startFixture({ authorization: { noSession: "auto-approve" }, tokens: { consumeCodeOnFailure: true } });
+    const out = join(mkdtempSync(join(tmpdir(), "map-login-")), "lab.json");
+    const base = { mcpUrl: fixture.mcpUrl, out, browser: false, allowPrivate: true, secret: undefined, openUrl: browser(), timeoutMs: 5000 };
+    expect(await runLoginCommand({ ...base, force: false, probe: true })).toBe(0);
+    const first = loadGrant(out);
+    expect(first.grant).toBeNull();
+    expect(first.observations.map((o) => o.checkId).sort()).toEqual(["MAP-PKC01", "MAP-RDR03"]);
+
+    expect(await runLoginCommand({ ...base, force: true, probe: false })).toBe(0);
+    const second = loadGrant(out);
+    expect(second.grant).not.toBeNull();
+    expect(second.observations.map((o) => o.checkId).sort()).toEqual(["MAP-PKC01", "MAP-RDR03"]);
+    const report = await scan(fixture.mcpUrl, { allowPrivate: true, grant: second.grant as TestGrant, observations: second.observations });
+    expect(report.findings.find((f) => f.checkId === "MAP-PKC01")?.evidence.at(-1)).toMatch(/observed during login/);
   });
 });
 

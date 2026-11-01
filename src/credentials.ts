@@ -42,7 +42,8 @@ export interface Observation extends Finding {
 }
 
 export interface LoadedGrant {
-  grant: TestGrant;
+  /** Null for a results-only file (login kept no grant). */
+  grant: TestGrant | null;
   observations: Observation[];
   warnings: string[];
 }
@@ -111,7 +112,13 @@ export function loadGrant(path: string): LoadedGrant {
     // Never echo file content: it holds secrets.
     throw new Error(`Credentials file ${path} is not valid JSON.`);
   }
-  const observations = parseObservations((raw as Record<string, unknown> | null)?.["observations"]);
+  const obj = raw as Record<string, unknown> | null;
+  const observations = parseObservations(obj?.["observations"]);
+  // A results-only file: login observed the checks but kept no grant.
+  if (obj && typeof obj === "object" && obj["refresh_token"] === undefined && obj["client_id"] === undefined && observations.length > 0) {
+    warnings.push(`${path} holds login results only, no test grant: the refresh token checks will be skipped.`);
+    return { grant: null, observations, warnings };
+  }
   return { grant: parseGrant(raw), observations, warnings };
 }
 
@@ -119,15 +126,16 @@ export function loadGrant(path: string): LoadedGrant {
  * Write a grant file with mode 600. Refuses to follow a symbolic link and,
  * unless `overwrite` is set, to replace an existing file.
  */
-export function writeGrantFile(path: string, grant: TestGrant, observations: Observation[], overwrite = false): void {
-  const data: Record<string, unknown> = {
-    client_id: grant.clientId,
-    refresh_token: grant.refreshToken,
-    token_endpoint_auth_method: grant.authMethod,
-  };
-  if (grant.clientSecret) data["client_secret"] = grant.clientSecret;
-  if (grant.target) data["target"] = grant.target;
-  if (grant.tokenEndpoint) data["token_endpoint"] = grant.tokenEndpoint;
+export function writeGrantFile(path: string, grant: TestGrant | null, observations: Observation[], overwrite = false): void {
+  const data: Record<string, unknown> = {};
+  if (grant) {
+    data["client_id"] = grant.clientId;
+    data["refresh_token"] = grant.refreshToken;
+    data["token_endpoint_auth_method"] = grant.authMethod;
+    if (grant.clientSecret) data["client_secret"] = grant.clientSecret;
+    if (grant.target) data["target"] = grant.target;
+    if (grant.tokenEndpoint) data["token_endpoint"] = grant.tokenEndpoint;
+  }
   if (observations.length > 0) data["observations"] = observations;
 
   const nofollow = constants.O_NOFOLLOW ?? 0;

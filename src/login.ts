@@ -33,7 +33,7 @@ export interface LoginOptions {
   discovery: DiscoveryResult;
   /** Opens the authorization URL (a browser in the CLI, a scripted agent in tests). */
   openUrl: (url: string) => Promise<void>;
-  /** Run the MAP-RDR03 probe. Only set when ownership of every contacted host is proven. */
+  /** Run the login checks (PKC01, RDR03, AUD01, ORG01, COD01). Only set when ownership of every contacted host is proven. */
   probe: boolean;
   /** How long to wait for the user to finish in the browser. */
   timeoutMs?: number;
@@ -226,7 +226,7 @@ export async function login(opts: LoginOptions): Promise<LoginResult> {
         }
       }
     } else {
-      notes.push("MAP-PKC01, MAP-RDR03, MAP-COD01 and MAP-AUD01 were not observed: ownership of the contacted hosts is not proven, or --no-probe was used.");
+      notes.push("MAP-PKC01, MAP-RDR03, MAP-COD01, MAP-AUD01 and MAP-ORG01 were not observed: ownership of the contacted hosts is not proven, or --no-probe was used.");
     }
 
     // --- The real exchange ---
@@ -256,7 +256,7 @@ export async function login(opts: LoginOptions): Promise<LoginResult> {
     const PRE_MESSAGES: Record<string, { pass: string; fail: string }> = {
       "MAP-PKC01": {
         pass: "The token endpoint refused the code without a code_verifier and with a wrong one.",
-        fail: "The token endpoint exchanged a code without a valid code_verifier: PKCE is not enforced, so an intercepted code can be redeemed.",
+        fail: "The token endpoint exchanged a code without a valid code_verifier, so PKCE is not enforced and an intercepted code can be redeemed.",
       },
       "MAP-RDR03": {
         pass: "The token endpoint refused a code presented with a different redirect_uri.",
@@ -265,8 +265,11 @@ export async function login(opts: LoginOptions): Promise<LoginResult> {
     };
     for (const checkId of ["MAP-PKC01", "MAP-RDR03"]) {
       const rs = results.filter((r) => r.checkId === checkId && r.verdict !== "not_run");
-      if (rs.length === 0) continue;
       const lines = results.filter((r) => r.checkId === checkId).map((r) => r.line);
+      if (rs.length === 0) {
+        if (lines.length > 0) observations.push(observation(checkId, target, "skipped", "Not observed: an earlier probe already obtained tokens with this code (see the other login checks).", lines));
+        continue;
+      }
       const msg = PRE_MESSAGES[checkId] as { pass: string; fail: string };
       if (rs.some((r) => r.verdict === "accepted")) observations.push(observation(checkId, target, "fail", msg.fail, lines));
       else if (rs.some((r) => r.verdict === "inconclusive")) observations.push(observation(checkId, target, "error", "Inconclusive: some attempts got an unexpected answer or could not be told apart from an earlier refusal.", lines));
@@ -274,7 +277,7 @@ export async function login(opts: LoginOptions): Promise<LoginResult> {
     }
 
     if (codeBurnt) {
-      notes.push("The server invalidated the code after the first refused attempt (a strict, acceptable behaviour). Run login again with --no-probe to obtain a test grant.");
+      notes.push("The server invalidated the code after the first refused attempt (a strict, acceptable behaviour). The results are saved; run login again with --no-probe --force --out <same file> to obtain a test grant.");
       return { grant: null, observations, notes };
     }
     if (!tokens.refreshToken) {
@@ -293,77 +296,9 @@ export async function login(opts: LoginOptions): Promise<LoginResult> {
     if (client.clientSecret) grant.clientSecret = client.clientSecret;
 
     if (opts.probe) {
-      // --- MAP-AUD01: a token for another resource must be useless here ---
-      const foreignResource = `https://other.${SAFE_DOMAIN}/mcp`;
-      const control = tokens.accessToken ? await initializeStatus(http, target, { token: tokens.accessToken }) : null;
-      const audLines = [`control, token for this server: ${control === null ? "no access token" : `HTTP ${control}`}`];
-      if (control === null || control === 401 || control === 403) {
-        observations.push(observation("MAP-AUD01", target, "error", "Inconclusive: the token issued for this server is not accepted by it, so audience binding cannot be judged.", audLines));
-      } else {
-        const o = await refresh(http, tokenEndpoint, grant, grant.refreshToken, foreignResource);
-        audLines.push(`refresh token used to request a token for ${foreignResource}: ${describeOutcome(o)}`);
-        if (o.refreshToken) grant.refreshToken = o.refreshToken; // rotation: keep the newest
-        if (!o.accessTokenIssued) {
-          // Only invalid_target says why; another refusal (scope, policy) proves nothing.
-          observations.push(
-            o.error === "invalid_target"
-              ? observation("MAP-AUD01", target, "pass", "The authorization server refused to issue a token for an unrelated resource (invalid_target).", audLines)
-              : observation("MAP-AUD01", target, "error", "The request for a token for an unrelated resource was refused, but not with invalid_target; inconclusive.", audLines),
-          );
-        } else {
-          const st = await initializeStatus(http, target, { token: o.accessToken ?? "" });
-          audLines.push(`that token presented to this MCP server: HTTP ${st}`);
-          if (st === 401 || st === 403) {
-            observations.push(observation("MAP-AUD01", target, "pass", "A token issued for an unrelated resource is rejected by the MCP server.", audLines));
-          } else if (st === control) {
-            observations.push(
-              observation("MAP-AUD01", target, "fail", "A token requested for an unrelated resource is accepted by this MCP server: the authorization server ignores the resource parameter, or the MCP server does not check the audience.", audLines),
-            );
-          } else {
-            observations.push(observation("MAP-AUD01", target, "error", "Unexpected answer from the MCP server; inconclusive.", audLines));
-          }
-        }
-      }
-
-      // --- MAP-ORG01, with a valid token: a foreign Origin must be refused ---
-      if (control !== null && control >= 200 && control < 300 && tokens.accessToken) {
-        const st = await initializeStatus(http, target, { token: tokens.accessToken, origin: FOREIGN_ORIGIN });
-        const orgLines = [`initialize with a valid token: HTTP ${control}`, `same request with Origin: ${FOREIGN_ORIGIN}: HTTP ${st}`];
-        observations.push(
-          st === 403
-            ? observation("MAP-ORG01", target, "pass", "A request from a foreign Origin is refused with 403, even with a valid token.", orgLines)
-            : st === control
-              ? observation("MAP-ORG01", target, "fail", "A request from a foreign Origin is processed like any other: the Origin header is not validated.", orgLines)
-              : observation("MAP-ORG01", target, "error", "Unexpected answer to a request from a foreign Origin; inconclusive.", orgLines),
-        );
-      }
-
-      // --- MAP-COD01: the code must not be usable twice (last: it may revoke the grant) ---
-      if (!tokensFromProbe) {
-        const reuse = await exchangeCode(http, tokenEndpoint, correct);
-        const codLines = [`code presented a second time: ${describeOutcome(reuse)}`];
-        if (reuse.accessTokenIssued) {
-          observations.push(observation("MAP-COD01", target, "fail", "The authorization code was exchanged a second time: codes are not single-use.", codLines));
-          if (reuse.refreshToken) grant.refreshToken = reuse.refreshToken;
-        } else if (classify(reuse) !== "refused") {
-          observations.push(observation("MAP-COD01", target, "error", "Unexpected answer to the second use of the code; inconclusive.", codLines));
-        } else {
-          // Were the tokens issued from that code revoked? (recommended)
-          const after = await refresh(http, tokenEndpoint, grant, grant.refreshToken);
-          if (after.accessTokenIssued) {
-            if (after.refreshToken) grant.refreshToken = after.refreshToken;
-            codLines.push(`refresh token after the reuse attempt: still valid (revoking it is recommended)`);
-            observations.push(observation("MAP-COD01", target, "pass", "A second use of the authorization code is refused. The tokens already issued from it stay valid; revoking them on reuse is recommended.", codLines));
-          } else {
-            codLines.push(`refresh token after the reuse attempt: ${describeOutcome(after)}`);
-            observations.push(observation("MAP-COD01", target, "pass", "A second use of the authorization code is refused, and the tokens issued from it were revoked.", codLines));
-            notes.push("The server revoked the tokens after the code reuse attempt (recommended behaviour). Run login again with --no-probe to obtain a test grant.");
-            return { grant: null, observations, notes };
-          }
-        }
-      }
+      await postExchangeProbes({ http, target, tokenEndpoint, grant, tokens, correct, tokensFromProbe, observations, notes, results });
+      if (notes.some((n) => n.startsWith(REVOKED_NOTE))) return { grant: null, observations, notes };
     }
-
     keepClient = true; // the grant belongs to this client
     return { grant, observations, notes };
   } finally {
@@ -392,5 +327,150 @@ export function openInBrowser(url: string): Promise<void> {
       /* the URL is printed anyway */
     }
     resolve();
+  });
+}
+
+
+const REVOKED_NOTE = "The server revoked the tokens after the code reuse attempt";
+
+interface PostExchange {
+  http: HttpClient;
+  target: string;
+  tokenEndpoint: string;
+  grant: TestGrant;
+  tokens: CodeExchangeOutcome;
+  correct: Parameters<typeof exchangeCode>[2];
+  tokensFromProbe: boolean;
+  observations: Observation[];
+  notes: string[];
+  results: Array<{ checkId: string }>;
+}
+
+const is2xx = (s: number | null): s is number => s !== null && s >= 200 && s < 300;
+
+/** Audience of a JWT access token, read without verification (attribution only), or null. */
+export function jwtAudience(token: string): string[] | null {
+  const parts = token.split(".");
+  if (parts.length !== 3) return null;
+  try {
+    const payload = JSON.parse(Buffer.from(parts[1] as string, "base64url").toString("utf8")) as { aud?: unknown };
+    if (typeof payload.aud === "string") return [payload.aud];
+    if (Array.isArray(payload.aud) && payload.aud.every((a) => typeof a === "string")) return payload.aud as string[];
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Checks that need tokens: MAP-ORG01 and MAP-AUD01 (with the access token,
+ * before any refresh), then MAP-COD01 (last: it may revoke the grant). Each
+ * one turns a network failure into an inconclusive result, so the grant and
+ * the earlier observations are never lost. The grant always keeps the newest
+ * refresh token.
+ */
+async function postExchangeProbes(c: PostExchange): Promise<void> {
+  const { http, target, tokenEndpoint, grant, tokens, observations } = c;
+  const guard = async (checkId: string, run: () => Promise<void>): Promise<void> => {
+    try {
+      await run();
+    } catch (e) {
+      observations.push(observation(checkId, target, "error", `Inconclusive: a request failed (${(e as Error).message}).`, []));
+    }
+  };
+
+  let control: number | null = null;
+  const accessToken = tokens.accessToken;
+  await guard("MAP-ORG01", async () => {
+    control = accessToken ? await initializeStatus(http, target, { token: accessToken }) : null;
+    const lines = [`initialize with a valid token: ${control === null ? "no access token" : `HTTP ${control}`}`];
+    if (!is2xx(control) || !accessToken) {
+      observations.push(observation("MAP-ORG01", target, "error", "Inconclusive: the MCP endpoint did not accept the token just issued for it, so it could not be compared.", lines));
+      return;
+    }
+    const st = await initializeStatus(http, target, { token: accessToken, origin: FOREIGN_ORIGIN });
+    lines.push(`same request with Origin: ${FOREIGN_ORIGIN}: HTTP ${st}`);
+    // The token must still work afterwards, or a 403 could come from a dead token.
+    const again = await initializeStatus(http, target, { token: accessToken });
+    lines.push(`same request again without Origin: HTTP ${again}`);
+    if (!is2xx(again)) {
+      observations.push(observation("MAP-ORG01", target, "error", "Inconclusive: the token stopped working during the check.", lines));
+    } else if (st === 403) {
+      observations.push(observation("MAP-ORG01", target, "pass", "A request from a foreign Origin is refused with 403, even with a valid token.", lines));
+    } else if (st === control) {
+      observations.push(observation("MAP-ORG01", target, "fail", "A request from a foreign Origin is processed like any other: the Origin header is not validated.", lines));
+    } else {
+      observations.push(observation("MAP-ORG01", target, "error", "Unexpected answer to a request from a foreign Origin; inconclusive.", lines));
+    }
+  });
+
+  await guard("MAP-AUD01", async () => {
+    const lines = [`control, token for this server: ${control === null ? "not available" : `HTTP ${control}`}`];
+    if (!is2xx(control)) {
+      observations.push(observation("MAP-AUD01", target, "error", "Inconclusive: the token issued for this server was not accepted by it, so audience binding cannot be judged.", lines));
+      return;
+    }
+    const foreignResource = `https://other.${SAFE_DOMAIN}/mcp`;
+    const o = await refresh(http, tokenEndpoint, grant, grant.refreshToken, foreignResource);
+    lines.push(`refresh token used to request a token for ${foreignResource}: ${describeOutcome(o)}`);
+    if (o.refreshToken) grant.refreshToken = o.refreshToken; // rotation: keep the newest
+    if (!o.accessTokenIssued) {
+      // Only invalid_target says why; another refusal (scope, policy, throttling) proves nothing.
+      observations.push(
+        o.error === "invalid_target"
+          ? observation("MAP-AUD01", target, "pass", "The authorization server refused to issue a token for an unrelated resource (invalid_target).", lines)
+          : observation("MAP-AUD01", target, "error", "The request for a token for an unrelated resource was refused, but not with invalid_target; inconclusive.", lines),
+      );
+      return;
+    }
+    const st = await initializeStatus(http, target, { token: o.accessToken ?? "" });
+    lines.push(`that token presented to this MCP server: HTTP ${st}`);
+    const aud = o.accessToken ? jwtAudience(o.accessToken) : null;
+    if (aud) lines.push(`audience of that token (JWT, unverified): ${aud.join(", ")}`);
+    if (st === 401 || st === 403) {
+      observations.push(observation("MAP-AUD01", target, "pass", "A token issued for an unrelated resource is rejected by the MCP server.", lines));
+    } else if (!is2xx(st)) {
+      observations.push(observation("MAP-AUD01", target, "error", "Unexpected answer from the MCP server; inconclusive.", lines));
+    } else if (aud && aud.includes(foreignResource) && !aud.includes(target)) {
+      observations.push(observation("MAP-AUD01", target, "fail", "The MCP server accepts a token whose audience is another resource: it does not validate the token audience.", lines));
+    } else if (aud) {
+      observations.push(
+        observation("MAP-AUD01", target, "error", "Inconclusive: the authorization server ignored the resource parameter and issued a token for this server (RFC 8707 recommends refusing with invalid_target), so the MCP server's audience validation could not be tested.", lines),
+      );
+    } else {
+      observations.push(
+        observation("MAP-AUD01", target, "error", "Inconclusive: a token requested for an unrelated resource works on this server, but the token is opaque, so it cannot be told whether the authorization server ignored the resource parameter or the MCP server does not validate the audience. Check both.", lines),
+      );
+    }
+  });
+
+  // Last: a compliant server may revoke the grant here.
+  await guard("MAP-COD01", async () => {
+    const reuse = await exchangeCode(http, tokenEndpoint, c.correct);
+    const lines = [`code presented a second time: ${describeOutcome(reuse)}`];
+    if (c.tokensFromProbe) lines.unshift("the code had already been exchanged by an earlier probe");
+    if (reuse.accessTokenIssued) {
+      observations.push(observation("MAP-COD01", target, "fail", "The authorization code was exchanged a second time: codes are not single-use.", lines));
+      if (reuse.refreshToken) grant.refreshToken = reuse.refreshToken;
+      return;
+    }
+    if (reuse.status < 400 || reuse.status >= 500 || reuse.throttled) {
+      observations.push(observation("MAP-COD01", target, "error", "Unexpected answer to the second use of the code; inconclusive.", lines));
+      return;
+    }
+    // Were the tokens issued from that code revoked? (recommended)
+    const after = await refresh(http, tokenEndpoint, grant, grant.refreshToken);
+    if (after.accessTokenIssued) {
+      if (after.refreshToken) grant.refreshToken = after.refreshToken;
+      lines.push("newest refresh token after the reuse attempt: still valid");
+      observations.push(observation("MAP-COD01", target, "pass", "A second use of the authorization code is refused. The tokens issued from it stay valid; revoking them on reuse is recommended.", lines));
+    } else if (after.error === "invalid_grant") {
+      lines.push(`newest refresh token after the reuse attempt: ${describeOutcome(after)}`);
+      observations.push(observation("MAP-COD01", target, "pass", "A second use of the authorization code is refused, and the tokens issued from it were revoked.", lines));
+      c.notes.push(`${REVOKED_NOTE} (recommended behaviour). The results are saved; run login again with --no-probe --force --out <same file> to obtain a test grant.`);
+    } else {
+      lines.push(`newest refresh token after the reuse attempt: ${describeOutcome(after)} (unknown)`);
+      observations.push(observation("MAP-COD01", target, "pass", "A second use of the authorization code is refused. Whether the tokens issued from it were revoked is unknown.", lines));
+    }
   });
 }

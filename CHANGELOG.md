@@ -6,11 +6,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-11-01
+
 ### Added
 
 - `MAP-PKC01` (PKCE enforcement): during `login`, the code is first presented without `code_verifier`, then with a wrong one; the token endpoint must refuse both.
 - `MAP-COD01` (single-use codes): after the exchange, `login` presents the used code again, then checks whether the tokens issued from it were revoked (recommended, reported in the result).
-- `MAP-AUD01` (token audience, RFC 8707): `login` requests a token for an unrelated resource with the refresh token and presents it to the MCP endpoint, after a control with its own token. Passes on `invalid_target` from the authorization server or 401/403 from the MCP endpoint; any other refusal is inconclusive.
+- `MAP-AUD01` (token audience, RFC 8707): `login` requests a token for an unrelated resource with the refresh token and presents it to the MCP endpoint, after a successful control with its own token. Passes on `invalid_target` from the authorization server or 401/403 from the MCP endpoint. Fails only when the MCP endpoint accepts a token whose JWT audience is the other resource; an opaque token, or an authorization server that ignores `resource`, is reported as inconclusive with the reason.
 - `lab` command: a local MCP server with its own OAuth authorization server, in a `vulnerable` profile (most checks fail) or a `secure` one, to try every check in a minute. Loopback only, test account `test` / `test`, in memory.
 - `MAP-ORG01` (Origin validation): an `initialize` request with a foreign `Origin` must get 403. Observed during `login` with a valid token, and in every scan without credentials (inconclusive when the server asks for a token first).
 
@@ -18,6 +20,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 - `login` runs its probes in a fixed order and handles servers that invalidate a code after the first refused attempt: only that first refusal is trusted. If a probe obtains tokens, the remaining probes are reported as not run and those tokens become the grant. The grant always keeps the newest refresh token.
 - Scans report every login observation; no check is listed as "not implemented" any more.
+- `login` writes its results even when it keeps no grant (strict servers), and a later `login --no-probe --force` to the same file keeps them. A grant file may therefore hold results only; scans then skip the refresh token checks with a warning.
 - The lab server doubles as the test fixture: its consent mode validates authorization requests before asking for a login, and returns the RFC 9207 `iss` parameter.
 
 ## [0.2.0] - 2026-11-01
@@ -59,7 +62,8 @@ First release.
 - Hardening from an independent review before release: HTTPS is required for every request outside loopback/private labs; rate limits and server errors make redirect URI, registration and throttling checks inconclusive instead of passing; test grants record their target and token endpoint and are never used elsewhere (and must name their target in MCP mode); loopback targets need a proof in MCP mode unless listed in `MCP_AUTHPROBE_LAB_ORIGINS`; `login` output is neutralized; more IPv6 transition ranges are refused; a malformed issuer no longer aborts discovery.
 - Local fixture server with a stateful token endpoint, dynamic registration and an authorization endpoint and test suite; GitHub Actions CI.
 
-[Unreleased]: https://github.com/Enigmacker/mcp-authprobe/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/Enigmacker/mcp-authprobe/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/Enigmacker/mcp-authprobe/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/Enigmacker/mcp-authprobe/compare/v0.1.1...v0.2.0
 [0.1.1]: https://github.com/Enigmacker/mcp-authprobe/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/Enigmacker/mcp-authprobe/releases/tag/v0.1.0

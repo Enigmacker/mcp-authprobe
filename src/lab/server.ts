@@ -34,6 +34,10 @@ export interface TokenBehaviour {
   outage?: boolean;
   /** PKCE at the token endpoint: "enforce" (default), "optional" (a missing verifier is accepted), "ignore". */
   pkce?: "enforce" | "optional" | "ignore";
+  /** Answer 429 to refresh requests once this many have been served. */
+  throttleRefreshAfter?: number;
+  /** Invalidate the access tokens of a family when it is refreshed. */
+  revokeAccessOnRefresh?: boolean;
   /** A second use of a code: "refuse" (default), "revoke" (refuse and revoke its tokens), "allow". */
   codeReuse?: "refuse" | "revoke" | "allow";
   /** The resource parameter: "bind" (default, audience = resource), "ignore" (audience always this server), "refuse" (invalid_target for another resource). */
@@ -106,6 +110,8 @@ export interface FixtureOptions {
    * A non-loopback local address lets tests exercise the ownership gate.
    */
   host?: string;
+  /** Tests only: allow a non-loopback address (never used by the lab command). */
+  unsafeAllowNonLoopback?: boolean;
   /** Port to listen on (default: a random free port). */
   port?: number;
   /** The MCP endpoint with a token. */
@@ -114,6 +120,12 @@ export interface FixtureOptions {
     checkAudience?: boolean;
     /** Answer 403 to a request with a foreign Origin header (default true). */
     validateOrigin?: boolean;
+    /** Status for a request with an invalid or expired token (default 401). */
+    invalidTokenStatus?: number;
+    /** Answer every request with a valid token with this status (an overloaded or broken server). */
+    authenticatedStatus?: number;
+    /** Drop the connection on every request with a valid token. */
+    hangUpAuthenticated?: boolean;
   };
 }
 
@@ -145,11 +157,24 @@ function json(res: ServerResponse, status: number, body: unknown, headers: Recor
   res.end(JSON.stringify(body));
 }
 
-function readBody(req: IncomingMessage): Promise<string> {
+const MAX_BODY = 64 * 1024;
+
+/** Request body, or null when it exceeds MAX_BODY or the request fails. */
+function readBody(req: IncomingMessage): Promise<string | null> {
   return new Promise((resolve) => {
     const chunks: Buffer[] = [];
-    req.on("data", (c: Buffer) => chunks.push(c));
+    let size = 0;
+    req.on("data", (c: Buffer) => {
+      size += c.length;
+      if (size > MAX_BODY) {
+        resolve(null);
+        req.destroy();
+        return;
+      }
+      chunks.push(c);
+    });
     req.on("end", () => resolve(Buffer.concat(chunks).toString("utf8")));
+    req.on("error", () => resolve(null));
   });
 }
 
@@ -158,7 +183,7 @@ const newToken = (prefix: string): string => `${prefix}_${randomBytes(16).toStri
 export async function startFixture(options: FixtureOptions = {}): Promise<Fixture> {
   const opts = { challenge: true, prm: true, asMetadata: true, ownershipFile: null, anonymous: false, ...options };
   let failures = 0;
-  const tok: Required<Omit<TokenBehaviour, "clientSecret" | "rateLimitAfter">> & { clientSecret?: string; rateLimitAfter?: number } = {
+  const tok: Required<Omit<TokenBehaviour, "clientSecret" | "rateLimitAfter" | "throttleRefreshAfter">> & { clientSecret?: string; rateLimitAfter?: number; throttleRefreshAfter?: number } = {
     rotate: true,
     returnSameRefresh: false,
     rejectReplay: true,
@@ -171,6 +196,7 @@ export async function startFixture(options: FixtureOptions = {}): Promise<Fixtur
     pkce: "enforce",
     codeReuse: "refuse",
     resource: "bind",
+    revokeAccessOnRefresh: false,
     ...options.tokens,
   };
   let authzRequests = 0;
@@ -184,6 +210,7 @@ export async function startFixture(options: FixtureOptions = {}): Promise<Fixtur
   const refreshTokens = new Map<string, RefreshRecord>();
   const revokedFamilies = new Set<string>();
   let tokenCount = 0;
+  let refreshCount = 0;
   let base = "";
 
   function tokenEndpoint(req: IncomingMessage, body: string, res: ServerResponse): void {
@@ -232,6 +259,8 @@ export async function startFixture(options: FixtureOptions = {}): Promise<Fixtur
       return json(res, 200, { access_token: accessToken(audience, family), token_type: "Bearer", expires_in: 3600, refresh_token: refreshOut });
     }
     if (form.get("grant_type") !== "refresh_token") return json(res, 400, { error: "unsupported_grant_type" });
+    refreshCount += 1;
+    if (tok.throttleRefreshAfter !== undefined && refreshCount > tok.throttleRefreshAfter) return json(res, 429, { error: "slow_down" }, { "retry-after": "30" });
 
     const presented = form.get("refresh_token") ?? "";
     const record = refreshTokens.get(presented);
@@ -246,6 +275,7 @@ export async function startFixture(options: FixtureOptions = {}): Promise<Fixtur
 
     const audience = audienceFor(form.get("resource"));
     if (audience === null) return json(res, 400, { error: "invalid_target" });
+    if (tok.revokeAccessOnRefresh) for (const [t, a] of accessTokens) if (a.family === record.family) accessTokens.delete(t);
     let refreshOut = presented;
     if (tok.rotate) {
       record.used = true;
@@ -264,8 +294,10 @@ export async function startFixture(options: FixtureOptions = {}): Promise<Fixtur
     return tok.resource === "refuse" ? null : resource;
   }
 
+  /** A JWT-shaped access token (unsigned: the lab is not a real authorization server). */
   function accessToken(audience: string, family: string): string {
-    const t = newToken("at");
+    const b64 = (v: unknown): string => Buffer.from(JSON.stringify(v)).toString("base64url");
+    const t = `${b64({ alg: "none", typ: "at+jwt" })}.${b64({ iss: base, aud: audience, jti: randomBytes(16).toString("hex") })}.${randomBytes(16).toString("base64url")}`;
     accessTokens.set(t, { audience, family });
     return t;
   }
@@ -493,16 +525,34 @@ ${formTag}${hidden}${token}${challenge}${checkbox}
   }
 
   const server: Server = createServer((req: IncomingMessage, res: ServerResponse) => {
-    const path = new URL(req.url ?? "/", "http://fixture").pathname;
-    requests.push({ method: req.method ?? "GET", path });
-
     void readBody(req).then((body) => {
+      try {
+        if (body === null) return json(res, 413, { error: "request_too_large" });
+        handle(req, body, res);
+      } catch {
+        // Malformed input never stops the lab.
+        if (!res.headersSent) json(res, 400, { error: "invalid_request" });
+        else res.end();
+      }
+    });
+  });
+
+  function handle(req: IncomingMessage, body: string, res: ServerResponse): void {
+    const path = new URL(req.url ?? "/", "http://fixture").pathname;
+    if (requests.length < 10_000) requests.push({ method: req.method ?? "GET", path });
+    {
       if (path === "/mcp") {
         const origin = req.headers.origin;
         if (mcpOpts.validateOrigin && origin !== undefined && origin !== base) return json(res, 403, { error: "forbidden_origin" });
         const bearer = /^Bearer\s+(\S+)$/i.exec(req.headers.authorization ?? "")?.[1];
         const at = bearer ? accessTokens.get(bearer) : undefined;
         const tokenOk = at !== undefined && !revokedFamilies.has(at.family) && (!mcpOpts.checkAudience || at.audience === `${base}/mcp`);
+        if (tokenOk && mcpOpts.hangUpAuthenticated) {
+          req.socket.destroy();
+          return;
+        }
+        if (tokenOk && mcpOpts.authenticatedStatus !== undefined) return json(res, mcpOpts.authenticatedStatus, { error: "unavailable" });
+        if (bearer && !tokenOk && mcpOpts.invalidTokenStatus !== undefined) return json(res, mcpOpts.invalidTokenStatus, { error: "invalid_token" });
         if (opts.anonymous || tokenOk) {
           return json(res, 200, { jsonrpc: "2.0", id: 1, result: { protocolVersion: "2025-11-25", capabilities: {}, serverInfo: { name: "fixture", version: "0" } } });
         }
@@ -544,13 +594,18 @@ ${formTag}${hidden}${token}${challenge}${checkbox}
       if (path === "/authorize" && req.method === "GET") return authorizeEndpoint(new URL(req.url ?? "/", base), res);
       if (path === "/.well-known/mcp-authprobe.txt" && opts.ownershipFile !== null) {
         res.writeHead(200, { "content-type": "text/plain" });
-        return res.end(opts.ownershipFile);
+        res.end(opts.ownershipFile);
+        return;
       }
       json(res, 404, { error: "not_found" });
-    });
-  });
+    }
+  }
 
   const host = options.host ?? "127.0.0.1";
+  // Vulnerable on purpose: loopback only, unless a test explicitly needs a LAN address.
+  if (!options.unsafeAllowNonLoopback && host !== "127.0.0.1" && host !== "::1") {
+    throw new Error("The lab server only listens on 127.0.0.1 or ::1.");
+  }
   await new Promise<void>((resolve, reject) => {
     server.once("error", reject);
     server.listen(options.port ?? 0, host, () => {
@@ -558,7 +613,11 @@ ${formTag}${hidden}${token}${challenge}${checkbox}
       resolve();
     });
   });
-  const { port } = server.address() as AddressInfo;
+  const { port, address } = server.address() as AddressInfo;
+  if (!options.unsafeAllowNonLoopback && address !== "127.0.0.1" && address !== "::1") {
+    server.close();
+    throw new Error(`The lab server ended up on ${address}; refusing to run.`);
+  }
   base = `http://${host.includes(":") ? `[${host}]` : host}:${port}`;
 
   return {
