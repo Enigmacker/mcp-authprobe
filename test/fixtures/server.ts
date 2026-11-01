@@ -55,6 +55,19 @@ export interface AuthorizationBehaviour {
   rateLimitAfter?: number;
 }
 
+/** Consent page behaviour, for MAP-CSR01. */
+export interface ConsentBehaviour {
+  /**
+   * "token": a per-session anti-CSRF token is required (compliant);
+   * "none": no token, any POST with the session cookie grants consent;
+   * "unverified": a token is rendered but never checked;
+   * "origin": no token, but a foreign Origin is refused.
+   */
+  csrf?: "token" | "none" | "unverified" | "origin";
+  /** SameSite attribute of the session cookie (default Lax). */
+  sameSite?: "Lax" | "Strict" | "None";
+}
+
 export interface FixtureOptions {
   /** Send WWW-Authenticate with resource_metadata on 401 (default true). */
   challenge?: boolean;
@@ -68,6 +81,8 @@ export interface FixtureOptions {
   anonymous?: boolean;
   tokens?: TokenBehaviour;
   authorization?: AuthorizationBehaviour;
+  /** Serve a login page and a consent page at /authorize (enables MAP-CSR01 tests). */
+  consent?: ConsentBehaviour;
   /**
    * Address to listen on and to advertise in URLs (default 127.0.0.1).
    * A non-loopback local address lets tests exercise the ownership gate.
@@ -85,6 +100,10 @@ export interface Fixture {
   tokenRequests(): number;
   /** Client IDs currently registered through dynamic registration. */
   registeredClients(): string[];
+  /** Create a logged-in session and return its cookie value (consent mode). */
+  issueSession(): string;
+  /** Number of consents granted so far (consent mode). */
+  consentsGranted(): number;
   close(): Promise<void>;
 }
 
@@ -237,6 +256,93 @@ export async function startFixture(options: FixtureOptions = {}): Promise<Fixtur
     return json(res, 405, { error: "method_not_allowed" });
   }
 
+  // --- consent mode -------------------------------------------------------
+  const sessions = new Map<string, string>(); // sid -> csrf token
+  let granted = 0;
+  const consentOpts = { csrf: "token" as const, sameSite: "Lax" as const, ...options.consent };
+
+  function cookieOf(req: IncomingMessage, name: string): string | null {
+    const header = req.headers.cookie ?? "";
+    for (const part of header.split(";")) {
+      const [k, ...v] = part.trim().split("=");
+      if (k === name) return v.join("=");
+    }
+    return null;
+  }
+
+  function newSession(): string {
+    const sid = newToken("sid");
+    sessions.set(sid, newToken("csrf"));
+    return sid;
+  }
+
+  function sessionCookie(sid: string): string {
+    return `sid=${sid}; Path=/; HttpOnly; SameSite=${consentOpts.sameSite}${consentOpts.sameSite === "None" ? "; Secure" : ""}`;
+  }
+
+  const esc = (v: string): string => v.replace(/&/g, "&amp;").replace(/"/g, "&quot;").replace(/</g, "&lt;");
+
+  function consentAuthorize(req: IncomingMessage, url: URL, res: ServerResponse): void {
+    const sid = cookieOf(req, "sid");
+    const csrf = sid ? sessions.get(sid) : undefined;
+    if (!sid || csrf === undefined) {
+      res.writeHead(302, { location: `${base}/login?return=${encodeURIComponent(url.pathname + url.search)}` });
+      res.end();
+      return;
+    }
+    const q = url.searchParams;
+    const client = clients.get(q.get("client_id") ?? "");
+    if (!client || !client.redirectUris.includes(q.get("redirect_uri") ?? "")) return json(res, 400, { error: "invalid_request" });
+    const hidden = ["client_id", "redirect_uri", "state", "code_challenge", "code_challenge_method", "resource", "scope"]
+      .map((k) => `<input type="hidden" name="${k}" value="${esc(q.get(k) ?? "")}">`)
+      .join("");
+    const token = consentOpts.csrf === "token" || consentOpts.csrf === "unverified" ? `<input type="hidden" name="csrf_token" value="${esc(csrf)}">` : "";
+    res.writeHead(200, { "content-type": "text/html; charset=utf-8" });
+    res.end(`<!doctype html><title>Consent</title><h1>Allow test client?</h1>
+<form method="post" action="/consent">${hidden}${token}
+<button type="submit" name="decision" value="deny">Deny</button>
+<button type="submit" name="decision" value="allow">Allow</button></form>`);
+  }
+
+  function consentSubmit(req: IncomingMessage, body: string, res: ServerResponse): void {
+    const sid = cookieOf(req, "sid");
+    const csrf = sid ? sessions.get(sid) : undefined;
+    if (!sid || csrf === undefined) return json(res, 401, { error: "login_required" });
+    const form = new URLSearchParams(body);
+    if (consentOpts.csrf === "token" && form.get("csrf_token") !== csrf) return json(res, 403, { error: "invalid_csrf_token" });
+    if (consentOpts.csrf === "origin" && req.headers.origin !== undefined && req.headers.origin !== base) return json(res, 403, { error: "bad_origin" });
+    const redirectUri = form.get("redirect_uri") ?? "";
+    const client = clients.get(form.get("client_id") ?? "");
+    if (!client || !client.redirectUris.includes(redirectUri)) return json(res, 400, { error: "invalid_request" });
+    const back = new URL(redirectUri);
+    back.searchParams.set("state", form.get("state") ?? "");
+    if (form.get("decision") !== "allow") {
+      back.searchParams.set("error", "access_denied");
+    } else {
+      granted += 1;
+      const code = newToken("code");
+      codes.set(code, { clientId: form.get("client_id") ?? "", redirectUri, challenge: form.get("code_challenge") ?? "", used: false });
+      back.searchParams.set("code", code);
+    }
+    res.writeHead(302, { location: back.toString() });
+    res.end();
+  }
+
+  function loginPage(req: IncomingMessage, url: URL, body: string, res: ServerResponse): void {
+    const ret = url.searchParams.get("return") ?? "/";
+    if (req.method === "POST") {
+      const form = new URLSearchParams(body);
+      if (form.get("username") !== "test" || form.get("password") !== "test") return json(res, 401, { error: "bad_credentials" });
+      const sid = newSession();
+      res.writeHead(302, { location: ret.startsWith("/") ? ret : "/", "set-cookie": sessionCookie(sid) });
+      res.end();
+      return;
+    }
+    res.writeHead(200, { "content-type": "text/html; charset=utf-8" });
+    res.end(`<!doctype html><title>Login</title><form method="post" action="/login?return=${encodeURIComponent(ret)}">
+<input name="username"><input name="password" type="password"><button type="submit">Log in</button></form>`);
+  }
+
   function authorizeEndpoint(url: URL, res: ServerResponse): void {
     const q = url.searchParams;
     const client = clients.get(q.get("client_id") ?? "");
@@ -311,6 +417,9 @@ export async function startFixture(options: FixtureOptions = {}): Promise<Fixtur
       }
       if (path === "/register" && req.method === "POST") return registerEndpoint(body, res);
       if (path.startsWith("/register/")) return manageEndpoint(req, path.slice("/register/".length), res);
+      if (options.consent && path === "/authorize" && req.method === "GET") return consentAuthorize(req, new URL(req.url ?? "/", base), res);
+      if (options.consent && path === "/consent" && req.method === "POST") return consentSubmit(req, body, res);
+      if (options.consent && path === "/login") return loginPage(req, new URL(req.url ?? "/", base), body, res);
       if (path === "/authorize" && req.method === "GET") return authorizeEndpoint(new URL(req.url ?? "/", base), res);
       if (path === "/.well-known/mcp-authprobe.txt" && opts.ownershipFile !== null) {
         res.writeHead(200, { "content-type": "text/plain" });
@@ -336,6 +445,8 @@ export async function startFixture(options: FixtureOptions = {}): Promise<Fixtur
     },
     tokenRequests: () => tokenCount,
     registeredClients: () => [...clients.keys()],
+    issueSession: () => newSession(),
+    consentsGranted: () => granted,
     close: () =>
       new Promise<void>((resolve, reject) => {
         server.closeAllConnections();

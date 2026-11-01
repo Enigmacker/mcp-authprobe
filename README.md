@@ -9,7 +9,7 @@ Passive scanners read what a remote [Model Context Protocol](https://modelcontex
 
 `mcp-authprobe` runs those active checks, against servers whose ownership you have proven, and reports the results as JSON, SARIF and Markdown.
 
-> **Status: 0.1.0, first release.** Nine of the ten checks are available: OAuth discovery, refresh token rotation and replay, redirect URI strictness, and token endpoint throttling, behind an ownership proof. It works as a CLI, with an interactive `login` that creates the test grant, and as an MCP server so an AI assistant can run the audit. Consent CSRF (`MAP-CSR01`) is planned; see [Roadmap](#roadmap).
+> **Status: 0.1.x.** All ten checks are available behind an ownership proof: OAuth discovery, refresh token rotation and replay, redirect URI strictness, token endpoint throttling, and consent CSRF (in a real browser). It works as a CLI, with an interactive `login` that creates the test grant, and as an MCP server so an AI assistant can run the audit. See [Roadmap](#roadmap).
 
 > **Only test servers you own or are explicitly authorized to test.** Active checks change state on the target. The tool enforces an ownership proof before running them, but responsibility stays with the operator.
 
@@ -23,6 +23,7 @@ Passive scanners read what a remote [Model Context Protocol](https://modelcontex
 - [Interactive login](#interactive-login)
 - [Redirect URI checks](#redirect-uri-checks)
 - [Throttling check](#throttling-check)
+- [Consent CSRF check](#consent-csrf-check)
 - [Use it from an MCP client](#use-it-from-an-mcp-client)
 - [What it checks](#what-it-checks)
 - [Reports and exit codes](#reports-and-exit-codes)
@@ -213,6 +214,25 @@ Without rate limiting, refresh tokens, authorization codes and client secrets ca
 
 A failure means no throttling was seen within the cap. Your limit may simply be higher than 20; the finding asks you to confirm that one exists.
 
+## Consent CSRF check
+
+If a third-party website can submit your consent page on behalf of a logged-in user, it can make them grant access without noticing (the confused deputy described in the MCP security best practices). `MAP-CSR01` checks that the consent decision is protected, in a **real browser** with your **test account**:
+
+```sh
+npx -p mcp-authprobe -p playwright-core mcp-authprobe consent-check https://mcp.example.com/mcp
+```
+
+1. The ownership of every contacted host must be proven first.
+2. It registers a temporary client and opens **your installed Chrome** (or `--browser msedge`, or `--browser-path <executable>`) on the authorization page. No browser is downloaded; `playwright-core` is an optional dependency used only by this command.
+3. You log in with the test account. When the consent page is shown, **do not click anything**: go back to the terminal and press Enter.
+4. The tool reads the consent form and the cookie attributes as the browser sees them, closes the browser, then sends at most three form submissions with the session cookies and a **foreign Origin**:
+   - without any anti-CSRF field: must be refused;
+   - with the anti-CSRF field altered: must be refused;
+   - the untouched form: informational, shows whether the server also checks Origin.
+5. It deletes the temporary client. The loopback redirect URI is served by the tool itself, so even an accidental approval delivers the code nowhere else.
+
+The check **fails** when consent is granted without a valid anti-CSRF token. The finding also reports whether the session cookies are `SameSite=Lax/Strict`, which blocks the attack from other sites in modern browsers, but not from same-site subdomains or older clients. It is not available in MCP server mode, because it needs you to log in.
+
 ## Use it from an MCP client
 
 `mcp-authprobe mcp` runs the same engine as an MCP server over stdio, so an AI assistant in any MCP client can audit your servers for you.
@@ -278,7 +298,7 @@ The server is built so that the assistant, or a prompt injection reaching it, ca
 | `MAP-RDR03` | active | available (via `login`) | Token endpoint enforces the `redirect_uri` used at authorization |
 | `MAP-RDR04` | active | available | Dynamic client registration refuses unsafe redirect URIs |
 | `MAP-THR01` | active | available | Repeated failed token requests are throttled (5 to 20 sequential requests with random values) |
-| `MAP-CSR01` | active | planned | Consent decision is protected against CSRF |
+| `MAP-CSR01` | active | available (via `consent-check`) | Consent decision is protected against CSRF |
 
 Families: **DSC** discovery, **RTK** refresh tokens, **RDR** redirect URIs, **THR** throttling, **CSR** consent CSRF.
 
@@ -346,7 +366,7 @@ The scanner talks to servers that may be hostile, and it may be driven by an AI 
 - ~~npm release~~ done.
 
 **0.2.0**
-- Consent CSRF check (CSR01), driven through a browser session.
+- ~~Consent CSRF check (CSR01), driven through a browser session~~ done.
 - Optional integration with mcp-posture: run it alongside, or import its JSON report, and merge both into one report where active results confirm or refute what the metadata announces.
 
 ## Development

@@ -200,6 +200,8 @@ export async function scan(mcpUrl: string, options: ScanOptions = {}): Promise<S
       findings.push(...(await runRefreshFamily(target, discovery, http, options)));
       findings.push(...(await runRedirectFamily(target, discovery, http)));
       findings.push(fromObservation("MAP-RDR03", target, options.observations ?? []));
+      const csr = CATALOGUE.find((c) => c.id === "MAP-CSR01") as CheckDefinition;
+      findings.push(finding(csr, target, "skipped", "Needs a logged-in browser session: run `mcp-authprobe consent-check` separately."));
       // Last on purpose: once throttled, the token endpoint may refuse other checks.
       findings.push(await runThrottleFamily(target, discovery, http, options));
       for (const def of active.filter((c) => c.availability === "planned")) {

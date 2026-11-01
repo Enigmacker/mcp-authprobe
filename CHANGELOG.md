@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Added
+
+- `MAP-CSR01` (consent CSRF) with the new `consent-check` command: it opens the installed Chrome or Edge through the optional `playwright-core` peer dependency, lets the user log in with a test account and stop on the consent page, reads the consent form and cookie attributes, then replays at most three submissions with the session cookies and a foreign Origin (without the anti-CSRF field, with it altered, untouched). Requires ownership proof, only posts to proven hosts, owns its loopback redirect URI, never reports cookie or token values, and deletes its temporary client.
+
 ## [0.1.1] - 2026-11-01
 
 ### Added

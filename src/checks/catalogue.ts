@@ -148,7 +148,7 @@ export const CATALOGUE: readonly CheckDefinition[] = [
     title: "Consent decision is protected against cross-site request forgery",
     severity: "high",
     active: true,
-    availability: "planned",
+    availability: "available",
     rationale:
       "If the consent form can be submitted cross-site, a malicious page can grant access on behalf of a logged-in user (confused deputy, as described in the MCP security best practices).",
     remediation: "Protect the consent submission with an anti-CSRF token bound to the session, SameSite cookies and an Origin check.",

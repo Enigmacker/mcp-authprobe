@@ -31,6 +31,7 @@ Usage:
   ${TOOL_NAME} checks list                 List every check
   ${TOOL_NAME} checks show <id>            Explain one check
   ${TOOL_NAME} login <mcp-url> --out <file> Log in with a test account and save a test grant
+  ${TOOL_NAME} consent-check <mcp-url>     MAP-CSR01: consent CSRF, in a real browser
   ${TOOL_NAME} mcp                         Run as an MCP server over stdio
 
 Scan options:
@@ -47,6 +48,11 @@ Scan options:
                         Test grant (JSON: client_id, refresh_token, optional
                         client_secret) for the refresh token checks. The grant
                         is consumed: use a dedicated test account.
+
+Consent check options (needs the optional playwright-core package and Chrome or Edge):
+  --browser <channel>   chrome (default), msedge or chromium
+  --browser-path <exe>  Use this browser executable instead
+  --json, --sarif, --markdown, --fail-on, --allow-private, --secret-file  as for scan
 
 Login options:
   --out <file>          Where to write the test grant (mode 600, never overwritten without --force)
@@ -93,6 +99,8 @@ export async function main(argv: string[]): Promise<number> {
       "credentials-file": { type: "string" },
       out: { type: "string" },
       "throttle-attempts": { type: "string" },
+      browser: { type: "string" },
+      "browser-path": { type: "string" },
       force: { type: "boolean", default: false },
       "no-probe": { type: "boolean", default: false },
       "no-browser": { type: "boolean", default: false },
@@ -179,6 +187,34 @@ export async function main(argv: string[]): Promise<number> {
         await http.close();
       }
     }
+  }
+
+  if (command === "consent-check" && sub) {
+    let url: URL;
+    try {
+      url = new URL(sub);
+    } catch {
+      err(`Not a URL: ${sub}\n`);
+      return EXIT.usage;
+    }
+    const failOn = values["fail-on"] as Severity;
+    if (!SEVERITIES.includes(failOn)) {
+      err(`--fail-on must be one of ${SEVERITIES.join(", ")}\n`);
+      return EXIT.usage;
+    }
+    const { runConsentCommand } = await import("./consent-command.js");
+    const o: Parameters<typeof runConsentCommand>[0] = {
+      mcpUrl: url.toString(),
+      allowPrivate: values["allow-private"],
+      secret: readSecret(values["secret-file"]),
+      failOn,
+    };
+    if (values.browser) o.browser = values.browser;
+    if (values["browser-path"]) o.browserPath = values["browser-path"];
+    if (values.json) o.json = values.json;
+    if (values.sarif) o.sarif = values.sarif;
+    if (values.markdown) o.markdown = values.markdown;
+    return runConsentCommand(o);
   }
 
   if (command === "login" && sub) {
