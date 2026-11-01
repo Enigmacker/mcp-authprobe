@@ -11,6 +11,7 @@ import { toMarkdown } from "./report/markdown.js";
 import { toSarif } from "./report/sarif.js";
 import { toTable } from "./report/table.js";
 import { scan } from "./scan.js";
+import { parseSelection } from "./selection.js";
 import { severityAtLeast, type Severity } from "./types.js";
 import { TOOL_NAME, TOOL_VERSION } from "./version.js";
 
@@ -46,6 +47,9 @@ Scan options:
   --secret-file <file>  Read the ownership secret from a file instead of ${SECRET_ENV}
   --throttle-attempts <n>
                         Failed token requests sent by MAP-THR01 (5-20, default 10)
+  --only <list>         Run only these checks: IDs (MAP-RDR01 or RDR01) or families (RDR),
+                        comma-separated; the others are reported as skipped
+  --skip <list>         Do not run these checks (same syntax; wins over --only)
   --credentials-file <file>
                         Test grant (JSON: client_id, refresh_token, optional
                         client_secret) for the refresh token checks. The grant
@@ -106,6 +110,8 @@ export async function main(argv: string[]): Promise<number> {
       "credentials-file": { type: "string" },
       out: { type: "string" },
       "throttle-attempts": { type: "string" },
+      only: { type: "string" },
+      skip: { type: "string" },
       browser: { type: "string" },
       "browser-path": { type: "string" },
       force: { type: "boolean", default: false },
@@ -288,6 +294,13 @@ export async function main(argv: string[]): Promise<number> {
     }
 
     const options: Parameters<typeof scan>[1] = { allowPrivate: values["allow-private"] };
+    try {
+      const select = parseSelection(values.only, values.skip);
+      if (select) options.select = select;
+    } catch (e) {
+      err(`${(e as Error).message}\n`);
+      return EXIT.usage;
+    }
     const secret = readSecret(values["secret-file"]);
     if (secret) options.secret = secret;
     if (timeoutMs !== undefined) options.timeoutMs = timeoutMs;

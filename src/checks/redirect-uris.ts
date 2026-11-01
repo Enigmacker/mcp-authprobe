@@ -45,6 +45,8 @@ export const UNSAFE_REGISTRATIONS: ReadonlyArray<{ label: string; uri: string }>
 ];
 
 export interface RedirectCheckContext {
+  /** Checks to run (default: all three). Unselected checks send no request. */
+  select?: (checkId: string) => boolean;
   http: HttpClient;
   target: string;
   authorizationEndpoint: string | null;
@@ -105,14 +107,20 @@ async function authorizationChecks(ctx: RedirectCheckContext, client: Registered
     return [result("MAP-RDR01", target, "error", msg, [baselineLine]), result("MAP-RDR02", target, "error", msg, [baselineLine])];
   }
 
-  const unregistered = await probeAuthorize(http, { ...base, redirectUri: UNREGISTERED_REDIRECT });
-  const rdr01 = summarize(
-    "MAP-RDR01",
-    target,
-    [{ label: "unrelated host", verdict: judge(baseline, unregistered), detail: describeAnswer(unregistered) }],
-    "An unregistered redirect URI was refused without redirecting.",
-  );
-  rdr01.evidence.unshift(safeText(baselineLine));
+  const out: Finding[] = [];
+  const wanted = ctx.select ?? (() => true);
+  if (wanted("MAP-RDR01")) {
+    const unregistered = await probeAuthorize(http, { ...base, redirectUri: UNREGISTERED_REDIRECT });
+    const rdr01 = summarize(
+      "MAP-RDR01",
+      target,
+      [{ label: "unrelated host", verdict: judge(baseline, unregistered), detail: describeAnswer(unregistered) }],
+      "An unregistered redirect URI was refused without redirecting.",
+    );
+    rdr01.evidence.unshift(safeText(baselineLine));
+    out.push(rdr01);
+  }
+  if (!wanted("MAP-RDR02")) return out;
 
   const rows: Array<{ label: string; verdict: VariantVerdict; detail: string }> = [];
   for (const v of NEAR_MISS_VARIANTS) {
@@ -121,7 +129,8 @@ async function authorizationChecks(ctx: RedirectCheckContext, client: Registered
   }
   const rdr02 = summarize("MAP-RDR02", target, rows, `All ${rows.length} near-miss variants of the registered URI were refused.`);
   rdr02.evidence.unshift(safeText(baselineLine));
-  return [rdr01, rdr02];
+  out.push(rdr02);
+  return out;
 }
 
 async function registrationCheck(ctx: RedirectCheckContext, cleanup: RegisteredClient[]): Promise<Finding> {
@@ -166,39 +175,44 @@ export async function runRedirectUriChecks(ctx: RedirectCheckContext): Promise<F
       return findings;
     }
 
+    const wanted = ctx.select ?? (() => true);
     let client: RegisteredClient | null = null;
-    try {
-      const reg = await registerClient(http, ctx.registrationEndpoint, [REGISTERED_REDIRECT]);
-      if (reg.client) {
-        client = reg.client;
-        created.push(reg.client);
-      } else {
-        const msg = `Could not register a test client (HTTP ${reg.status}${reg.error ? `, error=${reg.error}` : ""}).`;
+    if (wanted("MAP-RDR01") || wanted("MAP-RDR02")) {
+      try {
+        const reg = await registerClient(http, ctx.registrationEndpoint, [REGISTERED_REDIRECT]);
+        if (reg.client) {
+          client = reg.client;
+          created.push(reg.client);
+        } else {
+          const msg = `Could not register a test client (HTTP ${reg.status}${reg.error ? `, error=${reg.error}` : ""}).`;
+          findings.push(result("MAP-RDR01", target, "error", msg), result("MAP-RDR02", target, "error", msg));
+        }
+      } catch (err) {
+        const msg = `Registration endpoint unreachable: ${(err as Error).message}`;
         findings.push(result("MAP-RDR01", target, "error", msg), result("MAP-RDR02", target, "error", msg));
       }
-    } catch (err) {
-      const msg = `Registration endpoint unreachable: ${(err as Error).message}`;
-      findings.push(result("MAP-RDR01", target, "error", msg), result("MAP-RDR02", target, "error", msg));
-    }
 
-    if (client) {
-      if (!ctx.authorizationEndpoint) {
-        const msg = "No authorization endpoint discovered.";
-        findings.push(result("MAP-RDR01", target, "skipped", msg), result("MAP-RDR02", target, "skipped", msg));
-      } else {
-        try {
-          findings.push(...(await authorizationChecks(ctx, client)));
-        } catch (err) {
-          const msg = `Authorization endpoint unreachable: ${(err as Error).message}`;
-          findings.push(result("MAP-RDR01", target, "error", msg), result("MAP-RDR02", target, "error", msg));
+      if (client) {
+        if (!ctx.authorizationEndpoint) {
+          const msg = "No authorization endpoint discovered.";
+          findings.push(result("MAP-RDR01", target, "skipped", msg), result("MAP-RDR02", target, "skipped", msg));
+        } else {
+          try {
+            findings.push(...(await authorizationChecks(ctx, client)));
+          } catch (err) {
+            const msg = `Authorization endpoint unreachable: ${(err as Error).message}`;
+            findings.push(result("MAP-RDR01", target, "error", msg), result("MAP-RDR02", target, "error", msg));
+          }
         }
       }
     }
 
-    try {
-      findings.push(await registrationCheck(ctx, created));
-    } catch (err) {
-      findings.push(result("MAP-RDR04", target, "error", `Registration endpoint unreachable: ${(err as Error).message}`));
+    if (wanted("MAP-RDR04")) {
+      try {
+        findings.push(await registrationCheck(ctx, created));
+      } catch (err) {
+        findings.push(result("MAP-RDR04", target, "error", `Registration endpoint unreachable: ${(err as Error).message}`));
+      }
     }
     return findings;
   } finally {

@@ -1,0 +1,150 @@
+name: mcp-authprobe
+description: Active OAuth tests for a remote MCP server you own (tokens, PKCE, redirect_uri, audience, Origin).
+author: Enigmacker
+branding:
+  icon: shield
+  color: blue
+
+inputs:
+  url:
+    description: MCP endpoint to scan, e.g. https://staging.example.com/mcp. Only scan servers you own or are authorized to test.
+    required: true
+  secret:
+    description: Ownership secret (pass it from a repository secret). Without it, only discovery and the passive Origin check run.
+    required: false
+    default: ""
+  fail-on:
+    description: Fail the step on a failing check at or above this severity (info, low, medium, high, critical).
+    required: false
+    default: high
+  fail-on-inconclusive:
+    description: Also fail the step when a check is inconclusive (rate limits, server errors, behaviour that cannot be judged from outside).
+    required: false
+    default: "false"
+  only:
+    description: Run only these checks, comma-separated IDs (MAP-RDR01 or RDR01) or families (RDR).
+    required: false
+    default: ""
+  skip:
+    description: Do not run these checks, same syntax. For example THR on a production server, to send no failed token requests.
+    required: false
+    default: ""
+  throttle-attempts:
+    description: Failed token requests sent by MAP-THR01 (5 to 20).
+    required: false
+    default: ""
+  timeout:
+    description: Per-request timeout in milliseconds.
+    required: false
+    default: ""
+  allow-private:
+    description: Allow loopback and private addresses (a lab started in the same job). Never needed for a real server.
+    required: false
+    default: "false"
+  upload-sarif:
+    description: Upload the SARIF report to GitHub code scanning (needs the security-events write permission).
+    required: false
+    default: "false"
+  node-version:
+    description: Node.js version used to run the scanner (22.19 or later).
+    required: false
+    default: "22"
+  package:
+    description: npm package spec to run. Defaults to the mcp-authprobe version of this action's release.
+    required: false
+    default: ""
+
+outputs:
+  exit-code:
+    description: "Scanner exit code: 0 no failing check at or above fail-on, 1 failing checks, 2 usage error, 3 inconclusive checks or unreachable target."
+    value: ${{ steps.scan.outputs.exit-code }}
+  failed:
+    description: Number of failing checks (any severity).
+    value: ${{ steps.scan.outputs.failed }}
+  json-file:
+    description: Path of the JSON report.
+    value: ${{ steps.scan.outputs.json-file }}
+  sarif-file:
+    description: Path of the SARIF report.
+    value: ${{ steps.scan.outputs.sarif-file }}
+  markdown-file:
+    description: Path of the Markdown report.
+    value: ${{ steps.scan.outputs.markdown-file }}
+
+runs:
+  using: composite
+  steps:
+    - uses: actions/setup-node@v7
+      with:
+        node-version: ${{ inputs.node-version }}
+
+    - id: scan
+      shell: bash
+      # Inputs are passed through the environment, never interpolated into the script.
+      env:
+        MAP_URL: ${{ inputs.url }}
+        MCP_AUTHPROBE_SECRET: ${{ inputs.secret }}
+        MAP_FAIL_ON: ${{ inputs.fail-on }}
+        MAP_ONLY: ${{ inputs.only }}
+        MAP_SKIP: ${{ inputs.skip }}
+        MAP_THROTTLE: ${{ inputs.throttle-attempts }}
+        MAP_TIMEOUT: ${{ inputs.timeout }}
+        MAP_ALLOW_PRIVATE: ${{ inputs.allow-private }}
+        MAP_PACKAGE: ${{ inputs.package }}
+        MAP_ACTION_PATH: ${{ github.action_path }}
+      run: |
+        set -uo pipefail
+        out="${RUNNER_TEMP}/mcp-authprobe"
+        mkdir -p "$out"
+        rm -f "$out/report.json" "$out/report.sarif" "$out/report.md"
+        pkg="$MAP_PACKAGE"
+        if [ -z "$pkg" ]; then
+          pkg="mcp-authprobe@$(node -p 'require(process.env.MAP_ACTION_PATH + "/package.json").version')"
+        fi
+        args=(scan "$MAP_URL" --fail-on "$MAP_FAIL_ON" --json "$out/report.json" --sarif "$out/report.sarif" --markdown "$out/report.md")
+        [ -n "$MAP_ONLY" ] && args+=(--only "$MAP_ONLY")
+        [ -n "$MAP_SKIP" ] && args+=(--skip "$MAP_SKIP")
+        [ -n "$MAP_THROTTLE" ] && args+=(--throttle-attempts "$MAP_THROTTLE")
+        [ -n "$MAP_TIMEOUT" ] && args+=(--timeout "$MAP_TIMEOUT")
+        [ "$MAP_ALLOW_PRIVATE" = "true" ] && args+=(--allow-private)
+        [ -z "$MCP_AUTHPROBE_SECRET" ] && unset MCP_AUTHPROBE_SECRET
+        echo "Running $pkg"
+        npx --yes --package "$pkg" mcp-authprobe "${args[@]}"
+        code=$?
+        failed=0
+        if [ -f "$out/report.json" ]; then
+          failed=$(node -e 'const r=require(process.argv[1]);console.log(r.findings.filter(f=>f.status==="fail").length)' "$out/report.json")
+        fi
+        if [ -f "$out/report.md" ]; then cat "$out/report.md" >> "$GITHUB_STEP_SUMMARY"; fi
+        {
+          echo "exit-code=$code"
+          echo "failed=$failed"
+          echo "json-file=$out/report.json"
+          echo "sarif-file=$out/report.sarif"
+          echo "markdown-file=$out/report.md"
+        } >> "$GITHUB_OUTPUT"
+        exit 0
+
+    - if: inputs.upload-sarif == 'true' && hashFiles(format('{0}/mcp-authprobe/report.sarif', runner.temp)) != ''
+      uses: github/codeql-action/upload-sarif@v4
+      with:
+        sarif_file: ${{ steps.scan.outputs.sarif-file }}
+        category: mcp-authprobe
+
+    - shell: bash
+      env:
+        MAP_CODE: ${{ steps.scan.outputs.exit-code }}
+        MAP_FAILED: ${{ steps.scan.outputs.failed }}
+        MAP_STRICT: ${{ inputs.fail-on-inconclusive }}
+        MAP_JSON: ${{ steps.scan.outputs.json-file }}
+      run: |
+        case "$MAP_CODE" in
+          0) echo "mcp-authprobe: no failing check at or above the threshold." ;;
+          1) echo "::error title=mcp-authprobe::$MAP_FAILED failing check(s); see the job summary."; exit 1 ;;
+          3)
+            if [ ! -f "$MAP_JSON" ]; then echo "::error title=mcp-authprobe::The scan could not run (target unreachable?)."; exit 3; fi
+            if [ "$MAP_STRICT" = "true" ]; then echo "::error title=mcp-authprobe::Some checks are inconclusive; see the job summary."; exit 3; fi
+            echo "::warning title=mcp-authprobe::Some checks are inconclusive; see the job summary."
+            ;;
+          *) echo "::error title=mcp-authprobe::Usage error (exit code $MAP_CODE)."; exit "$MAP_CODE" ;;
+        esac

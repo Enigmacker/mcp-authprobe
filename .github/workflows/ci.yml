@@ -50,3 +50,53 @@ jobs:
           cache: npm
       - run: npm ci
       - run: npm audit --omit=dev --audit-level=moderate
+
+  action:
+    name: GitHub Action against the lab
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - name: Pack this commit and start both lab profiles
+        id: pack
+        run: |
+          npm run build
+          echo "tarball=$(pwd)/$(npm pack --silent)" >> "$GITHUB_OUTPUT"
+          nohup node dist/cli.js lab --profile secure --port 8787 > secure.log 2>&1 &
+          nohup node dist/cli.js lab --profile vulnerable --port 8788 > vulnerable.log 2>&1 &
+          for port in 8787 8788; do
+            for i in $(seq 1 20); do curl -s -o /dev/null "http://127.0.0.1:$port/mcp" && break; sleep 0.5; done
+          done
+      - name: Secure lab passes
+        uses: ./
+        with:
+          url: http://127.0.0.1:8787/mcp
+          allow-private: "true"
+          package: ${{ steps.pack.outputs.tarball }}
+      - name: Vulnerable lab is caught
+        id: vulnerable
+        continue-on-error: true
+        uses: ./
+        with:
+          url: http://127.0.0.1:8788/mcp
+          allow-private: "true"
+          skip: THR
+          package: ${{ steps.pack.outputs.tarball }}
+      - name: Check the vulnerable run
+        env:
+          OUTCOME: ${{ steps.vulnerable.outcome }}
+          EXIT_CODE: ${{ steps.vulnerable.outputs.exit-code }}
+          FAILED: ${{ steps.vulnerable.outputs.failed }}
+          JSON: ${{ steps.vulnerable.outputs.json-file }}
+        run: |
+          echo "outcome=$OUTCOME exit=$EXIT_CODE failed=$FAILED"
+          test "$OUTCOME" = failure
+          test "$EXIT_CODE" = 1
+          test "$FAILED" -ge 1
+          node -e 'const r=require(process.argv[1]); const t=r.findings.find(f=>f.checkId==="MAP-THR01"); if(!/Not selected/.test(t.message)) process.exit(1)' "$JSON"

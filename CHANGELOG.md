@@ -6,6 +6,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-11-01
+
+### Added
+
+- Official GitHub Action (`uses: Enigmacker/mcp-authprobe@v0.4.0`): runs the scan with the ownership secret from the environment, adds the results table to the job summary, can upload SARIF to code scanning, fails on findings at or above `fail-on`, warns on inconclusive checks (or fails with `fail-on-inconclusive`), and exposes the exit code, the number of failing checks and the report paths. CI tests it against both lab profiles.
+- `--only` and `--skip` (and `only` / `skip` in the MCP `scan` tool): choose checks by ID or family. Unselected checks send no request and are reported as skipped; unknown names are refused.
+
 ## [0.3.0] - 2026-11-01
 
 ### Added
@@ -62,7 +69,8 @@ First release.
 - Hardening from an independent review before release: HTTPS is required for every request outside loopback/private labs; rate limits and server errors make redirect URI, registration and throttling checks inconclusive instead of passing; test grants record their target and token endpoint and are never used elsewhere (and must name their target in MCP mode); loopback targets need a proof in MCP mode unless listed in `MCP_AUTHPROBE_LAB_ORIGINS`; `login` output is neutralized; more IPv6 transition ranges are refused; a malformed issuer no longer aborts discovery.
 - Local fixture server with a stateful token endpoint, dynamic registration and an authorization endpoint and test suite; GitHub Actions CI.
 
-[Unreleased]: https://github.com/Enigmacker/mcp-authprobe/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/Enigmacker/mcp-authprobe/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/Enigmacker/mcp-authprobe/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/Enigmacker/mcp-authprobe/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/Enigmacker/mcp-authprobe/compare/v0.1.1...v0.2.0
 [0.1.1]: https://github.com/Enigmacker/mcp-authprobe/compare/v0.1.0...v0.1.1

@@ -41,7 +41,8 @@ describe("MCP server", () => {
     expect(byName["list_checks"]?.annotations?.readOnlyHint).toBe(true);
     // Sensitive settings are never tool arguments.
     const scanProps = Object.keys((byName["scan"]?.inputSchema as { properties?: object }).properties ?? {});
-    expect(scanProps).toEqual(["url"]);
+    // only/skip can only narrow a scan, never widen it.
+    expect(scanProps).toEqual(["url", "only", "skip"]);
   });
 
   it("lists and explains checks", async () => {
@@ -78,6 +79,18 @@ describe("MCP server", () => {
     const res = await c.callTool({ name: "scan", arguments: { url: "http://127.0.0.1:8080/mcp" } });
     expect(res.isError).toBe(true);
     expect(textOf(res)).toMatch(/Only https/);
+  });
+
+  it("applies only/skip, and refuses an unknown check name", async () => {
+    fixture = await startFixture();
+    const c = await connect({ allowPrivate: true, labOrigins: [new URL(fixture.mcpUrl).origin] });
+    const bad = await c.callTool({ name: "scan", arguments: { url: fixture.mcpUrl, only: "nope" } });
+    expect(bad.isError).toBe(true);
+    expect(textOf(bad)).toMatch(/Unknown check or family/);
+    const res = await c.callTool({ name: "scan", arguments: { url: fixture.mcpUrl, skip: "THR" } });
+    const report = (res.structuredContent as { report: { findings: Array<{ checkId: string; message: string }> } }).report;
+    expect(report.findings.find((f) => f.checkId === "MAP-THR01")?.message).toMatch(/Not selected/);
+    expect(fixture.tokenRequests()).toBe(0);
   });
 
   it("refuses URLs carrying credentials", async () => {

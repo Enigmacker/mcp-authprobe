@@ -8,6 +8,7 @@ import { FOREIGN_ORIGIN, initializeStatus } from "./oauth/mcp-call.js";
 import { HttpClient } from "./net/http.js";
 import { verifyOwnership, type OwnershipResult, type VerifyOptions } from "./ownership.js";
 import { safeText } from "./redact.js";
+import type { CheckSelector } from "./selection.js";
 import type { CheckDefinition, Finding, ScanReport } from "./types.js";
 import { TOOL_NAME, TOOL_VERSION } from "./version.js";
 
@@ -18,6 +19,8 @@ export interface ScanOptions {
   timeoutMs?: number;
   /** Test grant for the refresh token checks. It is consumed by the scan. */
   grant?: TestGrant;
+  /** Checks to run (from --only/--skip). Unselected checks send no request and are reported as skipped. */
+  select?: CheckSelector;
   /**
    * Refuse a grant that does not name its target (MCP mode): a hand-written,
    * unbound grant could otherwise be spent on any proven server.
@@ -140,7 +143,7 @@ async function runThrottleFamily(target: string, d: DiscoveryResult | null, http
   return runThrottlingCheck(ctx);
 }
 
-async function runRedirectFamily(target: string, d: DiscoveryResult | null, http: HttpClient): Promise<Finding[]> {
+async function runRedirectFamily(target: string, d: DiscoveryResult | null, http: HttpClient, select: CheckSelector): Promise<Finding[]> {
   const meta = d?.as?.metadata;
   if (!meta) {
     const defs = ["MAP-RDR01", "MAP-RDR02", "MAP-RDR04"].map((id) => CATALOGUE.find((c) => c.id === id)).filter((c): c is CheckDefinition => c !== undefined);
@@ -153,9 +156,15 @@ async function runRedirectFamily(target: string, d: DiscoveryResult | null, http
     authorizationEndpoint: typeof meta.authorization_endpoint === "string" ? meta.authorization_endpoint : null,
     registrationEndpoint: typeof meta.registration_endpoint === "string" ? meta.registration_endpoint : null,
     resource: d?.prm?.metadata.resource ?? target,
+    select,
   };
   if (Array.isArray(scopes) && scopes.length > 0) ctx.scope = scopes.join(" ");
   return runRedirectUriChecks(ctx);
+}
+
+function notSelected(checkId: string, target: string): Finding {
+  const def = CATALOGUE.find((c) => c.id === checkId) as CheckDefinition;
+  return finding(def, target, "skipped", "Not selected (--only/--skip): not run.");
 }
 
 /**
@@ -219,7 +228,9 @@ export async function scan(mcpUrl: string, options: ScanOptions = {}): Promise<S
       detail: results.map((r) => `${r.host}: ${r.detail}`).join(" "),
     };
 
-    findings.push(await runOriginCheck(target, http, options.observations ?? []));
+    const wanted: CheckSelector = options.select ?? (() => true);
+    const anyOf = (ids: string[]): boolean => ids.some(wanted);
+    if (wanted("MAP-ORG01")) findings.push(await runOriginCheck(target, http, options.observations ?? []));
 
     const active = CATALOGUE.filter((c) => c.active);
     if (!verified) {
@@ -227,18 +238,32 @@ export async function scan(mcpUrl: string, options: ScanOptions = {}): Promise<S
         findings.push(finding(def, target, "skipped", "Ownership of every contacted host is not proven; active check not run."));
       }
     } else {
-      findings.push(...(await runRefreshFamily(target, discovery, http, options)));
-      findings.push(...(await runRedirectFamily(target, discovery, http)));
+      // The refresh token checks are one sequence: they run together, or not at all (the grant is untouched).
+      if (anyOf(RTK_IDS)) findings.push(...(await runRefreshFamily(target, discovery, http, options)));
+      if (anyOf(["MAP-RDR01", "MAP-RDR02", "MAP-RDR04"])) findings.push(...(await runRedirectFamily(target, discovery, http, wanted)));
       for (const id of ["MAP-RDR03", "MAP-PKC01", "MAP-COD01", "MAP-AUD01"]) {
         findings.push(fromObservation(id, target, options.observations ?? []));
       }
       const csr = CATALOGUE.find((c) => c.id === "MAP-CSR01") as CheckDefinition;
       findings.push(finding(csr, target, "skipped", "Needs a logged-in browser session: run `mcp-authprobe consent-check` separately."));
       // Last on purpose: once throttled, the token endpoint may refuse other checks.
-      findings.push(await runThrottleFamily(target, discovery, http, options));
+      if (wanted("MAP-THR01")) findings.push(await runThrottleFamily(target, discovery, http, options));
       for (const def of active.filter((c) => c.availability === "planned")) {
         findings.push(finding(def, target, "skipped", "Not implemented in this version yet."));
       }
+    }
+
+    // Every check appears once: unselected ones as skipped, in catalogue order of first appearance.
+    if (options.select) {
+      const seen = new Set<string>();
+      const kept: Finding[] = [];
+      for (const f of findings) {
+        if (seen.has(f.checkId)) continue;
+        seen.add(f.checkId);
+        kept.push(wanted(f.checkId) ? f : notSelected(f.checkId, target));
+      }
+      for (const def of CATALOGUE) if (!seen.has(def.id)) kept.push(notSelected(def.id, target));
+      findings.splice(0, findings.length, ...kept);
     }
 
     return {

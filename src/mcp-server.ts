@@ -5,6 +5,7 @@ import { CATALOGUE, getCheck } from "./checks/catalogue.js";
 import { loadGrant, type TestGrant } from "./credentials.js";
 import { HttpClient, plainHttpAllowed } from "./net/http.js";
 import { DNS_LABEL, proofFor, verifyOwnership, WELL_KNOWN_PATH } from "./ownership.js";
+import { parseSelection } from "./selection.js";
 import { toMarkdown } from "./report/markdown.js";
 import { scan, type ScanOptions } from "./scan.js";
 import { TOOL_NAME, TOOL_VERSION } from "./version.js";
@@ -180,10 +181,18 @@ export function createAuthprobeServer(config: ServerConfig): McpServer {
         "Run discovery and, on hosts with a valid ownership proof, the active authorization tests against a remote MCP server URL. Active tests register and delete temporary OAuth clients and CONSUME the configured test grant. Only use on servers the user owns or is authorized to test, after the user confirmed.",
       inputSchema: z.object({
         url: z.string().url().max(2048).describe("The MCP endpoint URL, e.g. https://mcp.example.com/mcp"),
+        only: z.string().max(500).optional().describe("Run only these checks: comma-separated IDs (MAP-RDR01 or RDR01) or families (RDR)"),
+        skip: z.string().max(500).optional().describe("Do not run these checks (same syntax; wins over only), e.g. THR to avoid failed token requests"),
       }),
       annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true },
     },
-    async ({ url }) => {
+    async ({ url, only, skip }) => {
+      let select: ReturnType<typeof parseSelection>;
+      try {
+        select = parseSelection(only, skip);
+      } catch (e) {
+        return errorResult((e as Error).message);
+      }
       let parsed: URL;
       try {
         parsed = new URL(url);
@@ -203,6 +212,7 @@ export function createAuthprobeServer(config: ServerConfig): McpServer {
           requireGrantBinding: true,
           loopbackExempt: (config.labOrigins ?? []).includes(parsed.origin),
         };
+        if (select) options.select = select;
         if (config.secret) options.secret = config.secret;
         if (config.timeoutMs !== undefined) options.timeoutMs = config.timeoutMs;
         if (config.resolveTxtRecords) options.resolveTxtRecords = config.resolveTxtRecords;

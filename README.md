@@ -28,7 +28,7 @@ Passive scanners read what a remote [Model Context Protocol](https://modelcontex
 - [Use it from an MCP client](#use-it-from-an-mcp-client)
 - [What it checks](#what-it-checks)
 - [Reports and exit codes](#reports-and-exit-codes)
-- [CI usage](#ci-usage)
+- [GitHub Action](#github-action)
 - [Safety of the scanner](#safety-of-the-scanner)
 - [Roadmap](#roadmap)
 - [Development](#development)
@@ -348,6 +348,17 @@ Families: **DSC** discovery, **RTK** refresh tokens, **RDR** redirect URIs, **TH
 
 `MAP-ORG01` runs in every scan without an ownership proof: it sends two ordinary `initialize` requests, one with a foreign `Origin`. Most servers ask for a token before looking at `Origin`; the scan then reports it as inconclusive, and `login` observes it with a valid token.
 
+### Choosing checks
+
+`--only` and `--skip` take comma-separated check IDs (`MAP-RDR01`, or just `RDR01`) or families (`RDR`), case-insensitive. `--skip` wins over `--only`; an unknown name is a usage error, so a typo never silently changes what runs.
+
+```sh
+mcp-authprobe scan https://mcp.example.com/mcp --skip THR        # production: no failed token requests
+mcp-authprobe scan https://mcp.example.com/mcp --only RDR02      # re-check one fix
+```
+
+A check that is not selected sends **no request** and is listed as `skipped (not selected)`, so a report never suggests it passed. The three refresh token checks are one sequence: selecting any of them runs the three (the others are then reported as not selected), and skipping all three leaves the test grant untouched. The MCP server's `scan` tool takes the same `only` and `skip` arguments.
+
 ## Reports and exit codes
 
 | Option | Output |
@@ -367,10 +378,58 @@ Families: **DSC** discovery, **RTK** refresh tokens, **RDR** redirect URIs, **TH
 
 All server-controlled text is neutralized before it reaches a report: terminal escape sequences, bidi overrides and invisible characters are escaped, and token-shaped values are redacted.
 
-## CI usage
+## GitHub Action
+
+Run the scan on every deployment, or every night, so a change that reintroduces a flaw is caught before anyone else finds it.
 
 ```yaml
-- uses: actions/setup-node@v4
+name: MCP authorization
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  security-events: write   # only for upload-sarif
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: Enigmacker/mcp-authprobe@v0.4.0
+        with:
+          url: https://staging.example.com/mcp
+          secret: ${{ secrets.MCP_AUTHPROBE_SECRET }}
+          skip: THR            # optional: no failed token requests
+          upload-sarif: true   # optional: findings in the Security tab
+```
+
+The results table is added to the job summary. The step fails when a check fails at or above `fail-on`.
+
+| Input | Default | Meaning |
+| --- | --- | --- |
+| `url` | (required) | MCP endpoint to scan |
+| `secret` | | Ownership secret, from a repository secret. Without it, only discovery and `MAP-ORG01` run |
+| `fail-on` | `high` | Fail on a failing check at or above this severity |
+| `fail-on-inconclusive` | `false` | Also fail when a check is inconclusive (otherwise a warning). An unreachable target always fails |
+| `only` / `skip` | | Same as `--only` / `--skip` |
+| `throttle-attempts`, `timeout` | | Same as the CLI options |
+| `upload-sarif` | `false` | Upload the SARIF report to code scanning (needs `security-events: write`) |
+| `allow-private` | `false` | For a lab started in the same job only |
+| `node-version` | `22` | Node.js used to run the scanner |
+| `package` | this release | npm package spec to run, e.g. `mcp-authprobe@0.4.0` |
+
+Outputs: `exit-code`, `failed` (number of failing checks), `json-file`, `sarif-file`, `markdown-file`.
+
+The secret is passed through the environment, never on a command line. The refresh token checks and the login checks are not run by the action: they need a test grant from an interactive `login`, and a grant is consumed by a scan. Run them by hand after a change to your authorization server.
+
+Run active scans against a staging environment rather than production whenever you can.
+
+Without the action, the same thing in plain steps:
+
+```yaml
+- uses: actions/setup-node@v7
   with:
     node-version: 22
 - run: npx mcp-authprobe scan "$MCP_URL" --sarif results.sarif --markdown summary.md
@@ -379,13 +438,7 @@ All server-controlled text is neutralized before it reaches a report: terminal e
     MCP_AUTHPROBE_SECRET: ${{ secrets.MCP_AUTHPROBE_SECRET }}
 - run: cat summary.md >> "$GITHUB_STEP_SUMMARY"
   if: always()
-- uses: github/codeql-action/upload-sarif@v3
-  if: always()
-  with:
-    sarif_file: results.sarif
 ```
-
-Run active scans against a staging environment rather than production whenever you can.
 
 ## Safety of the scanner
 
@@ -417,6 +470,9 @@ The scanner talks to servers that may be hostile, and it may be driven by an AI 
 **0.3.0**
 - ~~PKCE enforcement (PKC01), code reuse (COD01), token audience (AUD01), Origin validation (ORG01)~~ done.
 - ~~Local practice server (`lab`)~~ done.
+
+**0.4.0**
+- ~~GitHub Action, `--only` / `--skip`~~ done.
 
 **Next**
 - Optional integration with mcp-posture: run it alongside, or import its JSON report, and merge both into one report where active results confirm or refute what the metadata announces.
