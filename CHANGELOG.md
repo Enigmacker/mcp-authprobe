@@ -11,12 +11,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - `MAP-PKC01` (PKCE enforcement): during `login`, the code is first presented without `code_verifier`, then with a wrong one; the token endpoint must refuse both.
 - `MAP-COD01` (single-use codes): after the exchange, `login` presents the used code again, then checks whether the tokens issued from it were revoked (recommended, reported in the result).
 - `MAP-AUD01` (token audience, RFC 8707): `login` requests a token for an unrelated resource with the refresh token and presents it to the MCP endpoint, after a control with its own token. Passes on `invalid_target` from the authorization server or 401/403 from the MCP endpoint; any other refusal is inconclusive.
+- `lab` command: a local MCP server with its own OAuth authorization server, in a `vulnerable` profile (most checks fail) or a `secure` one, to try every check in a minute. Loopback only, test account `test` / `test`, in memory.
 - `MAP-ORG01` (Origin validation): an `initialize` request with a foreign `Origin` must get 403. Observed during `login` with a valid token, and in every scan without credentials (inconclusive when the server asks for a token first).
 
 ### Changed
 
 - `login` runs its probes in a fixed order and handles servers that invalidate a code after the first refused attempt: only that first refusal is trusted. If a probe obtains tokens, the remaining probes are reported as not run and those tokens become the grant. The grant always keeps the newest refresh token.
 - Scans report every login observation; no check is listed as "not implemented" any more.
+- The lab server doubles as the test fixture: its consent mode validates authorization requests before asking for a login, and returns the RFC 9207 `iss` parameter.
 
 ## [0.2.0] - 2026-11-01
 

@@ -17,6 +17,7 @@ Passive scanners read what a remote [Model Context Protocol](https://modelcontex
 
 - [Why another scanner?](#why-another-scanner)
 - [Install](#install)
+- [Try it in a minute: the lab](#try-it-in-a-minute-the-lab)
 - [Quick start](#quick-start)
 - [Ownership proof](#ownership-proof)
 - [Refresh token checks](#refresh-token-checks)
@@ -68,6 +69,29 @@ npm ci
 npm run build
 node dist/cli.js --help
 ```
+
+## Try it in a minute: the lab
+
+`mcp-authprobe lab` starts a small MCP server with its own OAuth authorization server on `127.0.0.1`, so you can see every check at work without touching a real server:
+
+```sh
+# Terminal 1: a deliberately vulnerable server (or --profile secure)
+npx mcp-authprobe lab
+
+# Terminal 2
+npx mcp-authprobe scan http://127.0.0.1:8787/mcp --allow-private
+npx mcp-authprobe login http://127.0.0.1:8787/mcp --allow-private --out lab-grant.json
+npx mcp-authprobe scan http://127.0.0.1:8787/mcp --allow-private --credentials-file lab-grant.json
+```
+
+Log in with the account `test` / `test` and click **Allow**.
+
+| Profile | What you should see |
+| --- | --- |
+| `vulnerable` (default) | Refresh token replay accepted, unsafe redirect URIs registered, PKCE not enforced, token audience ignored, foreign `Origin` accepted, no throttling, consent page without CSRF protection. `MAP-RDR02` is reported as **inconclusive**: this server sends unknown visitors to its login page before looking at `redirect_uri`, which cannot be told apart from outside, and the scanner never turns that into a pass. |
+| `secure` | Every check passes (or is not applicable); `MAP-CSR01` runs with `consent-check`. |
+
+The lab only listens on a loopback address (`--host 127.0.0.1` or `::1`, `--port`, default 8787), keeps everything in memory, and stops with Ctrl-C. It is vulnerable on purpose: never expose it.
 
 ## Quick start
 
@@ -390,6 +414,7 @@ The scanner talks to servers that may be hostile, and it may be driven by an AI 
 **0.2.0**
 - ~~Consent CSRF check (CSR01), driven through a browser session~~ done.
 - ~~PKCE enforcement (PKC01), code reuse (COD01), token audience (AUD01), Origin validation (ORG01)~~ done (Unreleased).
+- ~~Local practice server (`lab`)~~ done (Unreleased).
 - Optional integration with mcp-posture: run it alongside, or import its JSON report, and merge both into one report where active results confirm or refute what the metadata announces.
 
 ## Development

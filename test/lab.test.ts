@@ -1,0 +1,75 @@
+import { afterEach, describe, expect, it } from "vitest";
+import type { TestGrant } from "../src/credentials.js";
+import { discover } from "../src/discovery.js";
+import { LabUsageError, startLab } from "../src/lab-command.js";
+import type { Fixture } from "../src/lab/server.js";
+import { login } from "../src/login.js";
+import { HttpClient } from "../src/net/http.js";
+import { scan } from "../src/scan.js";
+
+let lab: Fixture | undefined;
+let http: HttpClient | undefined;
+
+afterEach(async () => {
+  await lab?.close();
+  await http?.close();
+  lab = undefined;
+  http = undefined;
+});
+
+/** A scripted user: logs in with test / test and clicks Allow on the consent page. */
+async function user(authorizationUrl: string): Promise<void> {
+  const first = await fetch(authorizationUrl, { redirect: "manual" });
+  const loginUrl = new URL(first.headers.get("location") ?? "", authorizationUrl);
+  const logged = await fetch(loginUrl, { method: "POST", redirect: "manual", body: new URLSearchParams({ username: "test", password: "test" }) });
+  const cookie = (logged.headers.get("set-cookie") ?? "").split(";")[0] ?? "";
+  const page = await (await fetch(authorizationUrl, { headers: { cookie } })).text();
+  const form = new URLSearchParams();
+  for (const m of page.matchAll(/<input type="hidden" name="([^"]+)" value="([^"]*)">/g)) form.set(m[1] as string, (m[2] as string).replace(/&quot;/g, '"').replace(/&lt;/g, "<").replace(/&amp;/g, "&"));
+  form.set("decision", "allow");
+  const consent = await fetch(new URL("/consent", authorizationUrl), { method: "POST", redirect: "manual", headers: { cookie }, body: form });
+  await fetch(consent.headers.get("location") ?? "", { redirect: "manual" });
+}
+
+async function runLab(profile: string) {
+  const started = await startLab({ profile, port: 0, host: "127.0.0.1" });
+  lab = started.lab;
+  http = new HttpClient({ allowPrivate: true });
+  const discovery = await discover(lab.mcpUrl, http);
+  const result = await login({ http, mcpUrl: lab.mcpUrl, discovery, openUrl: user, probe: true, timeoutMs: 5000 });
+  const report = await scan(lab.mcpUrl, { allowPrivate: true, grant: result.grant as TestGrant, observations: result.observations, throttleAttempts: 10 });
+  const status = Object.fromEntries(report.findings.map((f) => [f.checkId, f.status]));
+  return { started, result, status };
+}
+
+describe("lab", () => {
+  it("refuses a non-loopback address, an unknown profile and a bad port", async () => {
+    await expect(startLab({ profile: "vulnerable", port: 0, host: "0.0.0.0" })).rejects.toBeInstanceOf(LabUsageError);
+    await expect(startLab({ profile: "nope", port: 0, host: "127.0.0.1" })).rejects.toThrow(/Unknown profile/);
+    await expect(startLab({ profile: "secure", port: 70000, host: "127.0.0.1" })).rejects.toThrow(/--port/);
+  });
+
+  it("vulnerable: login and scan report the planted flaws", async () => {
+    const { started, result, status } = await runLab("vulnerable");
+    expect(started.banner).toMatch(/test \/ test/);
+    expect(result.grant).not.toBeNull();
+    expect(status).toMatchObject({
+      "MAP-DSC01": "pass",
+      "MAP-RTK01": "pass",
+      "MAP-RTK02": "fail",
+      "MAP-RDR02": "error",
+      "MAP-RDR04": "fail",
+      "MAP-PKC01": "fail",
+      "MAP-AUD01": "fail",
+      "MAP-ORG01": "fail",
+      "MAP-THR01": "fail",
+    });
+  });
+
+  it("secure: every check passes, is not applicable, or needs the browser", async () => {
+    const { result, status } = await runLab("secure");
+    expect(result.grant).not.toBeNull();
+    const notPassing = Object.entries(status).filter(([, s]) => s !== "pass" && s !== "not_applicable");
+    expect(notPassing).toEqual([["MAP-CSR01", "skipped"]]);
+  });
+});

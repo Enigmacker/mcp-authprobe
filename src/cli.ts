@@ -33,6 +33,8 @@ Usage:
   ${TOOL_NAME} login <mcp-url> --out <file> Log in with a test account and save a test grant
   ${TOOL_NAME} consent-check <mcp-url>     MAP-CSR01: consent CSRF, in a real browser
   ${TOOL_NAME} mcp                         Run as an MCP server over stdio
+  ${TOOL_NAME} lab [--profile vulnerable|secure] [--port 8787]
+                                           Run a local practice server (loopback only)
 
 Scan options:
   --json <file>         Write the JSON report
@@ -60,6 +62,11 @@ Login options:
   --no-probe            Do not observe the login checks (PKC01, RDR03, COD01, AUD01, ORG01)
   --no-browser          Print the authorization URL instead of opening a browser
   --allow-private, --secret-file, --timeout  as for scan
+
+Lab options:
+  --profile <name>      vulnerable (default): most checks fail; secure: a compliant server
+  --port <n>            Port on 127.0.0.1 (default: 8787; 0 picks a free port)
+  --host <address>      127.0.0.1 (default) or ::1; nothing else is accepted
 
 The ownership secret is read from ${SECRET_ENV} or --secret-file, never from
 the command line, so it does not end up in shell history or process lists.
@@ -104,6 +111,9 @@ export async function main(argv: string[]): Promise<number> {
       force: { type: "boolean", default: false },
       "no-probe": { type: "boolean", default: false },
       "no-browser": { type: "boolean", default: false },
+      profile: { type: "string", default: "vulnerable" },
+      port: { type: "string", default: "8787" },
+      host: { type: "string", default: "127.0.0.1" },
       help: { type: "boolean", short: "h", default: false },
       version: { type: "boolean", short: "v", default: false },
     },
@@ -123,6 +133,23 @@ export async function main(argv: string[]): Promise<number> {
     const { startStdioServer } = await import("./mcp-server.js");
     await startStdioServer();
     return KEEP_RUNNING;
+  }
+
+  if (command === "lab") {
+    const { LabUsageError, startLab } = await import("./lab-command.js");
+    try {
+      const { lab, banner } = await startLab({ profile: values.profile, port: Number(values.port), host: values.host });
+      err(banner);
+      const stop = (): void => {
+        void lab.close().finally(() => process.exit(EXIT.ok));
+      };
+      process.once("SIGINT", stop);
+      process.once("SIGTERM", stop);
+      return KEEP_RUNNING;
+    } catch (e) {
+      err(`${(e as Error).message}\n`);
+      return e instanceof LabUsageError ? EXIT.usage : EXIT.error;
+    }
   }
 
   if (command === "checks") {
