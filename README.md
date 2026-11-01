@@ -9,7 +9,7 @@ Passive scanners read what a remote [Model Context Protocol](https://modelcontex
 
 `mcp-authprobe` runs those active checks, against servers whose ownership you have proven, and reports the results as JSON, SARIF and Markdown.
 
-> **Status: early development (0.1.0-dev).** Available today: ownership proof, OAuth discovery, the refresh token checks (rotation, replay, family revocation) and the redirect URI checks (unregistered URI, exact matching, registration policy). The other active families are documented and being implemented; see [Roadmap](#roadmap).
+> **Status: early development (0.1.0-dev).** Available today: ownership proof, OAuth discovery, the refresh token checks (rotation, replay, family revocation) the redirect URI checks (unregistered URI, exact matching, registration policy), and an MCP server mode so an AI assistant can run the audit. The other active families are documented and being implemented; see [Roadmap](#roadmap).
 
 > **Only test servers you own or are explicitly authorized to test.** Active checks change state on the target. The tool enforces an ownership proof before running them, but responsibility stays with the operator.
 
@@ -21,6 +21,7 @@ Passive scanners read what a remote [Model Context Protocol](https://modelcontex
 - [Ownership proof](#ownership-proof)
 - [Refresh token checks](#refresh-token-checks)
 - [Redirect URI checks](#redirect-uri-checks)
+- [Use it from an MCP client](#use-it-from-an-mcp-client)
 - [What it checks](#what-it-checks)
 - [Reports and exit codes](#reports-and-exit-codes)
 - [CI usage](#ci-usage)
@@ -161,6 +162,51 @@ Safety by design: every host used lives under the reserved `.invalid` top-level 
 
 Reading the results: a variant answered exactly like the baseline (for example both redirected to the login page) is reported as **inconclusive** (`error`), never as a pass, because some servers only check `redirect_uri` after the user logs in. `MAP-RDR03` (token endpoint enforcement) needs an authorization code, hence a login, and will come with the interactive login feature.
 
+## Use it from an MCP client
+
+`mcp-authprobe mcp` runs the same engine as an MCP server over stdio, so an AI assistant in any MCP client can audit your servers for you.
+
+Add it to your client's MCP configuration (most clients use this `mcpServers` format):
+
+```json
+{
+  "mcpServers": {
+    "mcp-authprobe": {
+      "command": "npx",
+      "args": ["-y", "mcp-authprobe", "mcp"],
+      "env": {
+        "MCP_AUTHPROBE_SECRET_FILE": "/home/you/.config/mcp-authprobe/secret",
+        "MCP_AUTHPROBE_CREDENTIALS_FILE": "/home/you/.config/mcp-authprobe/test-grant.json"
+      }
+    }
+  }
+}
+```
+
+Until the npm release, use `"command": "node"` with `"args": ["/path/to/mcp-authprobe/dist/cli.js", "mcp"]`.
+
+| Tool | What it does | Annotations |
+| --- | --- | --- |
+| `list_checks` | Lists the catalogue | read-only |
+| `explain_check` | Explains one check | read-only |
+| `ownership_proof` | Returns the proof to publish for a host (never the secret) | read-only |
+| `verify_ownership` | Checks that the proof is published | read-only, open world |
+| `scan` | Runs discovery and the active checks; returns a Markdown summary and the full report as structured content | **destructive**, open world |
+
+The server is built so that the assistant, or a prompt injection reaching it, cannot widen what the scanner may do:
+
+- **Everything sensitive is set by you in the configuration, never by tool arguments:** the ownership secret, the test grant, and private-address access. The `scan` tool takes a URL and nothing else.
+- **`scan` is annotated as destructive**, so well-behaved clients ask for your confirmation before each call. It consumes the test grant and registers temporary clients.
+- **Only `https` targets** are accepted, unless you set `MCP_AUTHPROBE_ALLOW_PRIVATE=1` for a local lab. URLs with embedded credentials are refused, and only one scan runs at a time.
+- **Reports are marked as data:** every scan result ends with a notice that server-controlled text in it must not be treated as instructions.
+
+| Environment variable | Purpose |
+| --- | --- |
+| `MCP_AUTHPROBE_SECRET` or `MCP_AUTHPROBE_SECRET_FILE` | Ownership secret (prefer the file) |
+| `MCP_AUTHPROBE_CREDENTIALS_FILE` | Test grant for the refresh token checks |
+| `MCP_AUTHPROBE_ALLOW_PRIVATE=1` | Allow loopback and private targets (local labs only) |
+| `MCP_AUTHPROBE_TIMEOUT_MS` | Per-request timeout |
+
 ## What it checks
 
 `mcp-authprobe checks list` prints the catalogue, and `mcp-authprobe checks show <ID>` explains a check: why it matters, how to fix it, and references. IDs are stable and never reused.
@@ -238,7 +284,7 @@ The scanner talks to servers that may be hostile, and it may be driven by an AI 
 - ~~Redirect URI checks (RDR01, RDR02, RDR04)~~ done.
 - `MAP-RDR03`, once the interactive login exists.
 - Throttling check (THR01), capped at a small number of attempts against a dedicated test client.
-- MCP server mode (stdio), so the same engine can be used from an MCP client.
+- ~~MCP server mode (stdio)~~ done.
 - npm release.
 
 **0.2.0**

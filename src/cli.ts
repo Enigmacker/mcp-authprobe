@@ -17,6 +17,8 @@ import { TOOL_NAME, TOOL_VERSION } from "./version.js";
 const SECRET_ENV = "MCP_AUTHPROBE_SECRET";
 
 export const EXIT = { ok: 0, findings: 1, usage: 2, error: 3 } as const;
+/** Returned by main() when a long-running server was started: do not exit. */
+export const KEEP_RUNNING = -1;
 
 const HELP = `${TOOL_NAME} ${TOOL_VERSION}
 Active authorization testing for remote MCP servers you own.
@@ -28,6 +30,7 @@ Usage:
   ${TOOL_NAME} ownership verify <host>     Check that the proof is published
   ${TOOL_NAME} checks list                 List every check
   ${TOOL_NAME} checks show <id>            Explain one check
+  ${TOOL_NAME} mcp                         Run as an MCP server over stdio
 
 Scan options:
   --json <file>         Write the JSON report
@@ -91,6 +94,12 @@ export async function main(argv: string[]): Promise<number> {
   if (values.help || !command) {
     out(HELP);
     return values.help ? EXIT.ok : EXIT.usage;
+  }
+
+  if (command === "mcp") {
+    const { startStdioServer } = await import("./mcp-server.js");
+    await startStdioServer();
+    return KEEP_RUNNING;
   }
 
   if (command === "checks") {
@@ -227,7 +236,7 @@ function isEntryPoint(): boolean {
 if (isEntryPoint()) {
   main(process.argv.slice(2)).then(
     (code) => {
-      process.exitCode = code;
+      if (code !== KEEP_RUNNING) process.exitCode = code;
     },
     (e: unknown) => {
       err(`${(e as Error).message}\n`);

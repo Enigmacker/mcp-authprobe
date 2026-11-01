@@ -45,9 +45,12 @@
     "prepublishOnly": "npm run check"
   },
   "dependencies": {
-    "undici": "^7.16.0"
+    "@modelcontextprotocol/server": "^2.4.0",
+    "undici": "^7.16.0",
+    "zod": "^4.6.7"
   },
   "devDependencies": {
+    "@modelcontextprotocol/client": "^2.4.0",
     "@types/node": "^22.10.0",
     "typescript": "^5.7.0",
     "vitest": "^5.0.5"
