@@ -1,17 +1,21 @@
 # mcp-authprobe
 
 [![CI](https://github.com/Enigmacker/mcp-authprobe/actions/workflows/ci.yml/badge.svg)](https://github.com/Enigmacker/mcp-authprobe/actions/workflows/ci.yml)
+[![npm](https://img.shields.io/npm/v/mcp-authprobe.svg)](https://www.npmjs.com/package/mcp-authprobe)
+[![GitHub Marketplace](https://img.shields.io/badge/Marketplace-mcp--authprobe-blue?logo=github)](https://github.com/marketplace/actions/mcp-authprobe)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
 **Active authorization testing for remote MCP servers you own.**
 
-Passive scanners read what a remote [Model Context Protocol](https://modelcontextprotocol.io) server *announces*: its OAuth metadata, its TLS setup, its tool descriptions. Some properties can only be confirmed by actually exercising the authorization server: does it really rotate refresh tokens, does it really refuse a redirect URI it never registered, does it slow down repeated failures?
+Passive scanners read what a remote [Model Context Protocol](https://modelcontextprotocol.io) server *announces*: its OAuth metadata, its TLS setup, its tool descriptions. Some properties can only be confirmed by actually exercising the authorization server: does it really rotate refresh tokens, does it really refuse a redirect URI it never registered, does it enforce PKCE, does it accept a token meant for another server, does it slow down repeated failures?
 
 `mcp-authprobe` runs those active checks, against servers whose ownership you have proven, and reports the results as JSON, SARIF and Markdown.
 
-> **Status: 0.1.x.** All ten checks are available behind an ownership proof: OAuth discovery, refresh token rotation and replay, redirect URI strictness, token endpoint throttling, and consent CSRF (in a real browser). It works as a CLI, with an interactive `login` that creates the test grant, and as an MCP server so an AI assistant can run the audit. See [Roadmap](#roadmap).
+> **19 checks**, field-tested against a certified OpenID provider: OAuth discovery, refresh token rotation and replay, redirect URI strictness, PKCE enforcement, single-use codes, token audience, `Origin` validation, tokens in URLs, session IDs used as credentials, CORS, throttling and consent CSRF (in a real browser). It works as a CLI with an interactive `login`, as an MCP server so an AI assistant can run the audit, and as a GitHub Action. A deliberately vulnerable [lab](#try-it-in-a-minute-the-lab) lets you try everything in a minute.
 
 > **Only test servers you own or are explicitly authorized to test.** Active checks change state on the target. The tool enforces an ownership proof before running them, but responsibility stays with the operator.
+
+![mcp-authprobe against its vulnerable lab: login, then a scan with 10 failing checks](https://raw.githubusercontent.com/Enigmacker/mcp-authprobe/main/docs/demo/demo.gif)
 
 ## Contents
 
@@ -414,7 +418,7 @@ jobs:
   scan:
     runs-on: ubuntu-latest
     steps:
-      - uses: Enigmacker/mcp-authprobe@v0.6.0
+      - uses: Enigmacker/mcp-authprobe@v0.7.0
         with:
           url: https://staging.example.com/mcp
           secret: ${{ secrets.MCP_AUTHPROBE_SECRET }}
@@ -435,7 +439,7 @@ The results table is added to the job summary. The step fails when a check fails
 | `upload-sarif` | `false` | Upload the SARIF report to code scanning (needs `security-events: write`) |
 | `allow-private` | `false` | For a lab started in the same job only |
 | `node-version` | `22` | Node.js used to run the scanner |
-| `package` | this release | npm package spec to run, e.g. `mcp-authprobe@0.6.0` |
+| `package` | this release | npm package spec to run, e.g. `mcp-authprobe@0.7.0` |
 
 Outputs: `exit-code`, `failed` (number of failing checks), `json-file`, `sarif-file`, `markdown-file`.
 
@@ -497,6 +501,9 @@ The scanner talks to servers that may be hostile, and it may be driven by an AI 
 **0.6.0**
 - ~~Token in the URL (TOK01), session ID without a token (SES01), CORS with credentials (COR01)~~ done.
 
+**0.7.0**
+- ~~Readable terminal output and an animated demo~~ done.
+
 **Next**
 - Optional integration with mcp-posture: run it alongside, or import its JSON report, and merge both into one report where active results confirm or refute what the metadata announces.
 
@@ -508,6 +515,7 @@ npm run typecheck
 npm test          # unit and integration tests against a local fixture server
 npm run build
 npm run check     # all of the above
+npm run demo      # re-record docs/demo/demo.gif (needs Chrome and ffmpeg)
 ```
 
 Tests never leave the machine: integration tests run against a fixture server bound to `127.0.0.1`.

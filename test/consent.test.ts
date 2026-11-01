@@ -291,8 +291,8 @@ describe.skipIf(!chromeAvailable)("browser driver (real Chrome)", () => {
   it("reports a redirect when Allow is clicked", async () => {
     const { result } = await capture({ csrf: "token" }, async (page) => {
       await login(page);
-      await page.click("button[value=allow]");
-      await page.waitForURL(/callback/);
+      // The callback URL has no listener here: wait for the request, not for a page load.
+      await Promise.all([page.waitForRequest(/callback/), page.click("button[value=allow]")]);
     });
     expect(result.kind).toBe("redirected");
   }, 60_000);

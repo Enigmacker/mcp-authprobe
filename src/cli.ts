@@ -9,7 +9,7 @@ import { DNS_LABEL, generateSecret, proofFor, verifyOwnership, WELL_KNOWN_PATH }
 import { toJson } from "./report/json.js";
 import { toMarkdown } from "./report/markdown.js";
 import { toSarif } from "./report/sarif.js";
-import { toTable } from "./report/table.js";
+import { colorWanted, toTable } from "./report/table.js";
 import { scan } from "./scan.js";
 import { parseSelection } from "./selection.js";
 import { severityAtLeast, type Severity } from "./types.js";
@@ -47,6 +47,7 @@ Scan options:
   --secret-file <file>  Read the ownership secret from a file instead of ${SECRET_ENV}
   --throttle-attempts <n>
                         Failed token requests sent by MAP-THR01 (5-20, default 10)
+  --verbose             Show every evidence line (default: failing checks only)
   --only <list>         Run only these checks: IDs (MAP-RDR01 or RDR01) or families (RDR),
                         comma-separated; the others are reported as skipped
   --skip <list>         Do not run these checks (same syntax; wins over --only)
@@ -117,6 +118,7 @@ export async function main(argv: string[]): Promise<number> {
       force: { type: "boolean", default: false },
       "no-probe": { type: "boolean", default: false },
       "no-browser": { type: "boolean", default: false },
+      verbose: { type: "boolean", default: false },
       profile: { type: "string", default: "vulnerable" },
       port: { type: "string", default: "8787" },
       host: { type: "string", default: "127.0.0.1" },
@@ -332,7 +334,7 @@ export async function main(argv: string[]): Promise<number> {
       return EXIT.error;
     }
 
-    out(toTable(report));
+    out(toTable(report, { color: colorWanted(), verbose: values.verbose }));
     if (values.json) writeFileSync(values.json, toJson(report));
     if (values.sarif) writeFileSync(values.sarif, toSarif(report));
     if (values.markdown) writeFileSync(values.markdown, toMarkdown(report));

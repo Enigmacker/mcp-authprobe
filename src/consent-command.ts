@@ -14,7 +14,7 @@ import { safeText } from "./redact.js";
 import { toJson } from "./report/json.js";
 import { toMarkdown } from "./report/markdown.js";
 import { toSarif } from "./report/sarif.js";
-import { toTable } from "./report/table.js";
+import { colorWanted, toTable } from "./report/table.js";
 import { hostsToVerify } from "./scan.js";
 import { severityAtLeast, type Finding, type ScanReport, type Severity } from "./types.js";
 import { TOOL_NAME, TOOL_VERSION } from "./version.js";
@@ -169,7 +169,7 @@ export async function runConsentCommand(o: ConsentCommandOptions): Promise<numbe
       ownership: { verified: true, method: [...new Set(results.map((r) => r.method))].join("+"), detail: results.map((r) => `${r.host}: ${r.detail}`).join(" ") },
       findings: [finding],
     };
-    process.stdout.write(toTable(report));
+    process.stdout.write(toTable(report, { color: colorWanted(), verbose: true }));
     if (o.json) writeFileSync(o.json, toJson(report));
     if (o.sarif) writeFileSync(o.sarif, toSarif(report));
     if (o.markdown) writeFileSync(o.markdown, toMarkdown(report));
