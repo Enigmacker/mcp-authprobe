@@ -93,7 +93,7 @@ runs:
         MAP_PACKAGE: ${{ inputs.package }}
         MAP_ACTION_PATH: ${{ github.action_path }}
       run: |
-        set -uo pipefail
+        set +e -u -o pipefail  # the scanner exit code is handled below, not by bash
         out="${RUNNER_TEMP}/mcp-authprobe"
         mkdir -p "$out"
         rm -f "$out/report.json" "$out/report.sarif" "$out/report.md"
