@@ -100,3 +100,21 @@ jobs:
           test "$EXIT_CODE" = 1
           test "$FAILED" -ge 1
           node -e 'const r=require(process.argv[1]); const t=r.findings.find(f=>f.checkId==="MAP-THR01"); if(!/Not selected/.test(t.message)) process.exit(1)' "$JSON"
+
+  docker:
+    name: Docker image answers MCP introspection
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - run: docker build -t mcp-authprobe .
+      - name: initialize and tools/list over stdio
+        run: |
+          printf '%s\n' \
+            '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"ci","version":"0"}}}' \
+            '{"jsonrpc":"2.0","method":"notifications/initialized"}' \
+            '{"jsonrpc":"2.0","id":2,"method":"tools/list"}' \
+            | timeout 30 docker run -i --rm mcp-authprobe > out.jsonl
+          cat out.jsonl
+          node -e 'const l=require("fs").readFileSync("out.jsonl","utf8").trim().split("\n").map(JSON.parse); const t=l.find(m=>m.id===2); if(!t||!t.result.tools.some(x=>x.name==="scan")) process.exit(1)'

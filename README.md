@@ -341,6 +341,18 @@ The server is built so that the assistant, or a prompt injection reaching it, ca
 | `MCP_AUTHPROBE_LAB_ORIGINS` | Comma-separated lab origins (e.g. `http://127.0.0.1:8080`) exempt from the ownership proof |
 | `MCP_AUTHPROBE_TIMEOUT_MS` | Per-request timeout |
 
+
+### With Docker
+
+The repository's `Dockerfile` builds the same stdio MCP server:
+
+```sh
+docker build -t mcp-authprobe https://github.com/Enigmacker/mcp-authprobe.git
+docker run -i --rm -e MCP_AUTHPROBE_SECRET mcp-authprobe
+```
+
+In a container, `--allow-private` labs on your machine are not reachable as `127.0.0.1`; use the npm package for the lab.
+
 ## What it checks
 
 `mcp-authprobe checks list` prints the catalogue, and `mcp-authprobe checks show <ID>` explains a check: why it matters, how to fix it, and references. IDs are stable and never reused.

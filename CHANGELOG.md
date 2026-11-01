@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Added
+
+- `Dockerfile` for the stdio MCP server, tested in CI (the image must answer `initialize` and `tools/list`), and `glama.json` for the Glama directory.
+
 ## [0.7.0] - 2026-11-01
 
 ### Changed
