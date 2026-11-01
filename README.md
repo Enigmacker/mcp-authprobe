@@ -409,7 +409,7 @@ jobs:
   scan:
     runs-on: ubuntu-latest
     steps:
-      - uses: Enigmacker/mcp-authprobe@v0.4.0
+      - uses: Enigmacker/mcp-authprobe@v0.5.0
         with:
           url: https://staging.example.com/mcp
           secret: ${{ secrets.MCP_AUTHPROBE_SECRET }}
@@ -430,7 +430,7 @@ The results table is added to the job summary. The step fails when a check fails
 | `upload-sarif` | `false` | Upload the SARIF report to code scanning (needs `security-events: write`) |
 | `allow-private` | `false` | For a lab started in the same job only |
 | `node-version` | `22` | Node.js used to run the scanner |
-| `package` | this release | npm package spec to run, e.g. `mcp-authprobe@0.4.0` |
+| `package` | this release | npm package spec to run, e.g. `mcp-authprobe@0.5.0` |
 
 Outputs: `exit-code`, `failed` (number of failing checks), `json-file`, `sarif-file`, `markdown-file`.
 
@@ -485,6 +485,9 @@ The scanner talks to servers that may be hostile, and it may be driven by an AI 
 
 **0.4.0**
 - ~~GitHub Action, `--only` / `--skip`~~ done.
+
+**0.5.0**
+- ~~Field trial against node-oidc-provider and the MCP SDK's OAuth example, with the fixes it led to~~ done.
 
 **Next**
 - Optional integration with mcp-posture: run it alongside, or import its JSON report, and merge both into one report where active results confirm or refute what the metadata announces.

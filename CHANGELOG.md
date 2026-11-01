@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-11-01
+
 Fixes from a trial against node-oidc-provider (with an MCP server built on the official SDK) and the MCP SDK's OAuth example server.
 
 ### Changed
@@ -78,7 +80,8 @@ First release.
 - Hardening from an independent review before release: HTTPS is required for every request outside loopback/private labs; rate limits and server errors make redirect URI, registration and throttling checks inconclusive instead of passing; test grants record their target and token endpoint and are never used elsewhere (and must name their target in MCP mode); loopback targets need a proof in MCP mode unless listed in `MCP_AUTHPROBE_LAB_ORIGINS`; `login` output is neutralized; more IPv6 transition ranges are refused; a malformed issuer no longer aborts discovery.
 - Local fixture server with a stateful token endpoint, dynamic registration and an authorization endpoint and test suite; GitHub Actions CI.
 
-[Unreleased]: https://github.com/Enigmacker/mcp-authprobe/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/Enigmacker/mcp-authprobe/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/Enigmacker/mcp-authprobe/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/Enigmacker/mcp-authprobe/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/Enigmacker/mcp-authprobe/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/Enigmacker/mcp-authprobe/compare/v0.1.1...v0.2.0
