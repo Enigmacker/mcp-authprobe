@@ -1,0 +1,12 @@
+node_modules/
+dist/
+coverage/
+*.log
+.DS_Store
+# local scan outputs
+reports/
+*.sarif
+# never commit tokens or credentials
+.env
+.env.*
+*.token
