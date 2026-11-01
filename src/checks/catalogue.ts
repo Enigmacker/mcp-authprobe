@@ -87,7 +87,7 @@ export const CATALOGUE: readonly CheckDefinition[] = [
     title: "Unregistered redirect_uri is refused at the authorization endpoint",
     severity: "critical",
     active: true,
-    availability: "planned",
+    availability: "available",
     rationale:
       "If the authorization endpoint redirects to a URI the client never registered, authorization codes can be delivered to an attacker.",
     remediation:
@@ -100,7 +100,7 @@ export const CATALOGUE: readonly CheckDefinition[] = [
     title: "redirect_uri matching is exact, not prefix or pattern based",
     severity: "high",
     active: true,
-    availability: "planned",
+    availability: "available",
     rationale:
       "Prefix, substring or pattern matching lets close variants of a registered URI through (extra path segments, different port, different case, added query). Each variant is a potential open redirect for codes.",
     remediation: "Use simple string comparison as required by OAuth 2.1, with the single loopback port exception for native clients.",
@@ -124,7 +124,7 @@ export const CATALOGUE: readonly CheckDefinition[] = [
     title: "Dynamic client registration refuses unsafe redirect URIs",
     severity: "high",
     active: true,
-    availability: "planned",
+    availability: "available",
     rationale:
       "If anyone can register a client, the registration endpoint is the first line of defense: it should only accept HTTPS or loopback redirect URIs and refuse dangerous schemes.",
     remediation: "Validate redirect_uris at registration: HTTPS, loopback HTTP, or private-use schemes for native apps only.",

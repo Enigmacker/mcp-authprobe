@@ -22,6 +22,25 @@ export interface TokenBehaviour {
   throttle?: boolean;
 }
 
+export interface AuthorizationBehaviour {
+  /**
+   * How the authorization endpoint matches redirect_uri:
+   * "exact" (compliant), "prefix" (string prefix), "any" (no check),
+   * "deferred" (no check before login: indistinguishable from outside).
+   */
+  match?: "exact" | "prefix" | "any" | "deferred";
+  /**
+   * What a valid request without a session gets: "login" (redirect to the
+   * login page) or "error-redirect" (redirect to redirect_uri with
+   * error=login_required, as with prompt=none).
+   */
+  noSession?: "login" | "error-redirect";
+  /** Registration policy: "strict" refuses unsafe redirect URIs, "lax" accepts anything. */
+  registration?: "strict" | "lax" | "disabled";
+  /** Offer RFC 7592 deletion of registered clients (default true). */
+  management?: boolean;
+}
+
 export interface FixtureOptions {
   /** Send WWW-Authenticate with resource_metadata on 401 (default true). */
   challenge?: boolean;
@@ -34,6 +53,12 @@ export interface FixtureOptions {
   /** Answer the MCP endpoint without credentials (misconfiguration). */
   anonymous?: boolean;
   tokens?: TokenBehaviour;
+  authorization?: AuthorizationBehaviour;
+  /**
+   * Address to listen on and to advertise in URLs (default 127.0.0.1).
+   * A non-loopback local address lets tests exercise the ownership gate.
+   */
+  host?: string;
 }
 
 export interface Fixture {
@@ -44,6 +69,8 @@ export interface Fixture {
   issueRefreshToken(clientId?: string): string;
   /** Number of token requests received so far. */
   tokenRequests(): number;
+  /** Client IDs currently registered through dynamic registration. */
+  registeredClients(): string[];
   close(): Promise<void>;
 }
 
@@ -78,6 +105,8 @@ export async function startFixture(options: FixtureOptions = {}): Promise<Fixtur
     throttle: false,
     ...options.tokens,
   };
+  const authz: Required<AuthorizationBehaviour> = { match: "exact", noSession: "login", registration: "strict", management: true, ...options.authorization };
+  const clients = new Map<string, { redirectUris: string[]; managementToken: string }>();
   const requests: Fixture["requests"] = [];
   const refreshTokens = new Map<string, RefreshRecord>();
   const revokedFamilies = new Set<string>();
@@ -121,6 +150,76 @@ export async function startFixture(options: FixtureOptions = {}): Promise<Fixtur
     return json(res, 200, { access_token: newToken("at"), token_type: "Bearer", expires_in: 3600, refresh_token: refreshOut });
   }
 
+  function safeRedirect(uri: string): boolean {
+    let u: URL;
+    try {
+      u = new URL(uri);
+    } catch {
+      return false;
+    }
+    if (u.hash) return false;
+    if (u.protocol === "https:") return true;
+    return u.protocol === "http:" && ["127.0.0.1", "localhost", "[::1]"].includes(u.hostname);
+  }
+
+  function registerEndpoint(body: string, res: ServerResponse): void {
+    if (authz.registration === "disabled") return json(res, 404, { error: "not_found" });
+    let meta: { redirect_uris?: unknown };
+    try {
+      meta = JSON.parse(body) as { redirect_uris?: unknown };
+    } catch {
+      return json(res, 400, { error: "invalid_client_metadata" });
+    }
+    const uris = Array.isArray(meta.redirect_uris) ? meta.redirect_uris.filter((u): u is string => typeof u === "string") : [];
+    if (uris.length === 0) return json(res, 400, { error: "invalid_redirect_uri" });
+    if (authz.registration === "strict" && !uris.every(safeRedirect)) return json(res, 400, { error: "invalid_redirect_uri" });
+    const clientId = newToken("client");
+    const managementToken = newToken("rat");
+    clients.set(clientId, { redirectUris: uris, managementToken });
+    const body201: Record<string, unknown> = { client_id: clientId, redirect_uris: uris, token_endpoint_auth_method: "none" };
+    if (authz.management) {
+      body201["registration_client_uri"] = `${base}/register/${clientId}`;
+      body201["registration_access_token"] = managementToken;
+    }
+    return json(res, 201, body201);
+  }
+
+  function manageEndpoint(req: IncomingMessage, clientId: string, res: ServerResponse): void {
+    const c = clients.get(clientId);
+    if (!c || req.headers.authorization !== `Bearer ${c.managementToken}`) return json(res, 401, { error: "invalid_token" });
+    if (req.method === "DELETE") {
+      clients.delete(clientId);
+      res.writeHead(204);
+      res.end();
+      return;
+    }
+    return json(res, 405, { error: "method_not_allowed" });
+  }
+
+  function authorizeEndpoint(url: URL, res: ServerResponse): void {
+    const q = url.searchParams;
+    const client = clients.get(q.get("client_id") ?? "");
+    const redirectUri = q.get("redirect_uri") ?? "";
+    const login = (): void => {
+      res.writeHead(302, { location: `${base}/login?session=${randomBytes(4).toString("hex")}` });
+      res.end();
+    };
+    if (authz.match === "deferred") return login();
+    if (!client) return json(res, 400, { error: "invalid_client" });
+    const ok =
+      authz.match === "any" ||
+      (authz.match === "exact" && client.redirectUris.includes(redirectUri)) ||
+      (authz.match === "prefix" && client.redirectUris.some((r) => redirectUri.startsWith(r)));
+    if (!ok) return json(res, 400, { error: "invalid_request", error_description: "redirect_uri mismatch" });
+    if (q.get("code_challenge_method") !== "S256" || !q.get("code_challenge")) return json(res, 400, { error: "invalid_request" });
+    if (authz.noSession === "login") return login();
+    const target = new URL(redirectUri);
+    target.searchParams.set("error", "login_required");
+    target.searchParams.set("state", q.get("state") ?? "");
+    res.writeHead(302, { location: target.toString() });
+    res.end();
+  }
+
   const server: Server = createServer((req: IncomingMessage, res: ServerResponse) => {
     const path = new URL(req.url ?? "/", "http://fixture").pathname;
     requests.push({ method: req.method ?? "GET", path });
@@ -143,7 +242,7 @@ export async function startFixture(options: FixtureOptions = {}): Promise<Fixtur
           issuer: base,
           authorization_endpoint: `${base}/authorize`,
           token_endpoint: `${base}/token`,
-          registration_endpoint: `${base}/register`,
+          ...(authz.registration === "disabled" ? {} : { registration_endpoint: `${base}/register` }),
           response_types_supported: ["code"],
           grant_types_supported: ["authorization_code", "refresh_token"],
           code_challenge_methods_supported: ["S256"],
@@ -151,6 +250,9 @@ export async function startFixture(options: FixtureOptions = {}): Promise<Fixtur
         });
       }
       if (path === "/token" && req.method === "POST") return tokenEndpoint(req, body, res);
+      if (path === "/register" && req.method === "POST") return registerEndpoint(body, res);
+      if (path.startsWith("/register/")) return manageEndpoint(req, path.slice("/register/".length), res);
+      if (path === "/authorize" && req.method === "GET") return authorizeEndpoint(new URL(req.url ?? "/", base), res);
       if (path === "/.well-known/mcp-authprobe.txt" && opts.ownershipFile !== null) {
         res.writeHead(200, { "content-type": "text/plain" });
         return res.end(opts.ownershipFile);
@@ -159,9 +261,10 @@ export async function startFixture(options: FixtureOptions = {}): Promise<Fixtur
     });
   });
 
-  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const host = options.host ?? "127.0.0.1";
+  await new Promise<void>((resolve) => server.listen(0, host, resolve));
   const { port } = server.address() as AddressInfo;
-  base = `http://127.0.0.1:${port}`;
+  base = `http://${host.includes(":") ? `[${host}]` : host}:${port}`;
 
   return {
     baseUrl: base,
@@ -173,6 +276,7 @@ export async function startFixture(options: FixtureOptions = {}): Promise<Fixtur
       return token;
     },
     tokenRequests: () => tokenCount,
+    registeredClients: () => [...clients.keys()],
     close: () =>
       new Promise<void>((resolve, reject) => {
         server.closeAllConnections();

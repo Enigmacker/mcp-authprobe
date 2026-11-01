@@ -9,7 +9,7 @@ Passive scanners read what a remote [Model Context Protocol](https://modelcontex
 
 `mcp-authprobe` runs those active checks, against servers whose ownership you have proven, and reports the results as JSON, SARIF and Markdown.
 
-> **Status: early development (0.1.0-dev).** Available today: ownership proof, OAuth discovery, and the refresh token checks (rotation, replay, family revocation). The other active families are documented and being implemented; see [Roadmap](#roadmap).
+> **Status: early development (0.1.0-dev).** Available today: ownership proof, OAuth discovery, the refresh token checks (rotation, replay, family revocation) and the redirect URI checks (unregistered URI, exact matching, registration policy). The other active families are documented and being implemented; see [Roadmap](#roadmap).
 
 > **Only test servers you own or are explicitly authorized to test.** Active checks change state on the target. The tool enforces an ownership proof before running them, but responsibility stays with the operator.
 
@@ -20,6 +20,7 @@ Passive scanners read what a remote [Model Context Protocol](https://modelcontex
 - [Quick start](#quick-start)
 - [Ownership proof](#ownership-proof)
 - [Refresh token checks](#refresh-token-checks)
+- [Redirect URI checks](#redirect-uri-checks)
 - [What it checks](#what-it-checks)
 - [Reports and exit codes](#reports-and-exit-codes)
 - [CI usage](#ci-usage)
@@ -140,6 +141,26 @@ Important:
 - A throttled or unexpected response is reported as `error` (inconclusive), never as a pass.
 - Token values never appear in output or reports; evidence only shows status codes and OAuth error codes.
 
+## Redirect URI checks
+
+If an authorization server redirects to a URI the client never registered, authorization codes can end up with an attacker. OAuth 2.1 requires exact string matching. These checks need **dynamic client registration** on your server; no test grant and no login are required.
+
+How they work:
+
+1. The scanner registers a temporary client whose only redirect URI is `https://client.mcp-authprobe.invalid/callback`.
+2. It sends a **baseline** authorization request with that registered URI (PKCE S256, random `state`, RFC 8707 `resource`), then one request per variant, and compares the answers. Redirects are never followed.
+3. It deletes every client it created (RFC 7592). Clients it could not delete are listed in the report, named `mcp-authprobe test client (safe to delete)`.
+
+| Check | What is sent | Fails when |
+| --- | --- | --- |
+| `MAP-RDR01` | A completely different host | The server redirects to it |
+| `MAP-RDR02` | 7 near misses: extra path segment, trailing slash, added query, different port, subdomain, userinfo trick, `http` downgrade | The server redirects to any of them |
+| `MAP-RDR04` | Registrations with plain HTTP on a non-loopback host, `javascript:`, `data:`, and a fragment | The registration endpoint accepts any of them |
+
+Safety by design: every host used lives under the reserved `.invalid` top-level domain ([RFC 2606](https://www.rfc-editor.org/rfc/rfc2606)), which can never resolve. Even a vulnerable server could not deliver a code anywhere.
+
+Reading the results: a variant answered exactly like the baseline (for example both redirected to the login page) is reported as **inconclusive** (`error`), never as a pass, because some servers only check `redirect_uri` after the user logs in. `MAP-RDR03` (token endpoint enforcement) needs an authorization code, hence a login, and will come with the interactive login feature.
+
 ## What it checks
 
 `mcp-authprobe checks list` prints the catalogue, and `mcp-authprobe checks show <ID>` explains a check: why it matters, how to fix it, and references. IDs are stable and never reused.
@@ -150,10 +171,10 @@ Important:
 | `MAP-RTK01` | active | available | Refresh tokens for public clients are rotated |
 | `MAP-RTK02` | active | available | A rotated refresh token cannot be replayed |
 | `MAP-RTK03` | active | available | Refresh token replay revokes the token family |
-| `MAP-RDR01` | active | planned | Unregistered `redirect_uri` is refused at the authorization endpoint |
-| `MAP-RDR02` | active | planned | `redirect_uri` matching is exact, not prefix or pattern based |
+| `MAP-RDR01` | active | available | Unregistered `redirect_uri` is refused at the authorization endpoint |
+| `MAP-RDR02` | active | available | `redirect_uri` matching is exact, not prefix or pattern based |
 | `MAP-RDR03` | active | planned | Token endpoint enforces the `redirect_uri` used at authorization |
-| `MAP-RDR04` | active | planned | Dynamic client registration refuses unsafe redirect URIs |
+| `MAP-RDR04` | active | available | Dynamic client registration refuses unsafe redirect URIs |
 | `MAP-THR01` | active | planned | Repeated failed client authentication is throttled (small, capped number of attempts) |
 | `MAP-CSR01` | active | planned | Consent decision is protected against CSRF |
 
@@ -214,7 +235,8 @@ The scanner talks to servers that may be hostile, and it may be driven by an AI 
 **0.1.0**
 - ~~Refresh token checks (RTK01-03)~~ done, from a test grant file.
 - Optional one-time interactive login to your own server to create the test grant.
-- Redirect URI checks (RDR01-04).
+- ~~Redirect URI checks (RDR01, RDR02, RDR04)~~ done.
+- `MAP-RDR03`, once the interactive login exists.
 - Throttling check (THR01), capped at a small number of attempts against a dedicated test client.
 - MCP server mode (stdio), so the same engine can be used from an MCP client.
 - npm release.

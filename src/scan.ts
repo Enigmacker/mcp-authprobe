@@ -1,4 +1,5 @@
 import { CATALOGUE } from "./checks/catalogue.js";
+import { runRedirectUriChecks } from "./checks/redirect-uris.js";
 import { runRefreshTokenChecks } from "./checks/refresh-tokens.js";
 import type { TestGrant } from "./credentials.js";
 import { discover, type DiscoveryResult } from "./discovery.js";
@@ -79,6 +80,24 @@ async function runRefreshFamily(target: string, d: DiscoveryResult | null, http:
   return runRefreshTokenChecks({ http, target, tokenEndpoint, grant: options.grant });
 }
 
+async function runRedirectFamily(target: string, d: DiscoveryResult | null, http: HttpClient): Promise<Finding[]> {
+  const meta = d?.as?.metadata;
+  if (!meta) {
+    const defs = ["MAP-RDR01", "MAP-RDR02", "MAP-RDR04"].map((id) => CATALOGUE.find((c) => c.id === id)).filter((c): c is CheckDefinition => c !== undefined);
+    return defs.map((def) => finding(def, target, "skipped", "No authorization server metadata discovered."));
+  }
+  const scopes = d?.prm?.metadata.scopes_supported;
+  const ctx: Parameters<typeof runRedirectUriChecks>[0] = {
+    http,
+    target,
+    authorizationEndpoint: typeof meta.authorization_endpoint === "string" ? meta.authorization_endpoint : null,
+    registrationEndpoint: typeof meta.registration_endpoint === "string" ? meta.registration_endpoint : null,
+    resource: d?.prm?.metadata.resource ?? target,
+  };
+  if (Array.isArray(scopes) && scopes.length > 0) ctx.scope = scopes.join(" ");
+  return runRedirectUriChecks(ctx);
+}
+
 export async function scan(mcpUrl: string, options: ScanOptions = {}): Promise<ScanReport> {
   const startedAt = new Date().toISOString();
   const target = new URL(mcpUrl).toString();
@@ -120,6 +139,7 @@ export async function scan(mcpUrl: string, options: ScanOptions = {}): Promise<S
       }
     } else {
       findings.push(...(await runRefreshFamily(target, discovery, http, options)));
+      findings.push(...(await runRedirectFamily(target, discovery, http)));
       for (const def of active.filter((c) => c.availability === "planned")) {
         findings.push(finding(def, target, "skipped", "Not implemented in this version yet."));
       }

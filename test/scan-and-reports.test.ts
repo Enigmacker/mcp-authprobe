@@ -1,5 +1,5 @@
 import { mkdtempSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { networkInterfaces, tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { CATALOGUE } from "../src/checks/catalogue.js";
@@ -73,11 +73,28 @@ describe("scan", () => {
     expect(fixture.tokenRequests()).toBe(0);
   });
 
-  it("never sends a token request when ownership is not proven", async () => {
-    fixture = await startFixture();
+  it("runs the redirect URI checks on a lab and leaves no client behind", async () => {
+    fixture = await startFixture({ authorization: { match: "prefix", noSession: "error-redirect" } });
+    const report = await scan(fixture.mcpUrl, { allowPrivate: true });
+    const status = (id: string) => report.findings.find((f) => f.checkId === id)?.status;
+    expect([status("MAP-RDR01"), status("MAP-RDR02"), status("MAP-RDR04")]).toEqual(["pass", "fail", "pass"]);
+    expect(fixture.registeredClients()).toEqual([]);
+  });
+
+  // A non-loopback address of this machine: reachable with --allow-private,
+  // but not exempt from the ownership proof.
+  const lanAddress = Object.values(networkInterfaces())
+    .flat()
+    .find((a) => a && a.family === "IPv4" && !a.internal)?.address;
+
+  it.skipIf(!lanAddress)("sends no active request when the target is reachable but ownership is not proven", async () => {
+    fixture = await startFixture({ host: lanAddress as string });
     const grant = { clientId: "test-client", refreshToken: fixture.issueRefreshToken(), authMethod: "none" as const };
-    await scan(fixture.mcpUrl, { grant });
+    const report = await scan(fixture.mcpUrl, { allowPrivate: true, grant, resolveTxtRecords: async () => [] });
+    expect(report.findings.find((f) => f.checkId === "MAP-DSC01")?.status).toBe("pass");
+    expect(report.ownership.verified).toBe(false);
     expect(fixture.tokenRequests()).toBe(0);
+    expect(fixture.requests.filter((r) => ["/register", "/authorize", "/token"].includes(r.path))).toEqual([]);
   });
 
   it("asks for proof on the authorization server host too", () => {

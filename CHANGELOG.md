@@ -15,4 +15,5 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - Reports: terminal table, JSON (`mcp-authprobe/report/v1`), SARIF 2.1.0 and Markdown, with redaction of token-shaped values and neutralization of control, bidi and invisible characters.
 - CLI: `scan`, `ownership init|proof|verify`, `checks list|show`, `--fail-on`, exit codes 0/1/2/3.
 - Refresh token checks `MAP-RTK01` (rotation), `MAP-RTK02` (replay rejected) and `MAP-RTK03` (family revocation on reuse), in at most three token requests, from a test grant passed with `--credentials-file` (public clients, `client_secret_post`, `client_secret_basic`). Inconclusive outcomes, such as throttling, are reported as errors, never as passes.
-- Local fixture server with a stateful token endpoint and test suite; GitHub Actions CI.
+- Redirect URI checks `MAP-RDR01` (unregistered URI refused), `MAP-RDR02` (exact matching, 7 near-miss variants) and `MAP-RDR04` (registration refuses unsafe redirect URIs). They register a temporary client, compare each answer with a baseline request, report deferred validation as inconclusive, use only the reserved `.invalid` domain, and delete every client they created (RFC 7592).
+- Local fixture server with a stateful token endpoint, dynamic registration and an authorization endpoint and test suite; GitHub Actions CI.
