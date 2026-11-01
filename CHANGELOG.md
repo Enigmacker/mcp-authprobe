@@ -14,4 +14,5 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - Check catalogue with stable `MAP-` identifiers: `MAP-DSC01` available; refresh token, redirect URI, throttling and consent CSRF families documented as planned.
 - Reports: terminal table, JSON (`mcp-authprobe/report/v1`), SARIF 2.1.0 and Markdown, with redaction of token-shaped values and neutralization of control, bidi and invisible characters.
 - CLI: `scan`, `ownership init|proof|verify`, `checks list|show`, `--fail-on`, exit codes 0/1/2/3.
-- Local fixture server and test suite; GitHub Actions CI.
+- Refresh token checks `MAP-RTK01` (rotation), `MAP-RTK02` (replay rejected) and `MAP-RTK03` (family revocation on reuse), in at most three token requests, from a test grant passed with `--credentials-file` (public clients, `client_secret_post`, `client_secret_basic`). Inconclusive outcomes, such as throttling, are reported as errors, never as passes.
+- Local fixture server with a stateful token endpoint and test suite; GitHub Actions CI.

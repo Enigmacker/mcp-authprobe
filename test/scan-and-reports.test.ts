@@ -1,3 +1,6 @@
+import { mkdtempSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { CATALOGUE } from "../src/checks/catalogue.js";
 import { main, EXIT } from "../src/cli.js";
@@ -51,6 +54,30 @@ describe("scan", () => {
     const dsc = report.findings.find((f) => f.checkId === "MAP-DSC01");
     expect(dsc?.status).toBe("fail");
     expect(dsc?.message).toMatch(/Protected Resource Metadata/);
+  });
+
+  it("runs the refresh token checks when a test grant is supplied", async () => {
+    fixture = await startFixture({ tokens: { revokeFamily: false } });
+    const grant = { clientId: "test-client", refreshToken: fixture.issueRefreshToken(), authMethod: "none" as const };
+    const report = await scan(fixture.mcpUrl, { allowPrivate: true, grant });
+    const status = (id: string) => report.findings.find((f) => f.checkId === id)?.status;
+    expect([status("MAP-RTK01"), status("MAP-RTK02"), status("MAP-RTK03")]).toEqual(["pass", "pass", "fail"]);
+  });
+
+  it("skips the refresh token checks without a test grant, sending no token request", async () => {
+    fixture = await startFixture();
+    const report = await scan(fixture.mcpUrl, { allowPrivate: true });
+    const rtk = report.findings.filter((f) => f.checkId.startsWith("MAP-RTK"));
+    expect(rtk).toHaveLength(3);
+    expect(rtk.every((f) => f.status === "skipped" && /credentials-file/.test(f.message))).toBe(true);
+    expect(fixture.tokenRequests()).toBe(0);
+  });
+
+  it("never sends a token request when ownership is not proven", async () => {
+    fixture = await startFixture();
+    const grant = { clientId: "test-client", refreshToken: fixture.issueRefreshToken(), authMethod: "none" as const };
+    await scan(fixture.mcpUrl, { grant });
+    expect(fixture.tokenRequests()).toBe(0);
   });
 
   it("asks for proof on the authorization server host too", () => {
@@ -111,5 +138,17 @@ describe("cli", () => {
   it("exits 0 on a clean lab scan", async () => {
     fixture = await startFixture();
     expect(await main(["scan", fixture.mcpUrl, "--allow-private"])).toBe(EXIT.ok);
+  });
+
+  it("exits 1 when a refresh token can be replayed", async () => {
+    fixture = await startFixture({ tokens: { rejectReplay: false } });
+    const dir = mkdtempSync(join(tmpdir(), "map-cli-"));
+    const creds = join(dir, "creds.json");
+    writeFileSync(creds, JSON.stringify({ client_id: "test-client", refresh_token: fixture.issueRefreshToken() }), { mode: 0o600 });
+    expect(await main(["scan", fixture.mcpUrl, "--allow-private", "--credentials-file", creds])).toBe(EXIT.findings);
+  });
+
+  it("rejects an unreadable credentials file as a usage error", async () => {
+    expect(await main(["scan", "https://x.example/mcp", "--credentials-file", "/nonexistent/creds.json"])).toBe(EXIT.usage);
   });
 });

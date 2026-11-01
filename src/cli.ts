@@ -3,6 +3,7 @@ import { readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
 import { CATALOGUE, getCheck } from "./checks/catalogue.js";
+import { loadGrant } from "./credentials.js";
 import { HttpClient } from "./net/http.js";
 import { DNS_LABEL, generateSecret, proofFor, verifyOwnership, WELL_KNOWN_PATH } from "./ownership.js";
 import { toJson } from "./report/json.js";
@@ -36,6 +37,10 @@ Scan options:
   --allow-private       Allow loopback/private addresses (local labs only)
   --timeout <ms>        Per-request timeout (default: 10000)
   --secret-file <file>  Read the ownership secret from a file instead of ${SECRET_ENV}
+  --credentials-file <file>
+                        Test grant (JSON: client_id, refresh_token, optional
+                        client_secret) for the refresh token checks. The grant
+                        is consumed: use a dedicated test account.
 
 The ownership secret is read from ${SECRET_ENV} or --secret-file, never from
 the command line, so it does not end up in shell history or process lists.
@@ -72,6 +77,7 @@ export async function main(argv: string[]): Promise<number> {
       "allow-private": { type: "boolean", default: false },
       timeout: { type: "string" },
       "secret-file": { type: "string" },
+      "credentials-file": { type: "string" },
       help: { type: "boolean", short: "h", default: false },
       version: { type: "boolean", short: "v", default: false },
     },
@@ -174,6 +180,16 @@ export async function main(argv: string[]): Promise<number> {
     const secret = readSecret(values["secret-file"]);
     if (secret) options.secret = secret;
     if (timeoutMs !== undefined) options.timeoutMs = timeoutMs;
+    if (values["credentials-file"]) {
+      try {
+        const loaded = loadGrant(values["credentials-file"]);
+        for (const w of loaded.warnings) err(`warning: ${w}\n`);
+        options.grant = loaded.grant;
+      } catch (e) {
+        err(`${(e as Error).message}\n`);
+        return EXIT.usage;
+      }
+    }
 
     let report;
     try {

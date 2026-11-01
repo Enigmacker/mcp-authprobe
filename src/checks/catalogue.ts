@@ -50,7 +50,7 @@ export const CATALOGUE: readonly CheckDefinition[] = [
     title: "Refresh tokens for public clients are rotated",
     severity: "high",
     active: true,
-    availability: "planned",
+    availability: "available",
     rationale:
       "MCP clients are usually public clients. For them, refresh tokens must be sender-constrained or rotated on each use, so that a leaked refresh token has a short useful life.",
     remediation:
@@ -63,7 +63,7 @@ export const CATALOGUE: readonly CheckDefinition[] = [
     title: "A rotated refresh token cannot be replayed",
     severity: "critical",
     active: true,
-    availability: "planned",
+    availability: "available",
     rationale:
       "Rotation only helps if the previous refresh token is rejected afterwards. Accepting it lets an attacker who copied it keep minting access tokens.",
     remediation: "Reject any refresh token that has already been exchanged.",
@@ -75,7 +75,7 @@ export const CATALOGUE: readonly CheckDefinition[] = [
     title: "Refresh token replay revokes the token family",
     severity: "high",
     active: true,
-    availability: "planned",
+    availability: "available",
     rationale:
       "When an already-used refresh token is presented, the server cannot tell the legitimate client from an attacker. Revoking every token descended from the same grant contains the compromise.",
     remediation: "On detected reuse, revoke the whole refresh token family and the related access tokens.",

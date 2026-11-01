@@ -9,7 +9,7 @@ Passive scanners read what a remote [Model Context Protocol](https://modelcontex
 
 `mcp-authprobe` runs those active checks, against servers whose ownership you have proven, and reports the results as JSON, SARIF and Markdown.
 
-> **Status: early development (0.1.0-dev).** The foundations are in place (hardened HTTP client, ownership proof, OAuth discovery, reports, CLI). The active check families listed below are documented and being implemented; see [Roadmap](#roadmap).
+> **Status: early development (0.1.0-dev).** Available today: ownership proof, OAuth discovery, and the refresh token checks (rotation, replay, family revocation). The other active families are documented and being implemented; see [Roadmap](#roadmap).
 
 > **Only test servers you own or are explicitly authorized to test.** Active checks change state on the target. The tool enforces an ownership proof before running them, but responsibility stays with the operator.
 
@@ -19,6 +19,7 @@ Passive scanners read what a remote [Model Context Protocol](https://modelcontex
 - [Install](#install)
 - [Quick start](#quick-start)
 - [Ownership proof](#ownership-proof)
+- [Refresh token checks](#refresh-token-checks)
 - [What it checks](#what-it-checks)
 - [Reports and exit codes](#reports-and-exit-codes)
 - [CI usage](#ci-usage)
@@ -66,6 +67,9 @@ mcp-authprobe ownership verify mcp.example.com
 
 # 4. Scan
 mcp-authprobe scan https://mcp.example.com/mcp --sarif results.sarif --markdown summary.md
+
+# 5. Add a test grant to run the refresh token checks (see below)
+mcp-authprobe scan https://mcp.example.com/mcp --credentials-file ./test-grant.json
 ```
 
 Without a valid proof the scan still runs discovery (the same read-only requests any MCP client sends before logging in), and every active check is reported as `skipped`.
@@ -104,6 +108,38 @@ Design choices:
 
 You can remove the proof as soon as you are done testing.
 
+## Refresh token checks
+
+MCP clients are usually public clients, so OAuth 2.1 requires their refresh tokens to be rotated, and RFC 9700 recommends revoking the whole token family when an old one is reused. These properties cannot be read from metadata; they have to be exercised.
+
+The checks need a **test grant**: a client and a refresh token obtained by logging in to your own server with a **dedicated test account**. Save it to a file readable only by you (`chmod 600`):
+
+```json
+{
+  "client_id": "your-test-client-id",
+  "refresh_token": "the-refresh-token",
+  "client_secret": "only-for-confidential-clients",
+  "token_endpoint_auth_method": "none"
+}
+```
+
+`token_endpoint_auth_method` is `none` (default for public clients), `client_secret_post` (default when a secret is present) or `client_secret_basic`.
+
+The scan sends **at most three** `refresh_token` requests to the token endpoint found by discovery:
+
+| Step | Request | Expected on a compliant server | Check |
+| --- | --- | --- | --- |
+| 1 | Refresh with the supplied token | New access token **and a new refresh token** | `MAP-RTK01` |
+| 2 | Refresh again with the token from step 1's input (already used) | Rejected, typically `invalid_grant` | `MAP-RTK02` |
+| 3 | Refresh with the newest token (from step 1's output) | Rejected: reuse revoked the whole family | `MAP-RTK03` |
+
+Important:
+
+- **The grant is consumed.** On a compliant server, step 3 revokes it. Never use a grant you still need.
+- If tokens are not rotated, `MAP-RTK01` fails and the two replay checks are reported as not applicable.
+- A throttled or unexpected response is reported as `error` (inconclusive), never as a pass.
+- Token values never appear in output or reports; evidence only shows status codes and OAuth error codes.
+
 ## What it checks
 
 `mcp-authprobe checks list` prints the catalogue, and `mcp-authprobe checks show <ID>` explains a check: why it matters, how to fix it, and references. IDs are stable and never reused.
@@ -111,9 +147,9 @@ You can remove the proof as soon as you are done testing.
 | ID | Mode | Status | Check |
 | --- | --- | --- | --- |
 | `MAP-DSC01` | passive | available | Authorization endpoints are discoverable (401 challenge, RFC 9728, RFC 8414) |
-| `MAP-RTK01` | active | planned | Refresh tokens for public clients are rotated |
-| `MAP-RTK02` | active | planned | A rotated refresh token cannot be replayed |
-| `MAP-RTK03` | active | planned | Refresh token replay revokes the token family |
+| `MAP-RTK01` | active | available | Refresh tokens for public clients are rotated |
+| `MAP-RTK02` | active | available | A rotated refresh token cannot be replayed |
+| `MAP-RTK03` | active | available | Refresh token replay revokes the token family |
 | `MAP-RDR01` | active | planned | Unregistered `redirect_uri` is refused at the authorization endpoint |
 | `MAP-RDR02` | active | planned | `redirect_uri` matching is exact, not prefix or pattern based |
 | `MAP-RDR03` | active | planned | Token endpoint enforces the `redirect_uri` used at authorization |
@@ -131,6 +167,7 @@ Families: **DSC** discovery, **RTK** refresh tokens, **RDR** redirect URIs, **TH
 | `--json <file>` | Full report, schema `mcp-authprobe/report/v1` |
 | `--sarif <file>` | SARIF 2.1.0, for GitHub code scanning; only failing checks become results |
 | `--markdown <file>` | Table for a pull request comment or a CI job summary |
+| `--credentials-file <file>` | Test grant for the refresh token checks (input) |
 
 | Exit code | Meaning |
 | --- | --- |
@@ -175,7 +212,8 @@ The scanner talks to servers that may be hostile, and it may be driven by an AI 
 ## Roadmap
 
 **0.1.0**
-- Refresh token checks (RTK01-03), with a one-time interactive login to your own server.
+- ~~Refresh token checks (RTK01-03)~~ done, from a test grant file.
+- Optional one-time interactive login to your own server to create the test grant.
 - Redirect URI checks (RDR01-04).
 - Throttling check (THR01), capped at a small number of attempts against a dedicated test client.
 - MCP server mode (stdio), so the same engine can be used from an MCP client.

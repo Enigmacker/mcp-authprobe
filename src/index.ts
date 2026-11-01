@@ -1,4 +1,7 @@
 export { CATALOGUE, getCheck } from "./checks/catalogue.js";
+export { runRefreshTokenChecks } from "./checks/refresh-tokens.js";
+export { loadGrant, parseGrant } from "./credentials.js";
+export type { TestGrant, TokenEndpointAuthMethod } from "./credentials.js";
 export { discover } from "./discovery.js";
 export type { DiscoveryResult, ProtectedResourceMetadata, AuthorizationServerMetadata } from "./discovery.js";
 export { HttpClient, BlockedAddressError } from "./net/http.js";

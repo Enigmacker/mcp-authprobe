@@ -1,4 +1,6 @@
 import { CATALOGUE } from "./checks/catalogue.js";
+import { runRefreshTokenChecks } from "./checks/refresh-tokens.js";
+import type { TestGrant } from "./credentials.js";
 import { discover, type DiscoveryResult } from "./discovery.js";
 import { HttpClient } from "./net/http.js";
 import { verifyOwnership, type OwnershipResult, type VerifyOptions } from "./ownership.js";
@@ -11,6 +13,8 @@ export interface ScanOptions {
   secret?: string;
   allowPrivate?: boolean;
   timeoutMs?: number;
+  /** Test grant for the refresh token checks. It is consumed by the scan. */
+  grant?: TestGrant;
   /** Test hooks. */
   resolveTxtRecords?: VerifyOptions["resolveTxtRecords"];
   wellKnownBaseUrl?: string;
@@ -59,6 +63,22 @@ export function hostsToVerify(mcpUrl: string, d: DiscoveryResult | null): string
   return [...hosts];
 }
 
+const RTK_IDS = ["MAP-RTK01", "MAP-RTK02", "MAP-RTK03"];
+
+async function runRefreshFamily(target: string, d: DiscoveryResult | null, http: HttpClient, options: ScanOptions): Promise<Finding[]> {
+  const defs = RTK_IDS.map((id) => CATALOGUE.find((c) => c.id === id)).filter((c): c is CheckDefinition => c !== undefined);
+  const all = (status: Finding["status"], message: string): Finding[] => defs.map((def) => finding(def, target, status, message));
+
+  const tokenEndpoint = d?.as?.metadata.token_endpoint;
+  if (typeof tokenEndpoint !== "string") return all("skipped", "No token endpoint discovered.");
+  const grants = d?.as?.metadata.grant_types_supported;
+  if (Array.isArray(grants) && !grants.includes("refresh_token")) {
+    return all("not_applicable", "The authorization server does not advertise the refresh_token grant.");
+  }
+  if (!options.grant) return all("skipped", "Needs a test grant: pass --credentials-file with a refresh token from a dedicated test account.");
+  return runRefreshTokenChecks({ http, target, tokenEndpoint, grant: options.grant });
+}
+
 export async function scan(mcpUrl: string, options: ScanOptions = {}): Promise<ScanReport> {
   const startedAt = new Date().toISOString();
   const target = new URL(mcpUrl).toString();
@@ -93,10 +113,14 @@ export async function scan(mcpUrl: string, options: ScanOptions = {}): Promise<S
       detail: results.map((r) => `${r.host}: ${r.detail}`).join(" "),
     };
 
-    for (const def of CATALOGUE.filter((c) => c.active)) {
-      if (!verified) {
+    const active = CATALOGUE.filter((c) => c.active);
+    if (!verified) {
+      for (const def of active) {
         findings.push(finding(def, target, "skipped", "Ownership of every contacted host is not proven; active check not run."));
-      } else if (def.availability === "planned") {
+      }
+    } else {
+      findings.push(...(await runRefreshFamily(target, discovery, http, options)));
+      for (const def of active.filter((c) => c.availability === "planned")) {
         findings.push(finding(def, target, "skipped", "Not implemented in this version yet."));
       }
     }
