@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-11-01
+
 ### Added
 
 - `MAP-CSR01` (consent CSRF) with the new `consent-check` command: it opens the installed Chrome or Edge through the optional `playwright-core` peer dependency, lets the user log in with a test account and stop on the consent page, reads the consent form and cookie attributes, then replays at most three submissions with the session cookies and a foreign Origin (without the anti-CSRF field, with it altered, untouched). A pass requires a control submission (the untouched form from the page's own Origin) to be accepted, so a badly rebuilt request is reported as inconclusive, never as a pass. It recognises approve controls in several languages and "Don't allow" style labels, honours `formaction`, `<base>`, required checkboxes, selects and textareas, follows one redirect on a proven host to detect resumed grants, alters tokens within their alphabet, reads the raw SameSite attribute, matches cookies like a browser, and stops cleanly on Ctrl-C, browser close or timeout. Requires ownership proof, launches the browser before registering anything, only posts to proven hosts, owns its loopback redirect URI, never reports cookie or token values, and deletes its temporary client.
@@ -43,6 +45,7 @@ First release.
 - Hardening from an independent review before release: HTTPS is required for every request outside loopback/private labs; rate limits and server errors make redirect URI, registration and throttling checks inconclusive instead of passing; test grants record their target and token endpoint and are never used elsewhere (and must name their target in MCP mode); loopback targets need a proof in MCP mode unless listed in `MCP_AUTHPROBE_LAB_ORIGINS`; `login` output is neutralized; more IPv6 transition ranges are refused; a malformed issuer no longer aborts discovery.
 - Local fixture server with a stateful token endpoint, dynamic registration and an authorization endpoint and test suite; GitHub Actions CI.
 
-[Unreleased]: https://github.com/Enigmacker/mcp-authprobe/compare/v0.1.1...HEAD
+[Unreleased]: https://github.com/Enigmacker/mcp-authprobe/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/Enigmacker/mcp-authprobe/compare/v0.1.1...v0.2.0
 [0.1.1]: https://github.com/Enigmacker/mcp-authprobe/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/Enigmacker/mcp-authprobe/releases/tag/v0.1.0
