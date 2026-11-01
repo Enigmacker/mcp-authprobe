@@ -133,14 +133,14 @@ export const CATALOGUE: readonly CheckDefinition[] = [
   {
     id: "MAP-THR01",
     family: "THR",
-    title: "Repeated failed client authentication is throttled",
+    title: "Repeated failed token requests are throttled",
     severity: "medium",
     active: true,
-    availability: "planned",
+    availability: "available",
     rationale:
-      "Without throttling, credentials and codes can be guessed at line speed. The check sends a small, capped number of failing requests with the operator's own test client and looks for rate limiting.",
-    remediation: "Rate-limit failed attempts per client and per source, and answer with 429 and Retry-After.",
-    references: [RFC9700],
+      "Without throttling, refresh tokens, authorization codes and client secrets can be guessed at line speed. The check sends a small, capped number of token requests carrying random, invalid refresh tokens for the operator's own test client, and looks for rate limiting. It never touches user passwords or login forms.",
+    remediation: "Rate-limit failed token requests per client and per source address, and answer with HTTP 429 and a Retry-After header.",
+    references: [RFC9700, { title: "RFC 6585 - Additional HTTP Status Codes (429)", url: "https://www.rfc-editor.org/rfc/rfc6585" }],
   },
   {
     id: "MAP-CSR01",

@@ -9,7 +9,7 @@ Passive scanners read what a remote [Model Context Protocol](https://modelcontex
 
 `mcp-authprobe` runs those active checks, against servers whose ownership you have proven, and reports the results as JSON, SARIF and Markdown.
 
-> **Status: early development (0.1.0-dev).** Available today: ownership proof, OAuth discovery, the refresh token checks (rotation, replay, family revocation) the redirect URI checks (unregistered URI, exact matching, registration policy), and an MCP server mode so an AI assistant can run the audit, and an interactive `login` that creates the test grant for you. The other active families are documented and being implemented; see [Roadmap](#roadmap).
+> **Status: early development (0.1.0-dev).** Available today: ownership proof, OAuth discovery, the refresh token checks (rotation, replay, family revocation) the redirect URI checks (unregistered URI, exact matching, registration policy), the throttling check, and an MCP server mode so an AI assistant can run the audit, and an interactive `login` that creates the test grant for you. The other active families are documented and being implemented; see [Roadmap](#roadmap).
 
 > **Only test servers you own or are explicitly authorized to test.** Active checks change state on the target. The tool enforces an ownership proof before running them, but responsibility stays with the operator.
 
@@ -22,6 +22,7 @@ Passive scanners read what a remote [Model Context Protocol](https://modelcontex
 - [Refresh token checks](#refresh-token-checks)
 - [Interactive login](#interactive-login)
 - [Redirect URI checks](#redirect-uri-checks)
+- [Throttling check](#throttling-check)
 - [Use it from an MCP client](#use-it-from-an-mcp-client)
 - [What it checks](#what-it-checks)
 - [Reports and exit codes](#reports-and-exit-codes)
@@ -187,6 +188,18 @@ Safety by design: every host used lives under the reserved `.invalid` top-level 
 
 Reading the results: a variant answered exactly like the baseline (for example both redirected to the login page) is reported as **inconclusive** (`error`), never as a pass, because some servers only check `redirect_uri` after the user logs in. `MAP-RDR03` (token endpoint enforcement) is observed during [interactive login](#interactive-login).
 
+## Throttling check
+
+Without rate limiting, refresh tokens, authorization codes and client secrets can be guessed at line speed. `MAP-THR01` checks that the token endpoint slows down repeated failures, with strict bounds:
+
+- It sends **10** token requests by default (`--throttle-attempts`, between **5 and 20**, hard-capped), **one at a time**.
+- Each request carries a **freshly generated random refresh token** that cannot be valid. Nothing is guessed, and **user passwords and login forms are never involved**.
+- It uses your test client when a grant is supplied (your real refresh token is not sent), otherwise a temporary client that is deleted afterwards.
+- It stops at the first sign of throttling: HTTP 429, a `Retry-After` header, or an OAuth `slow_down` / `temporarily_unavailable` error.
+- It runs **last** in a scan, so a throttled token endpoint cannot disturb the other checks.
+
+A failure means no throttling was seen within the cap. Your limit may simply be higher than 20; the finding asks you to confirm that one exists.
+
 ## Use it from an MCP client
 
 `mcp-authprobe mcp` runs the same engine as an MCP server over stdio, so an AI assistant in any MCP client can audit your servers for you.
@@ -246,7 +259,7 @@ The server is built so that the assistant, or a prompt injection reaching it, ca
 | `MAP-RDR02` | active | available | `redirect_uri` matching is exact, not prefix or pattern based |
 | `MAP-RDR03` | active | available (via `login`) | Token endpoint enforces the `redirect_uri` used at authorization |
 | `MAP-RDR04` | active | available | Dynamic client registration refuses unsafe redirect URIs |
-| `MAP-THR01` | active | planned | Repeated failed client authentication is throttled (small, capped number of attempts) |
+| `MAP-THR01` | active | available | Repeated failed token requests are throttled (5 to 20 sequential requests with random values) |
 | `MAP-CSR01` | active | planned | Consent decision is protected against CSRF |
 
 Families: **DSC** discovery, **RTK** refresh tokens, **RDR** redirect URIs, **THR** throttling, **CSR** consent CSRF.
@@ -308,7 +321,7 @@ The scanner talks to servers that may be hostile, and it may be driven by an AI 
 - ~~Interactive login creating the test grant~~ done.
 - ~~Redirect URI checks (RDR01, RDR02, RDR04)~~ done.
 - ~~`MAP-RDR03`~~ done, observed during login.
-- Throttling check (THR01), capped at a small number of attempts against a dedicated test client.
+- ~~Throttling check (THR01)~~ done.
 - ~~MCP server mode (stdio)~~ done.
 - npm release.
 

@@ -64,13 +64,15 @@ describe("scan", () => {
     expect([status("MAP-RTK01"), status("MAP-RTK02"), status("MAP-RTK03")]).toEqual(["pass", "pass", "fail"]);
   });
 
-  it("skips the refresh token checks without a test grant, sending no token request", async () => {
+  it("skips the refresh token checks without a test grant", async () => {
     fixture = await startFixture();
     const report = await scan(fixture.mcpUrl, { allowPrivate: true });
     const rtk = report.findings.filter((f) => f.checkId.startsWith("MAP-RTK"));
     expect(rtk).toHaveLength(3);
     expect(rtk.every((f) => f.status === "skipped" && /credentials-file/.test(f.message))).toBe(true);
-    expect(fixture.tokenRequests()).toBe(0);
+    // Only MAP-THR01 talks to the token endpoint, with a temporary client and random values.
+    expect(fixture.tokenRequests()).toBe(10);
+    expect(fixture.registeredClients()).toEqual([]);
   });
 
   it("runs the redirect URI checks on a lab and leaves no client behind", async () => {

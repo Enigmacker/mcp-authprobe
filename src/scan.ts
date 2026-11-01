@@ -1,6 +1,7 @@
 import { CATALOGUE } from "./checks/catalogue.js";
 import { runRedirectUriChecks } from "./checks/redirect-uris.js";
 import { runRefreshTokenChecks } from "./checks/refresh-tokens.js";
+import { runThrottlingCheck } from "./checks/throttling.js";
 import type { Observation, TestGrant } from "./credentials.js";
 import { discover, type DiscoveryResult } from "./discovery.js";
 import { HttpClient } from "./net/http.js";
@@ -16,6 +17,8 @@ export interface ScanOptions {
   timeoutMs?: number;
   /** Test grant for the refresh token checks. It is consumed by the scan. */
   grant?: TestGrant;
+  /** Failed token requests sent by MAP-THR01 (clamped to 5-20, default 10). */
+  throttleAttempts?: number;
   /** Results observed during `login` (MAP-RDR03), read from the grant file. */
   observations?: Observation[];
   /** Test hooks. */
@@ -94,6 +97,21 @@ function fromObservation(checkId: string, target: string, observations: Observat
   return finding(def, target, obs.status, obs.message, [...obs.evidence, `observed during login at ${obs.observedAt}`]);
 }
 
+async function runThrottleFamily(target: string, d: DiscoveryResult | null, http: HttpClient, options: ScanOptions): Promise<Finding> {
+  const meta = d?.as?.metadata;
+  const def = CATALOGUE.find((c) => c.id === "MAP-THR01") as CheckDefinition;
+  if (typeof meta?.token_endpoint !== "string") return finding(def, target, "skipped", "No token endpoint discovered.");
+  const ctx: Parameters<typeof runThrottlingCheck>[0] = {
+    http,
+    target,
+    tokenEndpoint: meta.token_endpoint,
+    registrationEndpoint: typeof meta.registration_endpoint === "string" ? meta.registration_endpoint : null,
+  };
+  if (options.grant) ctx.grant = options.grant;
+  if (options.throttleAttempts !== undefined) ctx.attempts = options.throttleAttempts;
+  return runThrottlingCheck(ctx);
+}
+
 async function runRedirectFamily(target: string, d: DiscoveryResult | null, http: HttpClient): Promise<Finding[]> {
   const meta = d?.as?.metadata;
   if (!meta) {
@@ -155,6 +173,8 @@ export async function scan(mcpUrl: string, options: ScanOptions = {}): Promise<S
       findings.push(...(await runRefreshFamily(target, discovery, http, options)));
       findings.push(...(await runRedirectFamily(target, discovery, http)));
       findings.push(fromObservation("MAP-RDR03", target, options.observations ?? []));
+      // Last on purpose: once throttled, the token endpoint may refuse other checks.
+      findings.push(await runThrottleFamily(target, discovery, http, options));
       for (const def of active.filter((c) => c.availability === "planned")) {
         findings.push(finding(def, target, "skipped", "Not implemented in this version yet."));
       }

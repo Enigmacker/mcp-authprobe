@@ -24,6 +24,10 @@ export interface TokenBehaviour {
   bindRedirect?: boolean;
   /** Invalidate a code after any failed exchange attempt (default false). */
   consumeCodeOnFailure?: boolean;
+  /** Answer 429 once this many failed token requests have been seen. */
+  rateLimitAfter?: number;
+  /** Signal throttling with an OAuth slow_down error in a 400 instead of 429. */
+  rateLimitStyle?: "429" | "slow_down";
 }
 
 export interface AuthorizationBehaviour {
@@ -103,7 +107,8 @@ const newToken = (prefix: string): string => `${prefix}_${randomBytes(16).toStri
 
 export async function startFixture(options: FixtureOptions = {}): Promise<Fixture> {
   const opts = { challenge: true, prm: true, asMetadata: true, ownershipFile: null, anonymous: false, ...options };
-  const tok: Required<Omit<TokenBehaviour, "clientSecret">> & { clientSecret?: string } = {
+  let failures = 0;
+  const tok: Required<Omit<TokenBehaviour, "clientSecret" | "rateLimitAfter">> & { clientSecret?: string; rateLimitAfter?: number } = {
     rotate: true,
     returnSameRefresh: false,
     rejectReplay: true,
@@ -111,6 +116,7 @@ export async function startFixture(options: FixtureOptions = {}): Promise<Fixtur
     throttle: false,
     bindRedirect: true,
     consumeCodeOnFailure: false,
+    rateLimitStyle: "429",
     ...options.tokens,
   };
   const authz: Required<AuthorizationBehaviour> = { match: "exact", noSession: "login", registration: "strict", management: true, issInResponse: true, ...options.authorization };
@@ -125,6 +131,9 @@ export async function startFixture(options: FixtureOptions = {}): Promise<Fixtur
   function tokenEndpoint(req: IncomingMessage, body: string, res: ServerResponse): void {
     tokenCount += 1;
     if (tok.throttle) return json(res, 429, { error: "slow_down" }, { "retry-after": "30" });
+    if (tok.rateLimitAfter !== undefined && failures >= tok.rateLimitAfter) {
+      return tok.rateLimitStyle === "429" ? json(res, 429, { error: "too_many_requests" }, { "retry-after": "60" }) : json(res, 400, { error: "slow_down" });
+    }
 
     const form = new URLSearchParams(body);
     let clientId = form.get("client_id");
@@ -156,6 +165,7 @@ export async function startFixture(options: FixtureOptions = {}): Promise<Fixtur
     const presented = form.get("refresh_token") ?? "";
     const record = refreshTokens.get(presented);
     if (!record || record.clientId !== clientId || revokedFamilies.has(record.family)) {
+      failures += 1;
       return json(res, 400, { error: "invalid_grant" });
     }
     if (record.used && tok.rejectReplay) {

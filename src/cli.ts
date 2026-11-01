@@ -41,6 +41,8 @@ Scan options:
   --allow-private       Allow loopback/private addresses (local labs only)
   --timeout <ms>        Per-request timeout (default: 10000)
   --secret-file <file>  Read the ownership secret from a file instead of ${SECRET_ENV}
+  --throttle-attempts <n>
+                        Failed token requests sent by MAP-THR01 (5-20, default 10)
   --credentials-file <file>
                         Test grant (JSON: client_id, refresh_token, optional
                         client_secret) for the refresh token checks. The grant
@@ -90,6 +92,7 @@ export async function main(argv: string[]): Promise<number> {
       "secret-file": { type: "string" },
       "credentials-file": { type: "string" },
       out: { type: "string" },
+      "throttle-attempts": { type: "string" },
       force: { type: "boolean", default: false },
       "no-probe": { type: "boolean", default: false },
       "no-browser": { type: "boolean", default: false },
@@ -225,6 +228,14 @@ export async function main(argv: string[]): Promise<number> {
     const secret = readSecret(values["secret-file"]);
     if (secret) options.secret = secret;
     if (timeoutMs !== undefined) options.timeoutMs = timeoutMs;
+    if (values["throttle-attempts"] !== undefined) {
+      const n = Number(values["throttle-attempts"]);
+      if (!Number.isInteger(n) || n < 5 || n > 20) {
+        err("--throttle-attempts must be an integer between 5 and 20\n");
+        return EXIT.usage;
+      }
+      options.throttleAttempts = n;
+    }
     if (values["credentials-file"]) {
       try {
         const loaded = loadGrant(values["credentials-file"]);

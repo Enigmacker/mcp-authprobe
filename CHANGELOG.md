@@ -20,4 +20,5 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - CLI: `mcp` command.
 - Interactive `login`: dynamic registration with a loopback redirect URI, PKCE S256, random state, RFC 8707 resource and RFC 9207 iss check; the browser only opens the discovered authorization endpoint; the grant file is written with mode 600, without following symbolic links or overwriting without `--force`; clients from failed logins are deleted.
 - `MAP-RDR03` (token endpoint binds the code to its redirect_uri), observed during `login` when ownership is proven, stored in the grant file and reported by the next scan of the same target.
+- `MAP-THR01` (repeated failed token requests are throttled): 5 to 20 sequential requests (default 10, hard-capped, `--throttle-attempts`) carrying random refresh tokens for the operator's test client or a temporary deleted-afterwards client; stops at the first 429, Retry-After, `slow_down` or `temporarily_unavailable`; runs last in a scan.
 - Local fixture server with a stateful token endpoint, dynamic registration and an authorization endpoint and test suite; GitHub Actions CI.
