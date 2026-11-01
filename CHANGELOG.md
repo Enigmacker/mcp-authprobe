@@ -6,6 +6,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Changed
+
+- Requires Node.js 22.19 or later (Node.js 20 is end-of-life); `undici` 8.
+- GitHub Actions updated (`actions/checkout` and `actions/setup-node` v7); the release workflow skips the npm publish when the version already exists.
+
 ## [0.1.0] - 2026-11-01
 
 First release.

@@ -46,7 +46,7 @@ Good tools already exist, and this one is meant to sit next to them, not replace
 
 ## Install
 
-Requires Node.js 20.18.1 or later.
+Requires Node.js 22.19 or later.
 
 ```sh
 # run without installing
