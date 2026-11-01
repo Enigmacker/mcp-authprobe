@@ -106,7 +106,7 @@ describe("redirect URI checks", () => {
     http = new HttpClient({ allowPrivate: true });
     const deleted = await deleteClient(
       http,
-      { clientId: "c", redirectUris: [], registrationClientUri: "https://elsewhere.example/register/c", registrationAccessToken: "t" },
+      { clientId: "c", clientSecret: null, redirectUris: [], registrationClientUri: "https://elsewhere.example/register/c", registrationAccessToken: "t" },
       "http://127.0.0.1:9/register",
     );
     expect(deleted).toBe(false);

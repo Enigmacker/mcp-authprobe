@@ -9,7 +9,7 @@ Passive scanners read what a remote [Model Context Protocol](https://modelcontex
 
 `mcp-authprobe` runs those active checks, against servers whose ownership you have proven, and reports the results as JSON, SARIF and Markdown.
 
-> **Status: early development (0.1.0-dev).** Available today: ownership proof, OAuth discovery, the refresh token checks (rotation, replay, family revocation) the redirect URI checks (unregistered URI, exact matching, registration policy), and an MCP server mode so an AI assistant can run the audit. The other active families are documented and being implemented; see [Roadmap](#roadmap).
+> **Status: early development (0.1.0-dev).** Available today: ownership proof, OAuth discovery, the refresh token checks (rotation, replay, family revocation) the redirect URI checks (unregistered URI, exact matching, registration policy), and an MCP server mode so an AI assistant can run the audit, and an interactive `login` that creates the test grant for you. The other active families are documented and being implemented; see [Roadmap](#roadmap).
 
 > **Only test servers you own or are explicitly authorized to test.** Active checks change state on the target. The tool enforces an ownership proof before running them, but responsibility stays with the operator.
 
@@ -20,6 +20,7 @@ Passive scanners read what a remote [Model Context Protocol](https://modelcontex
 - [Quick start](#quick-start)
 - [Ownership proof](#ownership-proof)
 - [Refresh token checks](#refresh-token-checks)
+- [Interactive login](#interactive-login)
 - [Redirect URI checks](#redirect-uri-checks)
 - [Use it from an MCP client](#use-it-from-an-mcp-client)
 - [What it checks](#what-it-checks)
@@ -70,7 +71,10 @@ mcp-authprobe ownership verify mcp.example.com
 # 4. Scan
 mcp-authprobe scan https://mcp.example.com/mcp --sarif results.sarif --markdown summary.md
 
-# 5. Add a test grant to run the refresh token checks (see below)
+# 5. Log in once with a dedicated test account to create a test grant
+mcp-authprobe login https://mcp.example.com/mcp --out ./test-grant.json
+
+# 6. Full scan, including the refresh token checks
 mcp-authprobe scan https://mcp.example.com/mcp --credentials-file ./test-grant.json
 ```
 
@@ -114,7 +118,9 @@ You can remove the proof as soon as you are done testing.
 
 MCP clients are usually public clients, so OAuth 2.1 requires their refresh tokens to be rotated, and RFC 9700 recommends revoking the whole token family when an old one is reused. These properties cannot be read from metadata; they have to be exercised.
 
-The checks need a **test grant**: a client and a refresh token obtained by logging in to your own server with a **dedicated test account**. Save it to a file readable only by you (`chmod 600`):
+The checks need a **test grant**: a client and a refresh token obtained by logging in to your own server with a **dedicated test account**.
+
+The easy way is `mcp-authprobe login` (see [Interactive login](#interactive-login)), which writes the file for you. You can also write it by hand, readable only by you (`chmod 600`):
 
 ```json
 {
@@ -142,6 +148,25 @@ Important:
 - A throttled or unexpected response is reported as `error` (inconclusive), never as a pass.
 - Token values never appear in output or reports; evidence only shows status codes and OAuth error codes.
 
+## Interactive login
+
+```sh
+mcp-authprobe login https://mcp.example.com/mcp --out ./test-grant.json
+```
+
+`login` behaves like a careful native MCP client ([RFC 8252](https://www.rfc-editor.org/rfc/rfc8252)):
+
+- It registers a client through dynamic client registration, with a loopback redirect URI on `127.0.0.1` and a random port.
+- It opens your browser on the **discovered authorization endpoint only** (or prints the URL with `--no-browser`). Log in with your **test account**.
+- The loopback listener accepts a single `GET /callback` carrying the expected `state`, and echoes nothing back.
+- It uses PKCE S256, a random `state`, the RFC 8707 `resource`, and checks the RFC 9207 `iss` parameter against the discovered issuer.
+- It writes the grant with mode 600, never through a symbolic link, and never over an existing file unless you pass `--force`. Tokens are never printed.
+- If login fails, the client it registered is deleted when the server allows it.
+
+**`MAP-RDR03` is observed during login**, because it needs a fresh authorization code. When ownership of every contacted host is proven, `login` first presents the code with a *different* `redirect_uri`, which a compliant token endpoint must refuse, then exchanges it normally. The result is stored in the grant file and reported by the next scan of the same target. Use `--no-probe` to skip it.
+
+Some strict servers invalidate a code after any failed attempt. That is acceptable behaviour: `MAP-RDR03` passes, and `login` asks you to run it again with `--no-probe` to obtain the grant.
+
 ## Redirect URI checks
 
 If an authorization server redirects to a URI the client never registered, authorization codes can end up with an attacker. OAuth 2.1 requires exact string matching. These checks need **dynamic client registration** on your server; no test grant and no login are required.
@@ -160,7 +185,7 @@ How they work:
 
 Safety by design: every host used lives under the reserved `.invalid` top-level domain ([RFC 2606](https://www.rfc-editor.org/rfc/rfc2606)), which can never resolve. Even a vulnerable server could not deliver a code anywhere.
 
-Reading the results: a variant answered exactly like the baseline (for example both redirected to the login page) is reported as **inconclusive** (`error`), never as a pass, because some servers only check `redirect_uri` after the user logs in. `MAP-RDR03` (token endpoint enforcement) needs an authorization code, hence a login, and will come with the interactive login feature.
+Reading the results: a variant answered exactly like the baseline (for example both redirected to the login page) is reported as **inconclusive** (`error`), never as a pass, because some servers only check `redirect_uri` after the user logs in. `MAP-RDR03` (token endpoint enforcement) is observed during [interactive login](#interactive-login).
 
 ## Use it from an MCP client
 
@@ -219,7 +244,7 @@ The server is built so that the assistant, or a prompt injection reaching it, ca
 | `MAP-RTK03` | active | available | Refresh token replay revokes the token family |
 | `MAP-RDR01` | active | available | Unregistered `redirect_uri` is refused at the authorization endpoint |
 | `MAP-RDR02` | active | available | `redirect_uri` matching is exact, not prefix or pattern based |
-| `MAP-RDR03` | active | planned | Token endpoint enforces the `redirect_uri` used at authorization |
+| `MAP-RDR03` | active | available (via `login`) | Token endpoint enforces the `redirect_uri` used at authorization |
 | `MAP-RDR04` | active | available | Dynamic client registration refuses unsafe redirect URIs |
 | `MAP-THR01` | active | planned | Repeated failed client authentication is throttled (small, capped number of attempts) |
 | `MAP-CSR01` | active | planned | Consent decision is protected against CSRF |
@@ -280,9 +305,9 @@ The scanner talks to servers that may be hostile, and it may be driven by an AI 
 
 **0.1.0**
 - ~~Refresh token checks (RTK01-03)~~ done, from a test grant file.
-- Optional one-time interactive login to your own server to create the test grant.
+- ~~Interactive login creating the test grant~~ done.
 - ~~Redirect URI checks (RDR01, RDR02, RDR04)~~ done.
-- `MAP-RDR03`, once the interactive login exists.
+- ~~`MAP-RDR03`~~ done, observed during login.
 - Throttling check (THR01), capped at a small number of attempts against a dedicated test client.
 - ~~MCP server mode (stdio)~~ done.
 - npm release.

@@ -1,4 +1,4 @@
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import type { AddressInfo } from "node:net";
 
@@ -20,6 +20,10 @@ export interface TokenBehaviour {
   clientSecret?: string;
   /** Answer every token request with 429 (throttling). */
   throttle?: boolean;
+  /** Bind authorization codes to their redirect_uri at the token endpoint (default true). */
+  bindRedirect?: boolean;
+  /** Invalidate a code after any failed exchange attempt (default false). */
+  consumeCodeOnFailure?: boolean;
 }
 
 export interface AuthorizationBehaviour {
@@ -34,7 +38,9 @@ export interface AuthorizationBehaviour {
    * login page) or "error-redirect" (redirect to redirect_uri with
    * error=login_required, as with prompt=none).
    */
-  noSession?: "login" | "error-redirect";
+  noSession?: "login" | "error-redirect" | "auto-approve";
+  /** Include the RFC 9207 iss parameter in authorization responses (default true). */
+  issInResponse?: boolean;
   /** Registration policy: "strict" refuses unsafe redirect URIs, "lax" accepts anything. */
   registration?: "strict" | "lax" | "disabled";
   /** Offer RFC 7592 deletion of registered clients (default true). */
@@ -103,9 +109,12 @@ export async function startFixture(options: FixtureOptions = {}): Promise<Fixtur
     rejectReplay: true,
     revokeFamily: true,
     throttle: false,
+    bindRedirect: true,
+    consumeCodeOnFailure: false,
     ...options.tokens,
   };
-  const authz: Required<AuthorizationBehaviour> = { match: "exact", noSession: "login", registration: "strict", management: true, ...options.authorization };
+  const authz: Required<AuthorizationBehaviour> = { match: "exact", noSession: "login", registration: "strict", management: true, issInResponse: true, ...options.authorization };
+  const codes = new Map<string, { clientId: string; redirectUri: string; challenge: string; used: boolean }>();
   const clients = new Map<string, { redirectUris: string[]; managementToken: string }>();
   const requests: Fixture["requests"] = [];
   const refreshTokens = new Map<string, RefreshRecord>();
@@ -127,6 +136,21 @@ export async function startFixture(options: FixtureOptions = {}): Promise<Fixtur
       secret = decodeURIComponent(sec ?? "");
     }
     if (tok.clientSecret !== undefined && secret !== tok.clientSecret) return json(res, 401, { error: "invalid_client" });
+    if (form.get("grant_type") === "authorization_code") {
+      const code = codes.get(form.get("code") ?? "");
+      if (!code || code.used || code.clientId !== clientId) return json(res, 400, { error: "invalid_grant" });
+      const verifier = form.get("code_verifier") ?? "";
+      const fail = (): void => {
+        if (tok.consumeCodeOnFailure) code.used = true;
+        json(res, 400, { error: "invalid_grant" });
+      };
+      if (createHash("sha256").update(verifier).digest("base64url") !== code.challenge) return fail();
+      if (tok.bindRedirect && form.get("redirect_uri") !== code.redirectUri) return fail();
+      code.used = true;
+      const refreshOut = newToken("rt");
+      refreshTokens.set(refreshOut, { family: newToken("fam"), clientId: code.clientId, used: false });
+      return json(res, 200, { access_token: newToken("at"), token_type: "Bearer", expires_in: 3600, refresh_token: refreshOut });
+    }
     if (form.get("grant_type") !== "refresh_token") return json(res, 400, { error: "unsupported_grant_type" });
 
     const presented = form.get("refresh_token") ?? "";
@@ -213,6 +237,17 @@ export async function startFixture(options: FixtureOptions = {}): Promise<Fixtur
     if (!ok) return json(res, 400, { error: "invalid_request", error_description: "redirect_uri mismatch" });
     if (q.get("code_challenge_method") !== "S256" || !q.get("code_challenge")) return json(res, 400, { error: "invalid_request" });
     if (authz.noSession === "login") return login();
+    if (authz.noSession === "auto-approve") {
+      const code = newToken("code");
+      codes.set(code, { clientId: q.get("client_id") ?? "", redirectUri, challenge: q.get("code_challenge") ?? "", used: false });
+      const back = new URL(redirectUri);
+      back.searchParams.set("code", code);
+      back.searchParams.set("state", q.get("state") ?? "");
+      if (authz.issInResponse) back.searchParams.set("iss", base);
+      res.writeHead(302, { location: back.toString() });
+      res.end();
+      return;
+    }
     const target = new URL(redirectUri);
     target.searchParams.set("error", "login_required");
     target.searchParams.set("state", q.get("state") ?? "");
@@ -246,6 +281,7 @@ export async function startFixture(options: FixtureOptions = {}): Promise<Fixtur
           response_types_supported: ["code"],
           grant_types_supported: ["authorization_code", "refresh_token"],
           code_challenge_methods_supported: ["S256"],
+          authorization_response_iss_parameter_supported: authz.issInResponse,
           token_endpoint_auth_methods_supported: tok.clientSecret ? ["client_secret_post", "client_secret_basic"] : ["none"],
         });
       }

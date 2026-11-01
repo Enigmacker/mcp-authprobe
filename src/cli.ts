@@ -30,6 +30,7 @@ Usage:
   ${TOOL_NAME} ownership verify <host>     Check that the proof is published
   ${TOOL_NAME} checks list                 List every check
   ${TOOL_NAME} checks show <id>            Explain one check
+  ${TOOL_NAME} login <mcp-url> --out <file> Log in with a test account and save a test grant
   ${TOOL_NAME} mcp                         Run as an MCP server over stdio
 
 Scan options:
@@ -44,6 +45,13 @@ Scan options:
                         Test grant (JSON: client_id, refresh_token, optional
                         client_secret) for the refresh token checks. The grant
                         is consumed: use a dedicated test account.
+
+Login options:
+  --out <file>          Where to write the test grant (mode 600, never overwritten without --force)
+  --force               Overwrite an existing grant file
+  --no-probe            Do not observe MAP-RDR03 during login
+  --no-browser          Print the authorization URL instead of opening a browser
+  --allow-private, --secret-file, --timeout  as for scan
 
 The ownership secret is read from ${SECRET_ENV} or --secret-file, never from
 the command line, so it does not end up in shell history or process lists.
@@ -81,6 +89,10 @@ export async function main(argv: string[]): Promise<number> {
       timeout: { type: "string" },
       "secret-file": { type: "string" },
       "credentials-file": { type: "string" },
+      out: { type: "string" },
+      force: { type: "boolean", default: false },
+      "no-probe": { type: "boolean", default: false },
+      "no-browser": { type: "boolean", default: false },
       help: { type: "boolean", short: "h", default: false },
       version: { type: "boolean", short: "v", default: false },
     },
@@ -166,6 +178,30 @@ export async function main(argv: string[]): Promise<number> {
     }
   }
 
+  if (command === "login" && sub) {
+    if (!values.out) {
+      err("login needs --out <file> for the test grant.\n");
+      return EXIT.usage;
+    }
+    let url: URL;
+    try {
+      url = new URL(sub);
+    } catch {
+      err(`Not a URL: ${sub}\n`);
+      return EXIT.usage;
+    }
+    const { runLoginCommand } = await import("./login-command.js");
+    return runLoginCommand({
+      mcpUrl: url.toString(),
+      out: values.out,
+      force: values.force,
+      probe: !values["no-probe"],
+      browser: !values["no-browser"],
+      allowPrivate: values["allow-private"],
+      secret: readSecret(values["secret-file"]),
+    });
+  }
+
   if (command === "scan" && sub) {
     const failOn = values["fail-on"] as Severity;
     if (!SEVERITIES.includes(failOn)) {
@@ -194,6 +230,7 @@ export async function main(argv: string[]): Promise<number> {
         const loaded = loadGrant(values["credentials-file"]);
         for (const w of loaded.warnings) err(`warning: ${w}\n`);
         options.grant = loaded.grant;
+        options.observations = loaded.observations;
       } catch (e) {
         err(`${(e as Error).message}\n`);
         return EXIT.usage;

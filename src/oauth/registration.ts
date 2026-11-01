@@ -15,6 +15,8 @@ const CLIENT_NAME = "mcp-authprobe test client (safe to delete)";
 
 export interface RegisteredClient {
   clientId: string;
+  /** Present when the server registered a confidential client. In memory only. */
+  clientSecret: string | null;
   redirectUris: string[];
   /** RFC 7592 management URI and token, used to delete the client. */
   registrationClientUri: string | null;
@@ -28,11 +30,16 @@ export interface RegistrationOutcome {
   client: RegisteredClient | null;
 }
 
-export async function registerClient(http: HttpClient, registrationEndpoint: string, redirectUris: string[]): Promise<RegistrationOutcome> {
+export async function registerClient(
+  http: HttpClient,
+  registrationEndpoint: string,
+  redirectUris: string[],
+  extra: { clientName?: string; grantTypes?: string[] } = {},
+): Promise<RegistrationOutcome> {
   const body = {
-    client_name: CLIENT_NAME,
+    client_name: extra.clientName ?? CLIENT_NAME,
     redirect_uris: redirectUris,
-    grant_types: ["authorization_code"],
+    grant_types: extra.grantTypes ?? ["authorization_code"],
     response_types: ["code"],
     token_endpoint_auth_method: "none",
   };
@@ -56,6 +63,7 @@ export async function registerClient(http: HttpClient, registrationEndpoint: str
   if (!accepted) return { status: res.status, accepted: false, error, client: null };
 
   const uris = Array.isArray(json["redirect_uris"]) ? (json["redirect_uris"] as unknown[]).filter((u): u is string => typeof u === "string") : redirectUris;
+  const secret = json["client_secret"];
   const rcu = json["registration_client_uri"];
   const rat = json["registration_access_token"];
   return {
@@ -64,6 +72,7 @@ export async function registerClient(http: HttpClient, registrationEndpoint: str
     error: null,
     client: {
       clientId: clientId as string,
+      clientSecret: typeof secret === "string" && secret !== "" ? secret : null,
       redirectUris: uris,
       registrationClientUri: typeof rcu === "string" ? rcu : null,
       registrationAccessToken: typeof rat === "string" ? rat : null,

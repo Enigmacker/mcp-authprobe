@@ -69,3 +69,45 @@ export function describe(outcome: RefreshOutcome): string {
   }
   return `HTTP ${outcome.status}${outcome.error ? `, error=${outcome.error}` : ""}${outcome.throttled ? ", throttled" : ""}`;
 }
+
+export type CodeExchangeOutcome = RefreshOutcome;
+
+/** Exchange an authorization code (with PKCE) at the token endpoint. */
+export async function exchangeCode(
+  http: HttpClient,
+  tokenEndpoint: string,
+  params: { clientId: string; clientSecret?: string | null; code: string; codeVerifier: string; redirectUri: string; resource?: string },
+): Promise<CodeExchangeOutcome> {
+  const form: Record<string, string> = {
+    grant_type: "authorization_code",
+    code: params.code,
+    code_verifier: params.codeVerifier,
+    redirect_uri: params.redirectUri,
+    client_id: params.clientId,
+  };
+  if (params.clientSecret) form["client_secret"] = params.clientSecret;
+  if (params.resource) form["resource"] = params.resource;
+  const res = await http.request({
+    url: tokenEndpoint,
+    method: "POST",
+    headers: { "content-type": "application/x-www-form-urlencoded", accept: "application/json" },
+    body: new URLSearchParams(form).toString(),
+  });
+  let body: Record<string, unknown> = {};
+  try {
+    const parsed: unknown = JSON.parse(res.body);
+    if (typeof parsed === "object" && parsed !== null && !Array.isArray(parsed)) body = parsed as Record<string, unknown>;
+  } catch {
+    /* non-JSON error page */
+  }
+  const access = body["access_token"];
+  const refreshToken = body["refresh_token"];
+  const error = body["error"];
+  return {
+    status: res.status,
+    error: typeof error === "string" ? error : null,
+    accessTokenIssued: res.status === 200 && typeof access === "string" && access.length > 0,
+    refreshToken: typeof refreshToken === "string" && refreshToken.length > 0 ? refreshToken : null,
+    throttled: res.status === 429 || res.headers["retry-after"] !== undefined,
+  };
+}

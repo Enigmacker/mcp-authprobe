@@ -165,6 +165,11 @@ describe("cli", () => {
     expect(await main(["scan", fixture.mcpUrl, "--allow-private", "--credentials-file", creds])).toBe(EXIT.findings);
   });
 
+  it("requires --out for login", async () => {
+    expect(await main(["login", "https://x.example/mcp"])).toBe(EXIT.usage);
+    expect(await main(["login", "not a url", "--out", "g.json"])).toBe(EXIT.usage);
+  });
+
   it("rejects an unreadable credentials file as a usage error", async () => {
     expect(await main(["scan", "https://x.example/mcp", "--credentials-file", "/nonexistent/creds.json"])).toBe(EXIT.usage);
   });

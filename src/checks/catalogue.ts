@@ -112,7 +112,7 @@ export const CATALOGUE: readonly CheckDefinition[] = [
     title: "Token endpoint enforces the redirect_uri used at authorization",
     severity: "medium",
     active: true,
-    availability: "planned",
+    availability: "available",
     rationale:
       "A token request whose redirect_uri differs from the one used in the authorization request should fail; otherwise code injection defenses are weakened.",
     remediation: "Bind the authorization code to its redirect_uri and reject mismatches at the token endpoint.",

@@ -186,6 +186,7 @@ export function createAuthprobeServer(config: ServerConfig): McpServer {
           try {
             const loaded = loadGrant(config.credentialsFile);
             options.grant = loaded.grant satisfies TestGrant;
+            options.observations = loaded.observations;
             notes.push(...loaded.warnings);
           } catch (e) {
             notes.push(`Test grant not loaded: ${(e as Error).message}`);

@@ -1,7 +1,7 @@
 import { CATALOGUE } from "./checks/catalogue.js";
 import { runRedirectUriChecks } from "./checks/redirect-uris.js";
 import { runRefreshTokenChecks } from "./checks/refresh-tokens.js";
-import type { TestGrant } from "./credentials.js";
+import type { Observation, TestGrant } from "./credentials.js";
 import { discover, type DiscoveryResult } from "./discovery.js";
 import { HttpClient } from "./net/http.js";
 import { verifyOwnership, type OwnershipResult, type VerifyOptions } from "./ownership.js";
@@ -16,6 +16,8 @@ export interface ScanOptions {
   timeoutMs?: number;
   /** Test grant for the refresh token checks. It is consumed by the scan. */
   grant?: TestGrant;
+  /** Results observed during `login` (MAP-RDR03), read from the grant file. */
+  observations?: Observation[];
   /** Test hooks. */
   resolveTxtRecords?: VerifyOptions["resolveTxtRecords"];
   wellKnownBaseUrl?: string;
@@ -80,6 +82,18 @@ async function runRefreshFamily(target: string, d: DiscoveryResult | null, http:
   return runRefreshTokenChecks({ http, target, tokenEndpoint, grant: options.grant });
 }
 
+/**
+ * Report a result observed during `login`. The observation comes from a
+ * local file, so its text is neutralized again and it is only used for the
+ * exact target it was observed on.
+ */
+function fromObservation(checkId: string, target: string, observations: Observation[]): Finding {
+  const def = CATALOGUE.find((c) => c.id === checkId) as CheckDefinition;
+  const obs = observations.filter((o) => o.checkId === checkId && o.target === target).at(-1);
+  if (!obs) return finding(def, target, "skipped", "Observed during login: run `mcp-authprobe login` with ownership proven, then scan with the grant file it writes.");
+  return finding(def, target, obs.status, obs.message, [...obs.evidence, `observed during login at ${obs.observedAt}`]);
+}
+
 async function runRedirectFamily(target: string, d: DiscoveryResult | null, http: HttpClient): Promise<Finding[]> {
   const meta = d?.as?.metadata;
   if (!meta) {
@@ -140,6 +154,7 @@ export async function scan(mcpUrl: string, options: ScanOptions = {}): Promise<S
     } else {
       findings.push(...(await runRefreshFamily(target, discovery, http, options)));
       findings.push(...(await runRedirectFamily(target, discovery, http)));
+      findings.push(fromObservation("MAP-RDR03", target, options.observations ?? []));
       for (const def of active.filter((c) => c.availability === "planned")) {
         findings.push(finding(def, target, "skipped", "Not implemented in this version yet."));
       }

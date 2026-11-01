@@ -1,4 +1,5 @@
-import { readFileSync, statSync } from "node:fs";
+import { closeSync, constants, fchmodSync, openSync, readFileSync, statSync, writeSync } from "node:fs";
+import type { Finding } from "./types.js";
 
 /**
  * A test grant supplied by the operator: a client and a refresh token
@@ -26,9 +27,35 @@ export interface TestGrant {
   authMethod: TokenEndpointAuthMethod;
 }
 
+/**
+ * A check result observed outside a scan, during `login` (for example
+ * MAP-RDR03, which needs a fresh authorization code). Stored in the grant
+ * file so the next scan of the same target can report it.
+ */
+export interface Observation extends Finding {
+  observedAt: string;
+}
+
 export interface LoadedGrant {
   grant: TestGrant;
+  observations: Observation[];
   warnings: string[];
+}
+
+function parseObservations(raw: unknown): Observation[] {
+  if (!Array.isArray(raw)) return [];
+  const statuses = new Set(["pass", "fail", "not_applicable", "error", "skipped"]);
+  return raw.filter(
+    (o): o is Observation =>
+      typeof o === "object" &&
+      o !== null &&
+      typeof (o as Observation).checkId === "string" &&
+      typeof (o as Observation).target === "string" &&
+      typeof (o as Observation).message === "string" &&
+      typeof (o as Observation).observedAt === "string" &&
+      statuses.has((o as Observation).status) &&
+      Array.isArray((o as Observation).evidence),
+  );
 }
 
 const AUTH_METHODS: readonly TokenEndpointAuthMethod[] = ["none", "client_secret_post", "client_secret_basic"];
@@ -69,5 +96,31 @@ export function loadGrant(path: string): LoadedGrant {
     // Never echo file content: it holds secrets.
     throw new Error(`Credentials file ${path} is not valid JSON.`);
   }
-  return { grant: parseGrant(raw), warnings };
+  const observations = parseObservations((raw as Record<string, unknown> | null)?.["observations"]);
+  return { grant: parseGrant(raw), observations, warnings };
+}
+
+/**
+ * Write a grant file with mode 600. Refuses to follow a symbolic link and,
+ * unless `overwrite` is set, to replace an existing file.
+ */
+export function writeGrantFile(path: string, grant: TestGrant, observations: Observation[], overwrite = false): void {
+  const data: Record<string, unknown> = {
+    client_id: grant.clientId,
+    refresh_token: grant.refreshToken,
+    token_endpoint_auth_method: grant.authMethod,
+  };
+  if (grant.clientSecret) data["client_secret"] = grant.clientSecret;
+  if (observations.length > 0) data["observations"] = observations;
+
+  const nofollow = constants.O_NOFOLLOW ?? 0;
+  const flags = constants.O_WRONLY | constants.O_CREAT | nofollow | (overwrite ? constants.O_TRUNC : constants.O_EXCL);
+  const fd = openSync(path, flags, 0o600);
+  try {
+    // An overwritten file keeps its old mode: force 600.
+    if (process.platform !== "win32") fchmodSync(fd, 0o600);
+    writeSync(fd, `${JSON.stringify(data, null, 2)}\n`);
+  } finally {
+    closeSync(fd);
+  }
 }
