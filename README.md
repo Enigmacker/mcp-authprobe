@@ -488,7 +488,7 @@ The results table is added to the job summary. The step fails when a check fails
 Both tools have an Action, so the passive and active views fit in one job:
 
 ```yaml
-      - uses: batou9150/mcp-posture@v1.1.3
+      - uses: batou9150/mcp-posture@v1.2.0
         with:
           targets: https://staging.example.com/mcp
           args: --json posture.json
