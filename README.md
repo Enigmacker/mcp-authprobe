@@ -32,6 +32,7 @@ Passive scanners read what a remote [Model Context Protocol](https://modelcontex
 - [Consent CSRF check](#consent-csrf-check)
 - [Use it from an MCP client](#use-it-from-an-mcp-client)
 - [What it checks](#what-it-checks)
+- [Servers with a static API key](#servers-with-a-static-api-key)
 - [Combine with mcp-posture](#combine-with-mcp-posture)
 - [Reports and exit codes](#reports-and-exit-codes)
 - [GitHub Action](#github-action)
@@ -105,6 +106,8 @@ Log in with the account `test` / `test` and click **Allow**.
 | --- | --- |
 | `vulnerable` (default) | Refresh token replay accepted, unsafe redirect URIs registered, PKCE not enforced, token audience ignored, foreign `Origin` accepted, token accepted in the URL, session ID accepted without a token, CORS open to any origin with credentials, no throttling, consent page without CSRF protection. `MAP-RDR02` is reported as **inconclusive**: this server sends unknown visitors to its login page before looking at `redirect_uri`, which cannot be told apart from outside, and the scanner never turns that into a pass. |
 | `secure` | Every check passes (or is not applicable); `MAP-CSR01` runs with `consent-check`. |
+| `static-bearer` | No OAuth: the MCP endpoint takes a static API key, printed when the lab starts (scan with `--bearer-file`). JSON-RPC batches executed, 6 MiB bodies accepted, key accepted in the URL, any `Origin` accepted, session ID enough without the key, no rate limit. |
+| `static-bearer-secure` | The same server done right: every key check passes or is not applicable. |
 
 The lab only listens on `127.0.0.1` or `::1` (`--host`, `--port`, default 8787; names such as `localhost` are refused so that no resolver can move it elsewhere), keeps everything in memory, and stops with Ctrl-C. Its access tokens are unsigned JWTs, so `MAP-AUD01` can read their audience. It is vulnerable on purpose: never expose it.
 
@@ -327,7 +330,8 @@ From a source checkout, use `"command": "node"` with `"args": ["/path/to/mcp-aut
 
 The server is built so that the assistant, or a prompt injection reaching it, cannot widen what the scanner may do:
 
-- **Everything sensitive is set by you in the configuration, never by tool arguments:** the ownership secret, the test grant, and private-address access. The `scan` tool takes a URL and nothing else.
+- **Everything sensitive is set by you in the configuration, never by tool arguments:** the ownership secret, the test grant, the static key, and private-address access. The `scan` tool takes a URL, plus `only` and `skip`, which can only narrow a scan.
+- **A static key is bound to one URL** (`MCP_AUTHPROBE_BEARER_TARGET`): the assistant cannot send it anywhere else.
 - **`scan` is annotated as destructive**, so well-behaved clients ask for your confirmation before each call. It consumes the test grant and registers temporary clients.
 - **Only `https` targets** are accepted; plain `http` only for loopback or private-address labs with `MCP_AUTHPROBE_ALLOW_PRIVATE=1`. URLs with embedded credentials are refused, and only one scan runs at a time.
 - **Loopback targets still need a proof** in MCP mode, unless you list their origin in `MCP_AUTHPROBE_LAB_ORIGINS`. An assistant cannot point active requests at arbitrary local services.
@@ -341,6 +345,8 @@ The server is built so that the assistant, or a prompt injection reaching it, ca
 | `MCP_AUTHPROBE_ALLOW_PRIVATE=1` | Allow loopback and private targets (local labs only) |
 | `MCP_AUTHPROBE_LAB_ORIGINS` | Comma-separated lab origins (e.g. `http://127.0.0.1:8080`) exempt from the ownership proof |
 | `MCP_AUTHPROBE_TIMEOUT_MS` | Per-request timeout |
+| `MCP_AUTHPROBE_BEARER_FILE` and `MCP_AUTHPROBE_BEARER_TARGET` | Static API key, and the exact MCP URL it may be used for (both required) |
+| `MCP_AUTHPROBE_BEARER_HEADER` | Header for the key (default `Authorization`, sent as `Bearer`) |
 
 
 ### With Docker
@@ -373,12 +379,15 @@ In a container, `--allow-private` labs on your machine are not reachable as `127
 | `MAP-PKC01` | active | available (via `login`) | Token endpoint enforces PKCE (no `code_verifier`, wrong `code_verifier`) |
 | `MAP-COD01` | active | available (via `login`) | An authorization code cannot be used twice |
 | `MAP-AUD01` | active | available (via `login`) | Tokens are bound to their audience (RFC 8707) |
-| `MAP-ORG01` | passive | available | MCP endpoint rejects requests from a foreign `Origin` |
-| `MAP-TOK01` | active | available (via `login`) | MCP endpoint refuses access tokens in the URL |
-| `MAP-SES01` | active | available (via `login`) | An MCP session ID is not accepted instead of a token |
+| `MAP-ORG01` | passive | available | MCP endpoint rejects requests from a foreign, `null` or malformed `Origin` |
+| `MAP-TOK01` | active | available (via `login` or a static key) | MCP endpoint refuses access tokens and keys in the URL |
+| `MAP-SES01` | active | available (via `login` or a static key) | An MCP session ID is not accepted instead of a token |
 | `MAP-COR01` | passive | available | MCP endpoint does not allow credentialed requests from any origin (CORS) |
+| `MAP-BAT01` | active | available (via `login` or a static key) | MCP endpoint refuses JSON-RPC batches |
+| `MAP-BOD01` | active | available (via `login` or a static key) | MCP endpoint limits the request body size (6 MiB, with and without `Content-Length`) |
+| `MAP-THR02` | active | available (with a static key) | MCP endpoint rate-limits each credential (10 to 100 `ping` requests) |
 
-Families: **DSC** discovery, **RTK** refresh tokens, **RDR** redirect URIs, **THR** throttling, **CSR** consent CSRF, **PKC** PKCE, **COD** authorization codes, **AUD** token audience, **ORG** Origin validation, **TOK** token transport, **SES** sessions, **COR** CORS.
+Families: **DSC** discovery, **RTK** refresh tokens, **RDR** redirect URIs, **THR** throttling, **CSR** consent CSRF, **PKC** PKCE, **COD** authorization codes, **AUD** token audience, **ORG** Origin validation, **TOK** token transport, **SES** sessions, **COR** CORS, **BAT** batches, **BOD** body size.
 
 `MAP-ORG01` runs in every scan without an ownership proof: it sends two ordinary `initialize` requests, one with a foreign `Origin`. Most servers ask for a token before looking at `Origin`; the scan then reports it as inconclusive, and `login` observes it with a valid token. `MAP-COR01` also runs in every scan: a CORS preflight and an ordinary request with a foreign `Origin`; it fails only when that origin is reflected together with `Access-Control-Allow-Credentials: true`.
 
@@ -392,6 +401,34 @@ mcp-authprobe scan https://mcp.example.com/mcp --only RDR02      # re-check one 
 ```
 
 A check that is not selected sends **no request** and is listed as `skipped (not selected)`, so a report never suggests it passed. The three refresh token checks are one sequence: selecting any of them runs the three (the others are then reported as not selected), and skipping all three leaves the test grant untouched. The MCP server's `scan` tool takes the same `only` and `skip` arguments.
+
+## Servers with a static API key
+
+Many MCP servers, especially in front of SaaS APIs, take a fixed API key instead of OAuth. Give the key to the scanner in a file:
+
+```sh
+printf '%s\n' 'your-test-key' > test.key && chmod 600 test.key
+mcp-authprobe scan https://mcp.example.com/mcp --bearer-file test.key
+# a key sent in another header, as is
+mcp-authprobe scan https://mcp.example.com/mcp --bearer-file test.key --bearer-header X-API-Key
+```
+
+With the key, and only once ownership of the target is proven, the checks of the MCP endpoint itself run with it:
+
+| Check | With the key |
+| --- | --- |
+| `MAP-ORG01` | `initialize` with a foreign Origin, `Origin: null` and a malformed Origin: each must get 403 |
+| `MAP-TOK01` | The key as `?access_token=`, `?api_key=`, `?key=` and `?token=`, without any header: each must be refused |
+| `MAP-SES01` | When the server uses sessions: a `ping` carrying only the session ID must be refused |
+| `MAP-BAT01` | One POST carrying a JSON-RPC batch of 5 `ping` requests must be refused: MCP has allowed one message per request since 2025-06-18, and a server that runs batches counts many calls as one |
+| `MAP-BOD01` | Two 6 MiB `ping` requests, one with `Content-Length` and one chunked, must be refused (ideally 413) |
+| `MAP-THR02` | Up to 30 `ping` requests (`--rate-attempts`, 10 to 100) must meet a rate limit (429 or `Retry-After`). Runs last, since a limited key may be refused for a while |
+
+`MAP-DSC01` becomes *not applicable*, and so do the authorization server checks, when no OAuth metadata is published. This only happens when you declare a key: a bare 401 without metadata also looks like a broken OAuth setup, which must stay visible.
+
+Only side-effect-free methods are sent (`initialize`, `ping`); no tool is ever called. Every check has a hard request cap, the key is read from a file (a warning is printed if other users can read it), never accepted on the command line, and masked in every report. `MAP-BAT01` and `MAP-BOD01` also run during `login` with the OAuth access token.
+
+Use a dedicated test key: `MAP-THR02` may get it rate-limited for a few minutes. The `static-bearer` and `static-bearer-secure` lab profiles show all of this without a real server.
 
 ## Combine with mcp-posture
 
@@ -438,7 +475,7 @@ The report must be mcp-posture's JSON (`schema_version` 1.x) and contain a resul
 | `0` | No failing check at or above `--fail-on` (default `high`) |
 | `1` | At least one failing check at or above `--fail-on` (or `ownership verify` failed) |
 | `2` | Usage error |
-| `3` | A check errored or the target was unreachable |
+| `3` | A check was inconclusive, or the target was unreachable. With `--fail-on-inconclusive false`, inconclusive checks no longer change the exit code; a scan that cannot run still exits 3 |
 
 All server-controlled text is neutralized before it reaches a report: terminal escape sequences, bidi overrides and invisible characters are escaped, and token-shaped values are redacted.
 
@@ -461,7 +498,7 @@ jobs:
   scan:
     runs-on: ubuntu-latest
     steps:
-      - uses: Enigmacker/mcp-authprobe@v0.8.0
+      - uses: Enigmacker/mcp-authprobe@v0.9.0
         with:
           url: https://staging.example.com/mcp
           secret: ${{ secrets.MCP_AUTHPROBE_SECRET }}
@@ -478,12 +515,14 @@ The results table is added to the job summary. The step fails when a check fails
 | `fail-on` | `high` | Fail on a failing check at or above this severity |
 | `fail-on-inconclusive` | `false` | Also fail when a check is inconclusive (otherwise a warning). An unreachable target always fails |
 | `only` / `skip` | | Same as `--only` / `--skip` |
+| `bearer` | | Static API key, from a repository secret; written to a private temporary file, never on the command line |
+| `bearer-header`, `rate-attempts` | | Same as `--bearer-header`, `--rate-attempts` |
 | `posture-report` | | An mcp-posture JSON report to merge, see [Combine with mcp-posture](#combine-with-mcp-posture) |
 | `throttle-attempts`, `timeout` | | Same as the CLI options |
 | `upload-sarif` | `false` | Upload the SARIF report to code scanning (needs `security-events: write`) |
 | `allow-private` | `false` | For a lab started in the same job only |
 | `node-version` | `22` | Node.js used to run the scanner |
-| `package` | this release | npm package spec to run, e.g. `mcp-authprobe@0.8.0` |
+| `package` | this release | npm package spec to run, e.g. `mcp-authprobe@0.9.0` |
 
 Both tools have an Action, so the passive and active views fit in one job:
 
@@ -493,7 +532,7 @@ Both tools have an Action, so the passive and active views fit in one job:
           targets: https://staging.example.com/mcp
           args: --json posture.json
           fail: false   # let the active scan run too; each tool reports its own findings
-      - uses: Enigmacker/mcp-authprobe@v0.8.0
+      - uses: Enigmacker/mcp-authprobe@v0.9.0
         with:
           url: https://staging.example.com/mcp
           secret: ${{ secrets.MCP_AUTHPROBE_SECRET }}
@@ -567,7 +606,11 @@ The scanner talks to servers that may be hostile, and it may be driven by an AI 
 - ~~Import of mcp-posture reports, merged with the active results~~ done.
 - ~~Dockerfile, listed on Glama~~ done.
 
+**0.9.0**
+- ~~Servers with a static API key; JSON-RPC batches, body size and per-key rate limit checks~~ done.
+
 **Next**
+- Prompt injection hygiene of tool responses (content from outside marked as data), with a lab resource to demonstrate it.
 - Ideas welcome in the issues.
 
 ## Development

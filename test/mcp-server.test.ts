@@ -151,6 +151,39 @@ describe("MCP server guard rails", () => {
   });
 });
 
+describe("static key in MCP mode", () => {
+  const KEY = "sk_mcp_mode_0123456789abcdef";
+  const keyPath = (): string => {
+    const p = join(mkdtempSync(join(tmpdir(), "map-mcp-key-")), "key");
+    writeFileSync(p, KEY);
+    chmodSync(p, 0o600);
+    return p;
+  };
+
+  it("needs the URL the key belongs to", () => {
+    expect(() => configFromEnv({ MCP_AUTHPROBE_BEARER_FILE: keyPath() })).toThrow(/MCP_AUTHPROBE_BEARER_TARGET/);
+  });
+
+  it("uses the key only for its own URL", async () => {
+    fixture = await startFixture({ prm: false, asMetadata: false, challenge: "bearer", staticKey: { value: KEY }, mcp: { sessions: false, rateLimit: 20 } });
+    const origin = new URL(fixture.mcpUrl).origin;
+    const config = configFromEnv({
+      MCP_AUTHPROBE_ALLOW_PRIVATE: "1",
+      MCP_AUTHPROBE_LAB_ORIGINS: origin,
+      MCP_AUTHPROBE_BEARER_FILE: keyPath(),
+      MCP_AUTHPROBE_BEARER_TARGET: fixture.mcpUrl,
+    });
+    const c = await connect(config);
+    const ok = await c.callTool({ name: "scan", arguments: { url: fixture.mcpUrl, only: "BAT,TOK" } });
+    const findings = (ok.structuredContent as { report: { findings: Array<{ checkId: string; status: string }> } }).report.findings;
+    expect(findings.find((f) => f.checkId === "MAP-BAT01")?.status).toBe("pass");
+    expect(JSON.stringify(ok)).not.toContain(KEY);
+
+    const other = await c.callTool({ name: "scan", arguments: { url: `${origin}/other`, only: "BAT" } });
+    expect(textOf(other)).toMatch(/belongs to another URL/);
+  });
+});
+
 describe("configFromEnv", () => {
   it("reads settings only from the environment", () => {
     const cfg = configFromEnv({ MCP_AUTHPROBE_SECRET: " s ", MCP_AUTHPROBE_ALLOW_PRIVATE: "1", MCP_AUTHPROBE_TIMEOUT_MS: "5000", MCP_AUTHPROBE_CREDENTIALS_FILE: "/x.json" });

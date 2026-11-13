@@ -103,8 +103,15 @@ export interface ConsentBehaviour {
 }
 
 export interface FixtureOptions {
-  /** Send WWW-Authenticate with resource_metadata on 401 (default true). */
-  challenge?: boolean;
+  /**
+   * WWW-Authenticate on 401: true (default) with resource_metadata, "bearer"
+   * for a plain Bearer challenge (static key servers), false for none.
+   */
+  challenge?: boolean | "bearer";
+  /** Static API key accepted by the MCP endpoint (servers without OAuth). */
+  staticKey?: { value: string; header?: string };
+  /** Largest request body read, in bytes (default 64 KiB, at most 32 MiB). */
+  maxBodyBytes?: number;
   /** Serve Protected Resource Metadata (default true). */
   prm?: boolean;
   /** Serve Authorization Server Metadata (default true). */
@@ -146,6 +153,10 @@ export interface FixtureOptions {
     acceptQueryToken?: boolean;
     /** CORS policy for foreign origins (default none). */
     cors?: "none" | "reflect" | "reflect-credentials" | "wildcard";
+    /** Execute JSON-RPC batches (arrays) instead of refusing them with 400. */
+    batch?: boolean;
+    /** Authenticated requests allowed per credential per minute; then 429 (default: no limit). */
+    rateLimit?: number;
   };
 }
 
@@ -177,23 +188,34 @@ function json(res: ServerResponse, status: number, body: unknown, headers: Recor
   res.end(JSON.stringify(body));
 }
 
-const MAX_BODY = 64 * 1024;
+const DEFAULT_MAX_BODY = 64 * 1024;
+/** Never read more than this, whatever the profile: the lab must not be easy to knock over. */
+const HARD_MAX_BODY = 32 * 1024 * 1024;
 
-/** Request body, or null when it exceeds MAX_BODY or the request fails. */
-function readBody(req: IncomingMessage): Promise<string | null> {
+/**
+ * Request body, or null when it exceeds `max` or the request fails. An
+ * oversized body is drained (not kept) so the client gets a clean 413.
+ */
+function readBody(req: IncomingMessage, max: number): Promise<string | null> {
   return new Promise((resolve) => {
     const chunks: Buffer[] = [];
     let size = 0;
+    let tooLarge = false;
     req.on("data", (c: Buffer) => {
       size += c.length;
-      if (size > MAX_BODY) {
+      if (size > HARD_MAX_BODY) {
         resolve(null);
         req.destroy();
         return;
       }
+      if (size > max) {
+        tooLarge = true;
+        chunks.length = 0;
+        return;
+      }
       chunks.push(c);
     });
-    req.on("end", () => resolve(Buffer.concat(chunks).toString("utf8")));
+    req.on("end", () => resolve(tooLarge ? null : Buffer.concat(chunks).toString("utf8")));
     req.on("error", () => resolve(null));
   });
 }
@@ -227,6 +249,7 @@ export async function startFixture(options: FixtureOptions = {}): Promise<Fixtur
   const codes = new Map<string, { clientId: string; redirectUri: string; challenge: string; used: boolean; family?: string }>();
   const mcpOpts = { checkAudience: true, validateOrigin: true, sessions: true, cors: "none", ...options.mcp };
   const mcpSessions = new Set<string>();
+  const rateHits = new Map<string, number[]>();
   /** access token -> { audience, family } */
   const accessTokens = new Map<string, { audience: string; family: string }>();
   const clients = new Map<string, { redirectUris: string[]; managementToken: string }>();
@@ -572,7 +595,7 @@ ${formTag}${hidden}${token}${challenge}${checkbox}
   }
 
   const server: Server = createServer((req: IncomingMessage, res: ServerResponse) => {
-    void readBody(req).then((body) => {
+    void readBody(req, Math.min(options.maxBodyBytes ?? DEFAULT_MAX_BODY, HARD_MAX_BODY)).then((body) => {
       try {
         if (body === null) return json(res, 413, { error: "request_too_large" });
         handle(req, body, res);
@@ -602,12 +625,29 @@ ${formTag}${hidden}${token}${challenge}${checkbox}
         }
         for (const [k, v] of Object.entries(cors)) res.setHeader(k, v);
         if (mcpOpts.validateOrigin && origin !== undefined && origin !== base) return json(res, 403, { error: "forbidden_origin" });
-        const query = new URL(req.url ?? "/", base).searchParams.get("access_token");
-        const bearer = /^Bearer\s+(\S+)$/i.exec(req.headers.authorization ?? "")?.[1] ?? (mcpOpts.acceptQueryToken && query ? query : undefined);
+        const params = new URL(req.url ?? "/", base).searchParams;
+        const queryNames = opts.staticKey ? ["access_token", "api_key", "key", "token"] : ["access_token"];
+        const query = queryNames.map((n) => params.get(n)).find((v) => v !== null) ?? null;
+        const keyHeader = (opts.staticKey?.header ?? "authorization").toLowerCase();
+        const presented =
+          keyHeader === "authorization"
+            ? /^Bearer\s+(\S+)$/i.exec(req.headers.authorization ?? "")?.[1]
+            : typeof req.headers[keyHeader] === "string"
+              ? (req.headers[keyHeader] as string)
+              : undefined;
+        const bearer = presented ?? (mcpOpts.acceptQueryToken && query ? query : undefined);
         const sessionId = req.headers["mcp-session-id"];
         const knownSession = typeof sessionId === "string" && mcpSessions.has(sessionId);
         const at = bearer ? accessTokens.get(bearer) : undefined;
-        const tokenOk = at !== undefined && !revokedFamilies.has(at.family) && (!mcpOpts.checkAudience || at.audience === `${base}/mcp`);
+        const staticOk = opts.staticKey !== undefined && bearer === opts.staticKey.value;
+        const tokenOk = staticOk || (at !== undefined && !revokedFamilies.has(at.family) && (!mcpOpts.checkAudience || at.audience === `${base}/mcp`));
+        if (tokenOk && mcpOpts.rateLimit !== undefined && bearer) {
+          const now = Date.now();
+          const hits = (rateHits.get(bearer) ?? []).filter((t) => now - t < 60_000);
+          hits.push(now);
+          rateHits.set(bearer, hits);
+          if (hits.length > mcpOpts.rateLimit) return json(res, 429, { error: "rate_limited" }, { "retry-after": "60" });
+        }
         if (tokenOk && mcpOpts.hangUpAuthenticated) {
           req.socket.destroy();
           return;
@@ -623,10 +663,20 @@ ${formTag}${hidden}${token}${challenge}${checkbox}
         if (opts.anonymous || tokenOk || (mcpOpts.sessionWithoutToken && knownSession)) {
           const extra: Record<string, string> = {};
           let rpc: { method?: string } = {};
+          let parsed: unknown = null;
           try {
-            rpc = JSON.parse(body) as { method?: string };
+            parsed = JSON.parse(body) as unknown;
+            if (!Array.isArray(parsed)) rpc = parsed as { method?: string };
           } catch {
             /* not JSON-RPC */
+          }
+          if (Array.isArray(parsed)) {
+            if (!mcpOpts.batch) return json(res, 400, { jsonrpc: "2.0", id: null, error: { code: -32600, message: "Batches are not supported" } });
+            return json(
+              res,
+              200,
+              parsed.map((m: { id?: unknown }) => ({ jsonrpc: "2.0", id: m?.id ?? null, result: {} })),
+            );
           }
           if (mcpOpts.sessions && rpc.method === "initialize") {
             const sid = randomBytes(16).toString("hex");
@@ -636,9 +686,12 @@ ${formTag}${hidden}${token}${challenge}${checkbox}
           if (typeof sessionId === "string" && !knownSession && mcpOpts.sessions) return json(res, 404, { error: "session_not_found" });
           return json(res, 200, { jsonrpc: "2.0", id: 1, result: rpc.method === "initialize" ? { protocolVersion: "2025-11-25", capabilities: {}, serverInfo: { name: "fixture", version: "0" } } : {} }, extra);
         }
-        const headers: Record<string, string> = opts.challenge
-          ? { "www-authenticate": `Bearer resource_metadata="${base}/.well-known/oauth-protected-resource/mcp", scope="mcp"` }
-          : {};
+        const headers: Record<string, string> =
+          opts.challenge === "bearer"
+            ? { "www-authenticate": 'Bearer realm="mcp"' }
+            : opts.challenge
+              ? { "www-authenticate": `Bearer resource_metadata="${base}/.well-known/oauth-protected-resource/mcp", scope="mcp"` }
+              : {};
         return json(res, 401, { error: "unauthorized" }, headers);
       }
       if (path === "/.well-known/oauth-protected-resource/mcp" && opts.prm) {

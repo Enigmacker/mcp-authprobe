@@ -5,7 +5,9 @@ import { CATALOGUE, getCheck } from "./checks/catalogue.js";
 import { loadGrant, type TestGrant } from "./credentials.js";
 import { HttpClient, plainHttpAllowed } from "./net/http.js";
 import { DNS_LABEL, proofFor, verifyOwnership, WELL_KNOWN_PATH } from "./ownership.js";
+import type { Credential } from "./oauth/mcp-call.js";
 import { parseSelection } from "./selection.js";
+import { loadBearerFile } from "./static-key.js";
 import { toMarkdown } from "./report/markdown.js";
 import { scan, type ScanOptions } from "./scan.js";
 import { TOOL_NAME, TOOL_VERSION } from "./version.js";
@@ -23,6 +25,9 @@ import { TOOL_NAME, TOOL_VERSION } from "./version.js";
  * Environment:
  *   MCP_AUTHPROBE_SECRET / MCP_AUTHPROBE_SECRET_FILE   ownership secret
  *   MCP_AUTHPROBE_CREDENTIALS_FILE                     test grant (consumed by a scan)
+ *   MCP_AUTHPROBE_BEARER_FILE + MCP_AUTHPROBE_BEARER_TARGET
+ *                                                      static API key, used only for that exact URL
+ *   MCP_AUTHPROBE_BEARER_HEADER                        header for the key (default Authorization)
  *   MCP_AUTHPROBE_ALLOW_PRIVATE=1                      local labs only
  *   MCP_AUTHPROBE_LAB_ORIGINS                          comma-separated lab origins exempt from proof
  *   MCP_AUTHPROBE_TIMEOUT_MS                           per-request timeout
@@ -37,6 +42,8 @@ export interface ServerConfig {
   labOrigins?: string[];
   secret?: string;
   credentialsFile?: string;
+  /** Static key, bound to one MCP URL by the human. */
+  staticKey?: { credential: Credential; target: string };
   allowPrivate: boolean;
   timeoutMs?: number;
   /** Test hook. */
@@ -64,6 +71,14 @@ export function configFromEnv(env: NodeJS.ProcessEnv = process.env): ServerConfi
   }
   const creds = env["MCP_AUTHPROBE_CREDENTIALS_FILE"];
   if (creds) config.credentialsFile = creds;
+  const keyFile = env["MCP_AUTHPROBE_BEARER_FILE"];
+  if (keyFile) {
+    const target = env["MCP_AUTHPROBE_BEARER_TARGET"];
+    if (!target) throw new Error("MCP_AUTHPROBE_BEARER_FILE needs MCP_AUTHPROBE_BEARER_TARGET: the MCP URL the key belongs to.");
+    const loaded = loadBearerFile(keyFile, env["MCP_AUTHPROBE_BEARER_HEADER"] ?? "authorization");
+    for (const w of loaded.warnings) process.stderr.write(`mcp-authprobe: warning: ${w}\n`);
+    config.staticKey = { credential: loaded.credential, target: new URL(target).toString() };
+  }
   const timeout = Number(env["MCP_AUTHPROBE_TIMEOUT_MS"]);
   if (Number.isFinite(timeout) && timeout > 0) config.timeoutMs = timeout;
   return config;
@@ -217,6 +232,10 @@ export function createAuthprobeServer(config: ServerConfig): McpServer {
         if (config.timeoutMs !== undefined) options.timeoutMs = config.timeoutMs;
         if (config.resolveTxtRecords) options.resolveTxtRecords = config.resolveTxtRecords;
         const notes: string[] = [];
+        if (config.staticKey) {
+          if (config.staticKey.target === parsed.toString()) options.credential = config.staticKey.credential;
+          else notes.push("The configured static key belongs to another URL (MCP_AUTHPROBE_BEARER_TARGET); it was not used.");
+        }
         if (config.credentialsFile) {
           try {
             const loaded = loadGrant(config.credentialsFile);
