@@ -227,7 +227,7 @@ export async function login(opts: LoginOptions): Promise<LoginResult> {
         }
       }
     } else {
-      notes.push("MAP-PKC01, MAP-RDR03, MAP-COD01, MAP-AUD01, MAP-ORG01, MAP-TOK01, MAP-SES01, MAP-BAT01 and MAP-BOD01 were not observed: ownership of the contacted hosts is not proven, or --no-probe was used.");
+      notes.push("MAP-PKC01, MAP-RDR03, MAP-COD01, MAP-AUD01, MAP-ORG01, MAP-TOK01, MAP-SES01, MAP-BAT01, MAP-BOD01 and MAP-INJ01 were not observed: ownership of the contacted hosts is not proven, or --no-probe was used.");
     }
 
     // --- The real exchange ---
@@ -392,7 +392,7 @@ async function postExchangeProbes(c: PostExchange): Promise<void> {
   };
 
   // Checks of the MCP endpoint with the access token, before any refresh
-  // (a refresh may invalidate it): ORG01, TOK01, SES01, BAT01, BOD01.
+  // (a refresh may invalidate it): ORG01, TOK01, SES01, BAT01, BOD01, INJ01.
   let control: number | null = null;
   const accessToken = tokens.accessToken;
   if (accessToken) {
@@ -400,7 +400,7 @@ async function postExchangeProbes(c: PostExchange): Promise<void> {
     control = ep.control;
     for (const f of ep.findings) observations.push({ ...f, observedAt: new Date().toISOString() });
   } else {
-    for (const id of ["MAP-ORG01", "MAP-TOK01", "MAP-SES01", "MAP-BAT01", "MAP-BOD01"]) {
+    for (const id of ["MAP-ORG01", "MAP-TOK01", "MAP-SES01", "MAP-BAT01", "MAP-BOD01", "MAP-INJ01"]) {
       observations.push(observation(id, target, "error", "Inconclusive: the token endpoint issued no access token.", []));
     }
   }

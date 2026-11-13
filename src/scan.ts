@@ -4,7 +4,7 @@ import { runRefreshTokenChecks } from "./checks/refresh-tokens.js";
 import { runThrottlingCheck } from "./checks/throttling.js";
 import type { Observation, TestGrant } from "./credentials.js";
 import { discover, type DiscoveryResult } from "./discovery.js";
-import { runEndpointChecks } from "./checks/endpoint.js";
+import { runEndpointChecks, runMetadataCheck } from "./checks/endpoint.js";
 import { FOREIGN_ORIGIN, initializeStatus, type Credential } from "./oauth/mcp-call.js";
 import { HttpClient } from "./net/http.js";
 import { verifyOwnership, type OwnershipResult, type VerifyOptions } from "./ownership.js";
@@ -95,7 +95,7 @@ export function hostsToVerify(mcpUrl: string, d: DiscoveryResult | null): string
 
 const RTK_IDS = ["MAP-RTK01", "MAP-RTK02", "MAP-RTK03"];
 /** Checks of the MCP endpoint that need a working credential. */
-const ENDPOINT_IDS = ["MAP-ORG01", "MAP-TOK01", "MAP-SES01", "MAP-BAT01", "MAP-BOD01", "MAP-THR02"];
+const ENDPOINT_IDS = ["MAP-ORG01", "MAP-TOK01", "MAP-SES01", "MAP-BAT01", "MAP-BOD01", "MAP-INJ01", "MAP-THR02"];
 
 async function runRefreshFamily(target: string, d: DiscoveryResult | null, http: HttpClient, options: ScanOptions): Promise<Finding[]> {
   const defs = RTK_IDS.map((id) => CATALOGUE.find((c) => c.id === id)).filter((c): c is CheckDefinition => c !== undefined);
@@ -122,6 +122,23 @@ function fromObservation(checkId: string, target: string, observations: Observat
   const obs = observations.filter((o) => o.checkId === checkId && o.target === target).at(-1);
   if (!obs) return finding(def, target, "skipped", "Observed during login: run `mcp-authprobe login` with ownership proven, then scan with the grant file it writes.");
   return finding(def, target, obs.status, obs.message, [...obs.evidence, `observed during login at ${obs.observedAt}`]);
+}
+
+/**
+ * MAP-INJ01 without a credential: the result observed during `login`, or,
+ * for a server that answers anonymous requests, a reading without one.
+ */
+async function metadataWithoutCredential(target: string, http: HttpClient, observations: Observation[]): Promise<Finding> {
+  const def = CATALOGUE.find((c) => c.id === "MAP-INJ01") as CheckDefinition;
+  if (observations.some((o) => o.checkId === def.id && o.target === target)) return fromObservation(def.id, target, observations);
+  let anonymous: number;
+  try {
+    anonymous = await initializeStatus(http, target);
+  } catch (err) {
+    return finding(def, target, "error", `Request failed: ${(err as Error).message}`);
+  }
+  if (anonymous >= 200 && anonymous < 300) return runMetadataCheck(http, target);
+  return finding(def, target, "skipped", "Needs a credential: run `mcp-authprobe login` (ownership proven) and scan with the grant file it writes, or pass a static key with --bearer-file.", [`initialize without any credential: HTTP ${anonymous}`]);
 }
 
 /**
@@ -297,7 +314,7 @@ export async function scan(mcpUrl: string, options: ScanOptions = {}): Promise<S
     // With a static key and ownership proven, the MCP endpoint checks run with the key.
     const handled = new Set<string>();
     if (options.credential && verified) {
-      const ids = (["MAP-ORG01", "MAP-TOK01", "MAP-SES01", "MAP-BAT01", "MAP-BOD01", "MAP-THR02"] as const).filter(wanted);
+      const ids = (["MAP-ORG01", "MAP-TOK01", "MAP-SES01", "MAP-BAT01", "MAP-BOD01", "MAP-INJ01", "MAP-THR02"] as const).filter(wanted);
       if (ids.length > 0) {
         const ep = await runEndpointChecks(http, target, options.credential, { checks: ids, ...(options.rateAttempts !== undefined ? { rateAttempts: options.rateAttempts } : {}) });
         findings.push(...ep.findings);
@@ -324,6 +341,7 @@ export async function scan(mcpUrl: string, options: ScanOptions = {}): Promise<S
       for (const id of ["MAP-RDR03", "MAP-PKC01", "MAP-COD01", "MAP-AUD01", "MAP-TOK01", "MAP-SES01", "MAP-BAT01", "MAP-BOD01"]) {
         if (!handled.has(id)) findings.push(fromObservation(id, target, options.observations ?? []));
       }
+      if (wanted("MAP-INJ01") && !handled.has("MAP-INJ01")) findings.push(await metadataWithoutCredential(target, http, options.observations ?? []));
       const csr = CATALOGUE.find((c) => c.id === "MAP-CSR01") as CheckDefinition;
       findings.push(finding(csr, target, "skipped", "Needs a logged-in browser session: run `mcp-authprobe consent-check` separately."));
       // Last on purpose: once throttled, the token endpoint may refuse other checks.

@@ -14,7 +14,7 @@ export const LAB_PROFILES = {
       tokens: { rotate: true, rejectReplay: false, bindRedirect: false, pkce: "optional", codeReuse: "allow" },
       authorization: { match: "prefix", registration: "lax" },
       consent: { csrf: "none", sameSite: "unset" },
-      mcp: { checkAudience: false, validateOrigin: false, acceptQueryToken: true, sessionWithoutToken: true, cors: "reflect-credentials" },
+      mcp: { checkAudience: false, validateOrigin: false, acceptQueryToken: true, sessionWithoutToken: true, cors: "reflect-credentials", metadata: "poisoned" },
     },
   },
   secure: {
@@ -23,7 +23,7 @@ export const LAB_PROFILES = {
       tokens: { rateLimitAfter: 5, codeReuse: "refuse" },
       authorization: { match: "exact", registration: "strict" },
       consent: { csrf: "token", sameSite: "Lax" },
-      mcp: { checkAudience: true, validateOrigin: true },
+      mcp: { checkAudience: true, validateOrigin: true, metadata: "clean" },
     },
   },
   "static-bearer": {
@@ -33,7 +33,7 @@ export const LAB_PROFILES = {
       asMetadata: false,
       challenge: "bearer",
       maxBodyBytes: 16 * 1024 * 1024,
-      mcp: { validateOrigin: false, acceptQueryToken: true, batch: true, sessions: true, sessionWithoutToken: true, cors: "reflect-credentials" },
+      mcp: { validateOrigin: false, acceptQueryToken: true, batch: true, sessions: true, sessionWithoutToken: true, cors: "reflect-credentials", metadata: "poisoned" },
     },
   },
   "static-bearer-secure": {
@@ -42,7 +42,7 @@ export const LAB_PROFILES = {
       prm: false,
       asMetadata: false,
       challenge: "bearer",
-      mcp: { validateOrigin: true, sessions: false, rateLimit: 20 },
+      mcp: { validateOrigin: true, sessions: false, rateLimit: 20, metadata: "clean" },
     },
   },
 } as const satisfies Record<string, { description: string; options: FixtureOptions }>;

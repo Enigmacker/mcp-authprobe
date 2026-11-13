@@ -104,6 +104,7 @@ describe("lab", () => {
       "MAP-SES01": "fail",
       "MAP-COR01": "fail",
       "MAP-THR01": "fail",
+      "MAP-INJ01": "fail",
     });
   });
 
@@ -126,7 +127,7 @@ describe("lab", () => {
     const report = await scan(lab.mcpUrl, { allowPrivate: true, credential: bearerCredential(key, "authorization", "static") });
     const status = Object.fromEntries(report.findings.map((f) => [f.checkId, f.status]));
     expect(status["MAP-DSC01"]).toBe("not_applicable");
-    for (const id of ["MAP-ORG01", "MAP-TOK01", "MAP-BAT01", "MAP-BOD01", "MAP-THR02"]) expect([id, status[id]]).toEqual([id, expected]);
+    for (const id of ["MAP-ORG01", "MAP-TOK01", "MAP-BAT01", "MAP-BOD01", "MAP-INJ01", "MAP-THR02"]) expect([id, status[id]]).toEqual([id, expected]);
     expect(status["MAP-COR01"]).toBe(expected);
   });
 });

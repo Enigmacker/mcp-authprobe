@@ -246,6 +246,23 @@ export const CATALOGUE: readonly CheckDefinition[] = [
     references: [{ title: "RFC 9110 - 413 Content Too Large", url: "https://www.rfc-editor.org/rfc/rfc9110#section-15.5.14" }, MCP_SEC],
   },
   {
+    id: "MAP-INJ01",
+    family: "INJ",
+    title: "Tool, prompt and resource metadata carry no hidden instructions",
+    severity: "high",
+    active: true,
+    availability: "available",
+    rationale:
+      "The client's model reads tool, prompt and resource descriptions, input schemas and the initialize instructions as trusted context. Hidden characters (Unicode tags, zero-width and bidi controls, ANSI escapes) or instruction-like text there (\"ignore previous instructions\", <IMPORTANT> blocks, \"do not tell the user\", paths such as ~/.ssh) is a prompt injection every user of the server receives: tool poisoning. Only the list methods are sent (tools/list, prompts/list, resources/list, resources/templates/list); no tool is called and no resource is read. The report names where something matched, never the suspicious text itself. Pattern matching: a pass is not a proof, and a match is something to review.",
+    remediation:
+      "Keep descriptions plain, visible text about what the tool does. Strip invisible and control characters from anything generated or imported into descriptions (for instance from a third-party API or a package), never put instructions for the model about other tools, files or the user into metadata, and review metadata changes like code. Tool names: 1 to 128 of A-Z a-z 0-9 _ - . (MCP 2025-11-25).",
+    references: [
+      { title: "MCP specification - Tools, security considerations", url: "https://modelcontextprotocol.io/specification/2025-11-25/server/tools#security-considerations" },
+      { title: "OWASP LLM01:2025 Prompt Injection", url: "https://genai.owasp.org/llmrisk/llm01-prompt-injection/" },
+      MCP_SEC,
+    ],
+  },
+  {
     id: "MAP-THR02",
     family: "THR",
     title: "MCP endpoint rate-limits each credential",

@@ -3,11 +3,13 @@ import { endSession, FOREIGN_ORIGIN, jsonRpcMessages, mcpPost, type Credential }
 import { safeText } from "../redact.js";
 import type { CheckStatus, Finding } from "../types.js";
 import { CATALOGUE } from "./catalogue.js";
+import { inspectMetadata, isPoisoned } from "./metadata.js";
 
 /**
  * Checks of the MCP endpoint itself, with a working credential: an OAuth
  * access token during `login`, or a static API key (`--bearer-file`) during
- * `scan`. Only side-effect-free methods are sent (initialize, ping): never
+ * `scan`. Only side-effect-free methods are sent (initialize, ping and the
+ * list methods): never
  * tools/call, so no real tool runs. Every check has a hard request cap, and
  * a failed request makes that check inconclusive without stopping the others.
  *
@@ -15,7 +17,7 @@ import { CATALOGUE } from "./catalogue.js";
  * credential may be refused for a while.
  */
 
-export type EndpointCheckId = "MAP-ORG01" | "MAP-TOK01" | "MAP-SES01" | "MAP-BAT01" | "MAP-BOD01" | "MAP-THR02";
+export type EndpointCheckId = "MAP-ORG01" | "MAP-TOK01" | "MAP-SES01" | "MAP-BAT01" | "MAP-BOD01" | "MAP-INJ01" | "MAP-THR02";
 
 export interface EndpointOptions {
   /** Checks to run (default: all but MAP-THR02). */
@@ -67,7 +69,7 @@ async function* chunked(text: string): AsyncIterable<Uint8Array> {
 }
 
 export async function runEndpointChecks(http: HttpClient, target: string, cred: Credential, options: EndpointOptions = {}): Promise<EndpointResult> {
-  const wanted = new Set<EndpointCheckId>(options.checks ?? ["MAP-ORG01", "MAP-TOK01", "MAP-SES01", "MAP-BAT01", "MAP-BOD01"]);
+  const wanted = new Set<EndpointCheckId>(options.checks ?? ["MAP-ORG01", "MAP-TOK01", "MAP-SES01", "MAP-BAT01", "MAP-BOD01", "MAP-INJ01"]);
   const findings: Finding[] = [];
   const what = cred.kind === "static" ? "key" : "token";
   const guard = async (checkId: EndpointCheckId, run: () => Promise<void>): Promise<void> => {
@@ -285,6 +287,10 @@ export async function runEndpointChecks(http: HttpClient, target: string, cred: 
   });
 
   // --- MAP-THR02: a rate limit per credential (last: it may lock the credential for a while).
+  await guard("MAP-INJ01", async () => {
+    findings.push(await runMetadataCheck(http, target, cred));
+  });
+
   await guard("MAP-THR02", async () => {
     const attempts = clampRateAttempts(options.rateAttempts);
     const session = await openSession();
@@ -325,4 +331,29 @@ export async function runEndpointChecks(http: HttpClient, target: string, cred: 
   });
 
   return { findings, control };
+}
+
+/**
+ * MAP-INJ01 on its own: with a credential, or anonymously for a server that
+ * serves anonymous requests (`cred` undefined).
+ */
+export async function runMetadataCheck(http: HttpClient, target: string, cred?: Credential): Promise<Finding> {
+  const what = !cred ? "no credential" : cred.kind === "static" ? "the key" : "the token";
+  const r = await inspectMetadata(http, target, cred);
+  if (r.initializeStatus === null || r.initializeStatus < 200 || r.initializeStatus >= 300) {
+    return result("MAP-INJ01", target, "error", `Inconclusive: initialize with ${what} did not work, so the metadata cannot be read.`, [
+      `initialize with ${what}: ${r.initializeStatus === null ? "no usable answer" : `HTTP ${r.initializeStatus}`}`,
+      ...r.notes,
+    ]);
+  }
+  const c = r.counts;
+  const read = `read: ${c.tools} tool(s), ${c.prompts} prompt(s), ${c.resources} resource(s), ${c.templates} resource template(s) and the initialize result`;
+  // Locations and pattern names only: the suspicious text itself is never copied into the report.
+  const lines = [read, ...r.issues.slice(0, 30).map((i) => `${i.where}: ${i.detail}`), ...(r.issues.length > 30 ? [`… and ${r.issues.length - 30} more`] : []), ...r.notes];
+  if (isPoisoned(r.issues)) {
+    const n = new Set(r.issues.filter((i) => i.kind !== "name").map((i) => i.item)).size;
+    return result("MAP-INJ01", target, "fail", `Metadata the client's model reads contains hidden characters or instruction-like text (${n} place(s)): review it as a possible prompt injection.`, lines);
+  }
+  const names = r.issues.filter((i) => i.kind === "name").length;
+  return result("MAP-INJ01", target, "pass", `No hidden characters or instruction-like text in the metadata${names ? ` (${names} tool name(s) outside the recommended format)` : ""}.`, lines);
 }

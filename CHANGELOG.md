@@ -6,6 +6,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.10.0] - 2026-11-13
+
+### Added
+
+- `MAP-INJ01` (tool poisoning, high): tool, prompt and resource metadata and the initialize `instructions` are read with the list methods only (`tools/list`, `prompts/list`, `resources/list`, `resources/templates/list`; nothing is called or read) and must carry no invisible characters (Unicode tags, decoded before matching; zero-width and bidi controls; ANSI escapes) and no instruction-like text ("ignore previous instructions", `<IMPORTANT>`, "do not tell the user", `~/.ssh`…). Tool names with non-ASCII characters fail too. Runs with a static key, during `login`, or anonymously on a server that answers anonymous requests. The report locates matches and never copies the suspicious text.
+- The `vulnerable` and `static-bearer` lab profiles announce a poisoned tool, prompt and resource; the secure profiles, clean ones.
+
+### Changed
+
+- The lab answers JSON-RPC notifications with 202 and echoes request IDs.
+
 ## [0.9.0] - 2026-11-13
 
 Servers authenticated by a static API key (no OAuth) are now tested, following a field trial against one: 0.8.0 skipped 14 of 19 checks there.
