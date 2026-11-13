@@ -227,7 +227,7 @@ mcp-authprobe login https://mcp.example.com/mcp --out ./test-grant.json
 | `MAP-PKC01` | Presents the code **without** `code_verifier`, then with a **wrong** one | The token endpoint issues tokens |
 | `MAP-RDR03` | Presents the code with a **different** `redirect_uri` | The token endpoint issues tokens |
 | *(exchange)* | Exchanges the code normally | |
-| `MAP-ORG01` | Sends `initialize` with its access token (control, must succeed), then the same request with `Origin: https://attacker.mcp-authprobe.invalid`, then the control again | The foreign request is processed like any other. Passes on 403 only if the token still works afterwards |
+| `MAP-ORG01` | Sends `initialize` with its access token (control, must succeed), then the same request with `Origin: https://attacker.mcp-authprobe.invalid`, then the control again | The foreign request is processed like any other. Passes when it is refused with a 4xx (403 is what the spec expects) and the token still works afterwards |
 | `MAP-TOK01` | Sends `initialize` with the token as `?access_token=` and no `Authorization` header, then the control again | The token in the URL is accepted (the MCP specification forbids it: URLs end up in logs, history and `Referer` headers). The token never appears in the report |
 | `MAP-SES01` | Opens an MCP session with its token, sends `ping` with the session ID and the token (control), then with the session ID only, and ends the session | The request without a token is processed. Not applicable to stateless servers that assign no session ID |
 | `MAP-AUD01` | Uses the refresh token to request a token for `https://other.mcp-authprobe.invalid/mcp` and presents it to your MCP endpoint (only after a successful control) | The MCP endpoint accepts a token whose audience is the other resource (read from a JWT `aud`). Passes when the authorization server answers `invalid_target`, or the MCP endpoint answers 401/403. When the token is opaque, or the authorization server ignored `resource` and issued a token for your server, the result is inconclusive with an explanation, because the MCP server cannot be blamed |
@@ -417,7 +417,7 @@ With the key, and only once ownership of the target is proven, the checks of the
 
 | Check | With the key |
 | --- | --- |
-| `MAP-ORG01` | `initialize` with a foreign Origin, `Origin: null` and a malformed Origin: each must get 403 |
+| `MAP-ORG01` | `initialize` with a foreign Origin, `Origin: null` and a malformed Origin: each must be refused with a 4xx (403 is what the spec expects) |
 | `MAP-TOK01` | The key as `?access_token=`, `?api_key=`, `?key=` and `?token=`, without any header: each must be refused |
 | `MAP-SES01` | When the server uses sessions: a `ping` carrying only the session ID must be refused |
 | `MAP-BAT01` | One POST carrying a JSON-RPC batch of 5 `ping` requests must be refused: MCP has allowed one message per request since 2025-06-18, and a server that runs batches counts many calls as one |

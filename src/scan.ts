@@ -233,7 +233,7 @@ async function runCorsCheck(target: string, http: HttpClient): Promise<Finding> 
  * Origin. Without a token most servers answer 401 before looking at Origin;
  * `login` then observes it with a valid token.
  */
-async function runOriginCheck(target: string, http: HttpClient, observations: Observation[]): Promise<Finding> {
+async function runOriginCheck(target: string, http: HttpClient, observations: Observation[], staticKey = false): Promise<Finding> {
   const def = CATALOGUE.find((c) => c.id === "MAP-ORG01") as CheckDefinition;
   if (observations.some((o) => o.checkId === def.id && o.target === target)) return fromObservation(def.id, target, observations);
   let baseline: number;
@@ -250,7 +250,10 @@ async function runOriginCheck(target: string, http: HttpClient, observations: Ob
     return finding(def, target, "fail", "A request from a foreign Origin is processed like any other: the Origin header is not validated.", evidence);
   }
   if (baseline === 401 && foreign === 401) {
-    return finding(def, target, "error", "Inconclusive: the server asks for authentication before looking at Origin. Run `mcp-authprobe login` (ownership proven) to observe it with a valid token.", evidence);
+    const next = staticKey
+      ? "Prove ownership of the target so the declared key can be used, then scan again."
+      : "Run `mcp-authprobe login` (ownership proven) to observe it with a valid token, or pass a static key with --bearer-file.";
+    return finding(def, target, "error", `Inconclusive: the server asks for authentication before looking at Origin. ${next}`, evidence);
   }
   return finding(def, target, "error", "Unexpected answers; inconclusive.", evidence);
 }
@@ -301,7 +304,7 @@ export async function scan(mcpUrl: string, options: ScanOptions = {}): Promise<S
         for (const id of ids) handled.add(id);
       }
     }
-    if (wanted("MAP-ORG01") && !handled.has("MAP-ORG01")) findings.push(await runOriginCheck(target, http, options.observations ?? []));
+    if (wanted("MAP-ORG01") && !handled.has("MAP-ORG01")) findings.push(await runOriginCheck(target, http, options.observations ?? [], options.credential?.kind === "static"));
     if (wanted("MAP-COR01")) findings.push(await runCorsCheck(target, http));
 
     const active = CATALOGUE.filter((c) => c.active);
@@ -309,7 +312,7 @@ export async function scan(mcpUrl: string, options: ScanOptions = {}): Promise<S
       for (const def of active) {
         findings.push(finding(def, target, "skipped", "Ownership of every contacted host is not proven; active check not run."));
       }
-    } else if (options.credential?.kind === "static" && !discovery?.as) {
+    } else if (options.credential?.kind === "static" && discovery !== null && !discovery.prm && !discovery.as && !discovery.challenge.resourceMetadataUrl) {
       // No OAuth on this server: the authorization server checks do not apply.
       for (const def of active.filter((c) => !handled.has(c.id) && !ENDPOINT_IDS.includes(c.id))) {
         findings.push(finding(def, target, "not_applicable", "The server does not use OAuth (static key declared, no authorization server discovered)."));

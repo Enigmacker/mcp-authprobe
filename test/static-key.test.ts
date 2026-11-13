@@ -58,6 +58,7 @@ describe("static key file", () => {
   it("refuses empty files, several words, symlinks and unsafe headers", () => {
     expect(() => loadBearerFile(keyFile(""))).toThrow(/empty/);
     expect(() => loadBearerFile(keyFile("Bearer abc"))).toThrow(StaticKeyError);
+    expect(() => loadBearerFile(keyFile("short\n"))).toThrow(/fewer than 8/);
     const target = keyFile();
     const link = join(dir(), "link");
     symlinkSync(target, link);

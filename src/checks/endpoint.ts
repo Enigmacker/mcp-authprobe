@@ -211,12 +211,18 @@ export async function runEndpointChecks(http: HttpClient, target: string, cred: 
   await guard("MAP-BAT01", async () => {
     const session = await openSession();
     try {
+      // Control: one ping, same configuration, must work; otherwise a refused batch proves nothing.
+      const single = await mcpPost(http, target, { auth: cred, ...(session ? { sessionId: session } : {}), method: "ping" });
+      if (!is2xx(single.status)) {
+        findings.push(result("MAP-BAT01", target, "error", "Inconclusive: a single ping is not accepted either, so a refused batch proves nothing.", [`control, one ping request: HTTP ${single.status}`]));
+        return;
+      }
       const batch = JSON.stringify(Array.from({ length: BATCH_SIZE }, (_, i) => ({ jsonrpc: "2.0", id: i + 1, method: "ping" })));
       const r = await mcpPost(http, target, { auth: cred, ...(session ? { sessionId: session } : {}), body: batch });
       const messages = jsonRpcMessages(r);
       const results = messages.filter((m) => typeof m === "object" && m !== null && "result" in m).length;
       const errors = messages.filter((m) => typeof m === "object" && m !== null && "error" in m).length;
-      const lines = [`one POST carrying a JSON-RPC batch of ${BATCH_SIZE} ping requests: HTTP ${r.status}, ${results} result(s), ${errors} error(s)`];
+      const lines = [`control, one ping request: HTTP ${single.status}`, `one POST carrying a JSON-RPC batch of ${BATCH_SIZE} ping requests: HTTP ${r.status}, ${results} result(s), ${errors} error(s)`];
       if (results >= 2) {
         findings.push(
           result(
@@ -244,6 +250,13 @@ export async function runEndpointChecks(http: HttpClient, target: string, cred: 
     const lines: string[] = [];
     const verdicts: Array<"accepted" | "refused" | "unclear"> = [];
     try {
+      // Control: the same request at 1 KiB must work, so a refusal is about the size.
+      const small = await mcpPost(http, target, { auth: cred, ...(session ? { sessionId: session } : {}), body: paddedPing(1024) });
+      lines.push(`control, the same ping padded to 1 KiB: HTTP ${small.status}`);
+      if (!is2xx(small.status)) {
+        findings.push(result("MAP-BOD01", target, "error", "Inconclusive: the padded ping is refused even at 1 KiB, so a refusal of the large one proves nothing.", lines));
+        return;
+      }
       const text = paddedPing(OVERSIZED_BODY_BYTES);
       for (const variant of [
         { label: `${mib} MiB body with Content-Length`, body: text as string | AsyncIterable<Uint8Array> },
@@ -252,7 +265,8 @@ export async function runEndpointChecks(http: HttpClient, target: string, cred: 
         try {
           const r = await mcpPost(http, target, { auth: cred, ...(session ? { sessionId: session } : {}), body: variant.body });
           lines.push(`${variant.label}: HTTP ${r.status}`);
-          verdicts.push(is2xx(r.status) ? "accepted" : r.status === 413 || (r.status >= 400 && r.status < 500) ? "refused" : "unclear");
+          // The 1 KiB control worked, so a 4xx here is about the size (413 is the expected one).
+          verdicts.push(is2xx(r.status) ? "accepted" : r.status >= 400 && r.status < 500 ? "refused" : "unclear");
         } catch (e) {
           lines.push(`${variant.label}: connection closed before an answer (${(e as Error).message})`);
           verdicts.push("unclear");
@@ -276,19 +290,24 @@ export async function runEndpointChecks(http: HttpClient, target: string, cred: 
     const session = await openSession();
     const counts = new Map<number, number>();
     const started = Date.now();
+    let accepted = 0;
     try {
       for (let i = 1; i <= attempts; i += 1) {
         const r = await mcpPost(http, target, { auth: cred, ...(session ? { sessionId: session } : {}), method: "ping" });
         counts.set(r.status, (counts.get(r.status) ?? 0) + 1);
-        const tally = [...counts].map(([s, n]) => `HTTP ${s} x${n}`).join(", ");
-        if (r.status === 429 || (r.headers["retry-after"] !== undefined && r.status >= 400)) {
-          findings.push(result("MAP-THR02", target, "pass", `The ${what} is rate limited: refused after ${i - 1} requests in ${Date.now() - started} ms.`, [`ping requests with the ${what}: ${tally}`]));
-          return;
+        const evidence = [`ping requests with the ${what}: ${[...counts].map(([s, n]) => `HTTP ${s} x${n}`).join(", ")}`];
+        if (is2xx(r.status)) {
+          accepted += 1;
+          continue;
         }
-        if (r.status >= 500) {
-          findings.push(result("MAP-THR02", target, "error", "The endpoint answered with a server error; inconclusive.", [`ping requests with the ${what}: ${tally}`]));
-          return;
+        if (r.status === 429 || (r.headers["retry-after"] !== undefined && r.status >= 400 && r.status < 500)) {
+          findings.push(result("MAP-THR02", target, "pass", `The ${what} is rate limited: refused after ${accepted} accepted requests in ${Date.now() - started} ms.`, evidence));
+        } else if (accepted > 0 && (r.status === 401 || r.status === 403)) {
+          findings.push(result("MAP-THR02", target, "pass", `The ${what} was refused (HTTP ${r.status}) after ${accepted} accepted requests: probably a limit or a block; 429 with Retry-After is the standard answer.`, evidence));
+        } else {
+          findings.push(result("MAP-THR02", target, "error", `Unexpected answer (HTTP ${r.status}) to a ping with the ${what}; inconclusive.`, evidence));
         }
+        return;
       }
     } finally {
       if (session) await endSession(http, target, cred, session);

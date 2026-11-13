@@ -9,6 +9,7 @@ import { registerSecret } from "./redact.js";
  * proven.
  */
 
+const MIN_KEY_LENGTH = 8;
 const MAX_KEY_BYTES = 8 * 1024;
 /** Headers a key may not be sent in: they would change the request itself. */
 const FORBIDDEN_HEADERS = new Set(["host", "content-length", "content-type", "transfer-encoding", "connection", "origin", "mcp-session-id", "mcp-protocol-version", "accept", "user-agent"]);
@@ -47,6 +48,8 @@ export function loadBearerFile(path: string, header = "authorization"): { creden
   }
   const key = text.trim();
   if (!key) throw new StaticKeyError(`${path} is empty.`);
+  // Short values could not be redacted reliably and are not real keys.
+  if (key.length < MIN_KEY_LENGTH) throw new StaticKeyError(`${path} holds fewer than ${MIN_KEY_LENGTH} characters; expected an API key.`);
   if (/[\s\u0000-\u001f\u007f]/.test(key)) throw new StaticKeyError(`${path} must contain one key on one line, without spaces.`);
   registerSecret(key);
   return { credential: bearerCredential(key, h, "static"), warnings };

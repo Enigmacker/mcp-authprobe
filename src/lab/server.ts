@@ -189,8 +189,10 @@ function json(res: ServerResponse, status: number, body: unknown, headers: Recor
 }
 
 const DEFAULT_MAX_BODY = 64 * 1024;
-/** Never read more than this, whatever the profile: the lab must not be easy to knock over. */
+/** Never accept more than this, whatever the profile: the lab must not be easy to knock over. */
 const HARD_MAX_BODY = 32 * 1024 * 1024;
+/** Beyond the limit, drain at most this much (so a probe gets its 413), then cut the connection. */
+const MIN_DRAIN = 8 * 1024 * 1024;
 
 /**
  * Request body, or null when it exceeds `max` or the request fails. An
@@ -203,7 +205,7 @@ function readBody(req: IncomingMessage, max: number): Promise<string | null> {
     let tooLarge = false;
     req.on("data", (c: Buffer) => {
       size += c.length;
-      if (size > HARD_MAX_BODY) {
+      if (size > Math.max(max, MIN_DRAIN)) {
         resolve(null);
         req.destroy();
         return;

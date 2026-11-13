@@ -75,7 +75,10 @@ jobs:
             for i in $(seq 1 20); do curl -s -o /dev/null "http://127.0.0.1:$port/mcp" && break; sleep 0.5; done
           done
           # Throwaway key of the static lab, printed in its banner.
-          echo "key=$(grep -o 'lab_[A-Za-z0-9_-]*' static.log | head -1)" >> "$GITHUB_OUTPUT"
+          key=""
+          for i in $(seq 1 20); do key=$(grep -o 'lab_[A-Za-z0-9_-]*' static.log | head -1) && [ -n "$key" ] && break; sleep 0.5; done
+          [ -n "$key" ] || { cat static.log; exit 1; }
+          echo "key=$key" >> "$GITHUB_OUTPUT"
       - name: Secure lab passes (with an mcp-posture report merged)
         uses: ./
         with:

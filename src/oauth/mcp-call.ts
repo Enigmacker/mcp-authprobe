@@ -71,11 +71,11 @@ export async function mcpPost(http: HttpClient, mcpUrl: string, o: McpPostOption
     headers[auth.header] = auth.value;
   }
   if (o.origin) headers["origin"] = o.origin;
-  if (o.sessionId) {
-    headers["mcp-session-id"] = o.sessionId;
-    headers["mcp-protocol-version"] = PROTOCOL_VERSION;
-  }
   const method = o.method ?? "initialize";
+  // After initialize, every request carries the negotiated version (MCP 2025-06-18 and later),
+  // so a server cannot refuse it, or fall back to an older revision, for that reason alone.
+  if (o.sessionId || method !== "initialize" || o.body !== undefined) headers["mcp-protocol-version"] = PROTOCOL_VERSION;
+  if (o.sessionId) headers["mcp-session-id"] = o.sessionId;
   const body = o.body ?? JSON.stringify({ jsonrpc: "2.0", id: 1, method, ...(method === "initialize" ? { params: initializeParams() } : {}) });
   let res;
   try {
@@ -101,15 +101,24 @@ export async function endSession(http: HttpClient, mcpUrl: string, auth: Credent
   }
 }
 
-/** JSON-RPC messages in a response body, JSON or SSE (`data:` lines). */
+/**
+ * JSON-RPC messages in a response body: JSON, or SSE where one event may
+ * spread its data over several `data:` lines (joined with newlines).
+ */
 export function jsonRpcMessages(res: McpPostResult): unknown[] {
   const type = (res.headers["content-type"] ?? "").toLowerCase();
   const chunks = type.includes("text/event-stream")
     ? res.body
-        .split(/\r?\n/)
-        .filter((l) => l.startsWith("data:"))
-        .map((l) => l.slice(5).trim())
-        .filter((l) => l.length > 0)
+        .split(/\r?\n\r?\n/)
+        .map((event) =>
+          event
+            .split(/\r?\n/)
+            .filter((l) => l.startsWith("data:"))
+            .map((l) => l.slice(5).replace(/^ /, ""))
+            .join("\n")
+            .trim(),
+        )
+        .filter((d) => d.length > 0)
     : [res.body];
   const out: unknown[] = [];
   for (const c of chunks) {
