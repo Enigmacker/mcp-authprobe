@@ -6,6 +6,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.10.1] - 2026-11-13
+
+### Changed
+
+- MCP mode: every tool description now says when to use the tool, what it returns and what it never does, every parameter is documented, and the server instructions describe the whole flow (checks, ownership proof, scan) and all check families.
+- `explain_check` also accepts IDs without the `MAP-` prefix, case-insensitive (`rtk02`).
+
 ## [0.10.0] - 2026-11-13
 
 ### Added
