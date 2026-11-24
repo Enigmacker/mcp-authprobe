@@ -79,6 +79,12 @@ export interface AuthorizationBehaviour {
   clientIdMetadataDocuments?: boolean;
   /** Omit code_challenge_methods_supported from the metadata. */
   hidePkceMethods?: boolean;
+  /**
+   * Consent mode: send a visitor without a session to the login page before
+   * looking at redirect_uri, as many servers do (default false: the request
+   * is validated first). redirect_uri can then only be judged in a session.
+   */
+  validateAfterLogin?: boolean;
 }
 
 /** Consent page behaviour, for MAP-CSR01. */
@@ -108,6 +114,14 @@ export interface ConsentBehaviour {
    * "unbound": any request with a known id grants consent, even without cookies.
    */
   flowUrl?: "bound" | "unbound";
+  /**
+   * Where redirect_uri is checked: "request" (default, before the consent
+   * page is shown) or "approval" (the consent page is shown for any URI, the
+   * submission is refused).
+   */
+  checkRedirectAt?: "request" | "approval";
+  /** A logged-in user is redirected with a code at once (consent remembered, or a first-party client). */
+  skipConsent?: boolean;
 }
 
 export interface FixtureOptions {
@@ -355,7 +369,7 @@ export async function startFixture(options: FixtureOptions = {}): Promise<Fixtur
     ...options.tokens,
   };
   let authzRequests = 0;
-  const authz: Required<Omit<AuthorizationBehaviour, "rateLimitAfter" | "clients" | "clientIdMetadataDocuments" | "hidePkceMethods">> & Pick<AuthorizationBehaviour, "rateLimitAfter" | "clients" | "clientIdMetadataDocuments" | "hidePkceMethods"> = { match: "exact", noSession: "login", registration: "strict", management: true, issInResponse: true, ...options.authorization };
+  const authz: Required<Omit<AuthorizationBehaviour, "rateLimitAfter" | "clients" | "clientIdMetadataDocuments" | "hidePkceMethods">> & Pick<AuthorizationBehaviour, "rateLimitAfter" | "clients" | "clientIdMetadataDocuments" | "hidePkceMethods"> = { match: "exact", noSession: "login", registration: "strict", management: true, issInResponse: true, validateAfterLogin: false, ...options.authorization };
   const codes = new Map<string, { clientId: string; redirectUri: string; challenge: string; used: boolean; family?: string }>();
   const mcpOpts = { checkAudience: true, validateOrigin: true, sessions: true, cors: "none", ...options.mcp };
   const mcpSessions = new Set<string>();
@@ -555,16 +569,34 @@ export async function startFixture(options: FixtureOptions = {}): Promise<Fixtur
   const esc = (v: string): string => v.replace(/&/g, "&amp;").replace(/"/g, "&quot;").replace(/</g, "&lt;");
 
   function consentAuthorize(req: IncomingMessage, url: URL, res: ServerResponse): void {
-    const invalid = invalidAuthorizeRequest(url.searchParams);
-    if (invalid) return json(res, 400, { error: "invalid_request", error_description: invalid });
     const sid = cookieOf(req, "sid");
     const csrf = sid ? sessions.get(sid) : undefined;
+    const validate = (): boolean => {
+      if (consentOpts.checkRedirectAt === "approval") return true;
+      const invalid = invalidAuthorizeRequest(url.searchParams);
+      if (invalid) json(res, 400, { error: "invalid_request", error_description: invalid });
+      return !invalid;
+    };
+    if (!authz.validateAfterLogin && !validate()) return;
     if (!sid || csrf === undefined) {
       res.writeHead(302, { location: `${base}/login?return=${encodeURIComponent(url.pathname + url.search)}` });
       res.end();
       return;
     }
+    if (authz.validateAfterLogin && !validate()) return;
     const q = url.searchParams;
+    if (consentOpts.skipConsent) {
+      granted += 1;
+      const redirectUri = q.get("redirect_uri") ?? "";
+      const code = newToken("code");
+      codes.set(code, { clientId: q.get("client_id") ?? "", redirectUri, challenge: q.get("code_challenge") ?? "", used: false });
+      const back = new URL(redirectUri);
+      back.searchParams.set("code", code);
+      back.searchParams.set("state", q.get("state") ?? "");
+      res.writeHead(302, { location: back.toString() });
+      res.end();
+      return;
+    }
     const hidden = ["client_id", "redirect_uri", "state", "code_challenge", "code_challenge_method", "resource", "scope"]
       .map((k) => `<input type="hidden" name="${k}" value="${esc(q.get(k) ?? "")}">`)
       .join("");

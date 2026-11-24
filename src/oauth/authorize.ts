@@ -1,5 +1,5 @@
 import { createHash, randomBytes } from "node:crypto";
-import type { HttpClient } from "../net/http.js";
+import type { HttpClient, HttpResponse } from "../net/http.js";
 
 /**
  * Authorization request probe.
@@ -46,7 +46,8 @@ export function pointsTo(location: string, candidate: string): boolean {
   return loc.protocol === cand.protocol && loc.host === cand.host && loc.pathname === cand.pathname && loc.username === cand.username;
 }
 
-export async function probeAuthorize(http: HttpClient, p: AuthorizeParams): Promise<AuthorizeAnswer> {
+/** The authorization request URL: code flow, PKCE S256, a random state, the RFC 8707 resource. */
+export function authorizeUrl(p: AuthorizeParams): URL {
   const url = new URL(p.authorizationEndpoint);
   url.searchParams.set("response_type", "code");
   url.searchParams.set("client_id", p.clientId);
@@ -56,22 +57,31 @@ export async function probeAuthorize(http: HttpClient, p: AuthorizeParams): Prom
   url.searchParams.set("code_challenge_method", "S256");
   if (p.resource) url.searchParams.set("resource", p.resource);
   if (p.scope) url.searchParams.set("scope", p.scope);
+  return url;
+}
 
-  const res = await http.request({ url: url.toString(), headers: { accept: "text/html,application/json" } });
+/** How one answer of the authorization server relates to the redirect URI that was sent. */
+export function classifyAnswer(res: Pick<HttpResponse, "status" | "headers">, requestUrl: URL | string, redirectUri: string): AuthorizeAnswer {
   if (res.status === 429 || res.status >= 500 || res.headers["retry-after"] !== undefined) return { kind: "unavailable", status: res.status };
   const location = res.headers["location"];
   if (res.status >= 300 && res.status < 400 && location) {
     let absolute: string;
     try {
-      absolute = new URL(location, url).toString();
+      absolute = new URL(location, requestUrl).toString();
     } catch {
       return { kind: "page", status: res.status };
     }
-    if (pointsTo(absolute, p.redirectUri)) return { kind: "redirect-to-candidate", status: res.status };
+    if (pointsTo(absolute, redirectUri)) return { kind: "redirect-to-candidate", status: res.status };
     const dest = new URL(absolute);
     return { kind: "redirect-elsewhere", status: res.status, destination: `${dest.origin}${dest.pathname}` };
   }
   return { kind: "page", status: res.status };
+}
+
+export async function probeAuthorize(http: HttpClient, p: AuthorizeParams): Promise<AuthorizeAnswer> {
+  const url = authorizeUrl(p);
+  const res = await http.request({ url: url.toString(), headers: { accept: "text/html,application/json" } });
+  return classifyAnswer(res, url, p.redirectUri);
 }
 
 /** Comparable signature: two answers with the same signature are indistinguishable. */

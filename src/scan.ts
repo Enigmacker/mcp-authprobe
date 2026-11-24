@@ -3,6 +3,7 @@ import { CATALOGUE } from "./checks/catalogue.js";
 import { runEndpointChecks, runMetadataCheck, type EndpointCheckId } from "./checks/endpoint.js";
 import { makeFinding, summarize } from "./checks/finding.js";
 import { runRedirectUriChecks } from "./checks/redirect-uris.js";
+import type { AuthorizationSession } from "./checks/redirect-session.js";
 import { runRefreshTokenSequence, type GrantState } from "./checks/refresh-tokens.js";
 import { runThrottlingCheck } from "./checks/throttling.js";
 import { observationSource, type Observation, type TestGrant } from "./credentials.js";
@@ -91,6 +92,16 @@ export interface ScanOptions {
    * redirect URIs, needed by the redirect URI checks.
    */
   client?: { clientId: string; clientSecret?: string; redirectUri?: string };
+  /**
+   * A logged-in test account session on the authorization server
+   * (--session-cookie-file): MAP-RDR01 and MAP-RDR02 are replayed in it, for
+   * servers that only validate redirect_uri after login. `approveConsent`
+   * (--approve-consent) lets them submit the consent form when it is shown
+   * for an unregistered URI, which grants the test client access for the
+   * test account. The cookie goes to the authorization endpoint's origin
+   * only, and never into a report.
+   */
+  authorizationSession?: AuthorizationSession;
   /** Called at the start and end of the scan, of discovery and of every check. Must not throw. */
   onEvent?: (event: ScanEvent) => void;
   /** Test hooks. */
@@ -394,6 +405,7 @@ async function runRedirectFamily(ctx: Ctx, select: CheckSelector): Promise<Findi
     ...(ctx.options.client ? { client: { clientId: ctx.options.client.clientId, ...(ctx.options.client.redirectUri ? { redirectUri: ctx.options.client.redirectUri } : {}) } } : {}),
   };
   if (scope) c.scope = scope;
+  if (ctx.options.authorizationSession) c.session = ctx.options.authorizationSession;
   return runRedirectUriChecks(c);
 }
 

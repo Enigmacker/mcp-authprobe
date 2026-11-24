@@ -24,7 +24,7 @@ mcp-authprobe scan https://mcp.example.com/mcp \
   --deadline 300 --fail-on-inconclusive false
 ```
 
-- **Secrets only come from files or the environment**, never from the command line: `--secret-file` (or `MCP_AUTHPROBE_SECRET`), `--bearer-file`, `--access-token-file`, `--credentials-file`, `--client-secret-file`. Each is read once, must be a regular file of bounded size, and gets a warning when other users can read it. Key and token files are refused when they are symbolic links; the ownership secret and the grant file may be links (container secret volumes are).
+- **Secrets only come from files or the environment**, never from the command line: `--secret-file` (or `MCP_AUTHPROBE_SECRET`), `--bearer-file`, `--access-token-file`, `--credentials-file`, `--client-secret-file`, `--session-cookie-file`. Each is read once, must be a regular file of bounded size, and gets a warning when other users can read it. Key and token files are refused when they are symbolic links; the ownership secret and the grant file may be links (container secret volumes are).
 - **`--json -`** writes the report to standard output instead of the table; `--quiet` drops the table. Warnings and progress go to standard error.
 - **`--events <file>`** appends one JSON line per event: `scan_started`, `discovery_finished`, `check_started`, `check_finished` (with `status`, `reason`, `durationMs`), `scan_finished`. Checks that share requests (the three refresh token checks, the redirect URI checks, the MCP endpoint checks) start and finish together.
 - **`--deadline <seconds>`** and **`--max-requests <n>`** stop the scan with a partial report (`"complete": false`, exit 4). `SIGTERM` and `SIGINT` do the same: temporary clients are deleted first, then the reports are written. Prefer them to `SIGKILL`, which leaves registered test clients on the server and loses the report.
@@ -87,9 +87,9 @@ Each finding has `checkId`, `family`, `active`, `severity`, `status`, `message`,
 | `unreachable` | skipped, error | Network: the message has the cause code (`ECONNREFUSED`, `ENOTFOUND`, a TLS code, `ETIMEDOUT`) |
 | `rate_limited` | error | Wait (the message gives `Retry-After` when the server sent one), or use `--wait-on-rate-limit`, `--delay-ms` |
 | `server_error` | error | The server answered 5xx: look at its logs |
-| `credential_rejected` | error | The key, token or grant was refused: supply a fresh one |
+| `credential_rejected` | error | The key, token, grant or session cookie was refused: supply a fresh one |
 | `credential_expired` | error | The access token stopped working during the scan: supply a fresh one |
-| `deferred_validation` | error | The server validates `redirect_uri` after login, which cannot be seen from outside |
+| `deferred_validation` | error | The server validates `redirect_uri` after login, which cannot be seen from outside: pass `--session-cookie-file` (and, to settle a consent page, `--approve-consent`) |
 | `incomplete` | error | Metadata could not be read in full (`MAP-INJ01`) |
 | `ambiguous` | error | The answers cannot be attributed (anonymous endpoint, opaque token, control that fails) |
 | `protocol_unsupported` | error | The server speaks no MCP revision this version knows |
@@ -105,6 +105,7 @@ Each finding has `checkId`, `family`, `active`, `severity`, `status`, `message`,
 | + a static key (`--bearer-file`) | + `MAP-ORG01` with the key, `TOK01`, `SES01`, `BAT01`, `BOD01`, `INJ01`, `THR02` | 12 MiB of uploads; up to 30 requests in a row, which may get the key limited for a while |
 | + an access token (`--access-token-file`) | The same without `THR02` (add `--only THR02` to run it) | 12 MiB of uploads |
 | + a test grant (`--credentials-file`) | + `MAP-RTK01`, `RTK02`, `RTK03`; `MAP-AUD01` when an access token comes with it | See below |
+| + a session cookie (`--session-cookie-file`) | `MAP-RDR01`, `RDR02` replayed in the test account's session | None; with `--approve-consent`, one consent granted to the test client per variant whose consent page was shown |
 | `login` | `MAP-PKC01`, `RDR03`, `COD01`, `AUD01` and the endpoint checks, stored in the grant file | One authorization; the code is spent |
 | `consent-check` | `MAP-CSR01` | One browser session |
 

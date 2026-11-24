@@ -118,7 +118,7 @@ export const CATALOGUE: readonly CheckDefinition[] = [
   {
     id: "MAP-RDR01",
     appliesTo: BOTH,
-    runsWith: "every scan with ownership proven (dynamic registration, or `--client-id`)",
+    runsWith: "every scan with ownership proven (dynamic registration, or `--client-id`); in a logged-in session with `--session-cookie-file`",
     family: "RDR",
     title: "Unregistered redirect_uri is refused at the authorization endpoint",
     severity: "critical",
@@ -133,7 +133,7 @@ export const CATALOGUE: readonly CheckDefinition[] = [
   {
     id: "MAP-RDR02",
     appliesTo: BOTH,
-    runsWith: "every scan with ownership proven (dynamic registration, or `--client-id`)",
+    runsWith: "every scan with ownership proven (dynamic registration, or `--client-id`); in a logged-in session with `--session-cookie-file`",
     family: "RDR",
     title: "redirect_uri matching is exact, not prefix or pattern based",
     severity: "high",

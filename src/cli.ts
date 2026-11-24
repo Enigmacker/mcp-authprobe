@@ -23,6 +23,7 @@ import { runScan, type ScanEvent } from "./scan.js";
 import { readSecretFile, readSecretLine, SecretFileError } from "./secret-file.js";
 import { parseSelection, resolveChecks } from "./selection.js";
 import { loadAccessTokenFile, loadBearerFile } from "./static-key.js";
+import { loadSessionCookieFile } from "./session-cookie.js";
 import { loadPostureReport, postureSection, type LoadedPosture } from "./posture.js";
 import { REASON_CODES, type Severity } from "./types.js";
 import { REPORT_SCHEMA } from "./report/json.js";
@@ -121,6 +122,17 @@ Scan options:
   --client-secret-file <file>
                         Its secret, for a confidential client (one line, mode 600)
   --redirect-uri <uri>  One of its registered redirect URIs (MAP-RDR01, MAP-RDR02)
+  --session-cookie-file <file>
+                        Cookie header of a logged-in TEST account on the
+                        authorization server (one line, name=value; name2=value2,
+                        mode 600): MAP-RDR01 and MAP-RDR02 are replayed in that
+                        session, for servers that check redirect_uri only after
+                        login. Sent to the authorization endpoint's origin only,
+                        never reported
+  --approve-consent     With --session-cookie-file: when the consent page is shown
+                        for an unregistered redirect URI, submit it (Allow) to
+                        prove where the server redirects. This really grants the
+                        test client access for the test account
   --issuer <url>        Examine this authorization server when the resource
                         announces several (default: the first one)
   --wait-on-rate-limit <seconds>
@@ -288,7 +300,7 @@ export function capabilities(): Record<string, unknown> {
     presets: Object.fromEntries(Object.entries(PRESETS).map(([k, v]) => [k, v.description])),
     ownershipProofs: ["v1 (sha256)", "v2 (hmac-sha256, optional expiry)"],
     commands: ["scan", "plan", "login", "login begin", "login complete", "consent-check", "ownership", "checks", "capabilities", "cleanup", "lab", "mcp"],
-    credentials: ["bearer-file", "access-token-file", "credentials-file", "client-id", "client-secret-file"],
+    credentials: ["bearer-file", "access-token-file", "credentials-file", "client-id", "client-secret-file", "session-cookie-file"],
     login: ["interactive", "begin", "complete"],
     reports: ["json", "sarif", "markdown", "events"],
   };
@@ -370,6 +382,8 @@ const CLI_OPTIONS = {
       rtk: { type: "string" },
       "max-observation-age": { type: "string" },
       "access-token-file": { type: "string" },
+      "session-cookie-file": { type: "string" },
+      "approve-consent": { type: "boolean", default: false },
       "wait-on-rate-limit": { type: "string" },
       "delay-ms": { type: "string" },
       "max-requests": { type: "string" },
@@ -793,6 +807,20 @@ async function dispatch(command: string, sub: string | undefined, arg: string | 
       return EXIT.usage;
     }
     if (supplied.client) options.client = supplied.client;
+    if (values["approve-consent"] && !values["session-cookie-file"]) {
+      err("--approve-consent needs --session-cookie-file\n");
+      return EXIT.usage;
+    }
+    if (values["session-cookie-file"]) {
+      try {
+        const loaded = loadSessionCookieFile(values["session-cookie-file"]);
+        for (const w of loaded.warnings) err(`warning: ${w}\n`);
+        options.authorizationSession = { cookie: loaded.cookie, ...(values["approve-consent"] ? { approveConsent: true } : {}) };
+      } catch (e) {
+        err(`${(e as Error).message}\n`);
+        return EXIT.usage;
+      }
+    }
     const rtk = values.rtk ?? "destructive";
     if (!["destructive", "rotate-only", "off"].includes(rtk)) {
       err("--rtk must be destructive, rotate-only or off\n");

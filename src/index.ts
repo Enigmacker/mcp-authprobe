@@ -11,6 +11,7 @@ export type { EndpointCheckId, EndpointOptions, EndpointResult } from "./checks/
 export { makeFinding, summarize } from "./checks/finding.js";
 export { runRedirectUriChecks } from "./checks/redirect-uris.js";
 export type { RedirectCheckContext } from "./checks/redirect-uris.js";
+export type { AuthorizationSession } from "./checks/redirect-session.js";
 export { runRefreshTokenChecks, runRefreshTokenSequence } from "./checks/refresh-tokens.js";
 export type { GrantState, RefreshCheckContext, RefreshSequenceResult } from "./checks/refresh-tokens.js";
 export { runThrottlingCheck } from "./checks/throttling.js";
@@ -43,5 +44,6 @@ export { readSecretFile, readSecretLine, SecretFileError, writeSecretFile } from
 export { parseSelection, resolveChecks, SelectionError } from "./selection.js";
 export type { CheckSelector } from "./selection.js";
 export { loadAccessTokenFile, loadBearerFile, StaticKeyError } from "./static-key.js";
+export { loadSessionCookieFile, parseCookieHeader, SessionCookieError } from "./session-cookie.js";
 export * from "./types.js";
 export { TOOL_NAME, TOOL_VERSION } from "./version.js";

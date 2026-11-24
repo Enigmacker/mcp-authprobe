@@ -142,8 +142,11 @@ export async function planScan(mcpUrl: string, options: ScanOptions = {}): Promi
       if (!asProven) return unproven(id, unprovenAs.join(", "));
       if (id.startsWith("MAP-RTK")) return grant.grant ? entry(id, true, "Runs with the test grant.") : entry(id, false, grant.reason ?? "Needs a test grant.", tokenEndpoint ? "needs_grant" : "no_endpoint");
       if (id === "MAP-RDR01" || id === "MAP-RDR02") {
-        if (options.client) return options.client.redirectUri ? entry(id, true, "Runs with the supplied client; nothing is registered.") : entry(id, false, "The supplied client needs --redirect-uri.", "no_client");
-        return dcr ? entry(id, true, "Runs with a temporary client from dynamic registration.") : entry(id, false, "The server offers no dynamic registration: pass --client-id and --redirect-uri.", "no_client");
+        const session = options.authorizationSession
+          ? ` In the logged-in session (--session-cookie-file)${options.authorizationSession.approveConsent ? ", approving the consent page when it is shown for an unregistered URI (--approve-consent): that grants the test client access for the test account" : ""}.`
+          : "";
+        if (options.client) return options.client.redirectUri ? entry(id, true, `Runs with the supplied client; nothing is registered.${session}`) : entry(id, false, "The supplied client needs --redirect-uri.", "no_client");
+        return dcr ? entry(id, true, `Runs with a temporary client from dynamic registration.${session}`) : entry(id, false, "The server offers no dynamic registration: pass --client-id and --redirect-uri.", "no_client");
       }
       if (id === "MAP-RDR04") return dcr ? entry(id, true, "Runs against the registration endpoint.") : entry(id, false, "Not applicable: the server offers no dynamic registration.");
       if (id === "MAP-THR01") {

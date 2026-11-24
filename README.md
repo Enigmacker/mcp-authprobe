@@ -124,7 +124,7 @@ Log in with the account `test` / `test` and click **Allow**.
 
 | Profile | What you should see |
 | --- | --- |
-| `vulnerable` (default) | Refresh token replay accepted, unsafe redirect URIs registered, PKCE not enforced, token audience ignored, foreign `Origin` accepted, token accepted in the URL, session ID accepted without a token, CORS open to any origin with credentials, no throttling, consent page without CSRF protection. `MAP-RDR02` is reported as **inconclusive**: this server sends unknown visitors to its login page before looking at `redirect_uri`, which cannot be told apart from outside, and the scanner never turns that into a pass. |
+| `vulnerable` (default) | Refresh token replay accepted, unsafe redirect URIs registered, PKCE not enforced, token audience ignored, foreign `Origin` accepted, token accepted in the URL, session ID accepted without a token, CORS open to any origin with credentials, no throttling, consent page without CSRF protection. `MAP-RDR02` is reported as **inconclusive**: this server sends unknown visitors to its login page before looking at `redirect_uri`, which cannot be told apart from outside, and the scanner never turns that into a pass; [in a logged-in session](#in-a-logged-in-session) it can be judged. |
 | `secure` | Every check passes (or is not applicable); `MAP-CSR01` runs with `consent-check`. |
 | `static-bearer` | No OAuth: the MCP endpoint takes a static API key, printed when the lab starts (scan with `--bearer-file`). JSON-RPC batches executed, 6 MiB bodies accepted, key accepted in the URL, any `Origin` accepted, session ID enough without the key, no rate limit. |
 | `static-bearer-secure` | The same server done right: every key check passes or is not applicable. |
@@ -354,7 +354,37 @@ How they work:
 
 Safety by design: every host used lives under the reserved `.invalid` top-level domain ([RFC 2606](https://www.rfc-editor.org/rfc/rfc2606)), which can never resolve. Even a vulnerable server could not deliver a code anywhere.
 
-Reading the results: a variant answered exactly like the baseline (for example both redirected to the login page) is reported as **inconclusive** (`error`), never as a pass, because some servers only check `redirect_uri` after the user logs in. `MAP-RDR03` (token endpoint enforcement) is observed during [interactive login](#interactive-login).
+Reading the results: a variant answered exactly like the baseline (for example both redirected to the login page) is reported as **inconclusive** (`error`), never as a pass, because some servers only check `redirect_uri` after the user logs in. For those, replay the checks [in a logged-in session](#in-a-logged-in-session). `MAP-RDR03` (token endpoint enforcement) is observed during [interactive login](#interactive-login).
+
+### In a logged-in session
+
+Many authorization servers send a visitor without a session to their login page before they look at `redirect_uri`: every variant then gets the same answer as the registered URI, and `MAP-RDR01` / `MAP-RDR02` stay inconclusive. Give the scanner the session of your **test account** and it replays the same requests in that session:
+
+```sh
+# 1. In a browser, log in to the authorization server with the TEST account.
+# 2. Copy the Cookie header your browser sends to the authorization endpoint
+#    (developer tools, Network tab) into a file, on one line, and protect it:
+#      name=value; name2=value2
+chmod 600 session-cookie.txt
+# 3. Replay the redirect URI checks in that session
+mcp-authprobe scan https://mcp.example.com/mcp --only RDR01,RDR02 --session-cookie-file session-cookie.txt
+```
+
+Each variant is then judged on what the server does in the session:
+
+| Answer in the session | Verdict |
+| --- | --- |
+| A redirect to the URI that was sent | **Fail**, proven |
+| An error page, without redirect | Refused |
+| The consent page, shown for the unregistered URI | **Inconclusive**: the server has not refused yet, which is not proof that it would redirect there. Nothing is clicked |
+| The consent page, with `--approve-consent` | The consent form is submitted once (Allow): a redirect to the URI that was sent is a proven **fail**, a refusal at approval is refused |
+| The login page, or a redirect to another host | Inconclusive (a login page for the registered URI means the cookie was not accepted: `credential_rejected`) |
+
+- The cookie is sent to the **origin of the authorization endpoint only**, never to the MCP server or any other host, and never written to a report, a log or an event. Its values are registered for redaction.
+- In the session, redirects are followed only within the authorization server's own origin (at most 3), so that a server which shows its consent or error page at another path can be judged.
+- **`--approve-consent` grants access for real**: each submission approves the test client for the test account, once per variant whose consent page was shown. It is never done without the option. The redirect URIs are still under the reserved `.invalid` domain, so no code can be delivered or used; revoke the test client's access in the account afterwards if your server lists it. The report counts the approvals.
+- The cookie file follows the same rules as the other secret files (a regular file, mode 600 recommended). `--session-cookie-file` changes nothing for the other checks.
+- On the [lab](#try-it-in-a-minute-the-lab) (`--profile vulnerable`), log in at `http://127.0.0.1:8787/login` as `test` / `test` and put `sid=<value>` in the file: `MAP-RDR02` goes from inconclusive to a consent page shown for 3 variants, and to a proven failure with `--approve-consent`.
 
 ## Throttling check
 
@@ -480,8 +510,8 @@ Mount secrets as files (`--secret-file`, `--bearer-file`, `--access-token-file`,
 | `MAP-RTK01` | high | active | a test grant (`--credentials-file`) | Refresh tokens for public clients are rotated |
 | `MAP-RTK02` | critical | active | a test grant (`--credentials-file`) | A rotated refresh token cannot be replayed |
 | `MAP-RTK03` | high | active | a test grant (`--credentials-file`) | Refresh token replay revokes the token family |
-| `MAP-RDR01` | critical | active | every scan with ownership proven (dynamic registration, or `--client-id`) | Unregistered redirect_uri is refused at the authorization endpoint |
-| `MAP-RDR02` | high | active | every scan with ownership proven (dynamic registration, or `--client-id`) | redirect_uri matching is exact, not prefix or pattern based |
+| `MAP-RDR01` | critical | active | every scan with ownership proven (dynamic registration, or `--client-id`); in a logged-in session with `--session-cookie-file` | Unregistered redirect_uri is refused at the authorization endpoint |
+| `MAP-RDR02` | high | active | every scan with ownership proven (dynamic registration, or `--client-id`); in a logged-in session with `--session-cookie-file` | redirect_uri matching is exact, not prefix or pattern based |
 | `MAP-RDR03` | medium | active | `login` | Token endpoint enforces the redirect_uri used at authorization |
 | `MAP-RDR04` | high | active | every scan with ownership proven, on a server with dynamic registration | Dynamic client registration refuses unsafe redirect URIs |
 | `MAP-PKC01` | high | active | `login` | Token endpoint enforces PKCE |
@@ -722,9 +752,10 @@ The scanner talks to servers that may be hostile, and it may be driven by an AI 
 - **SSRF protection:** loopback, private, link-local, CGNAT, multicast, reserved and cloud-metadata addresses are refused at connect time, after DNS resolution, unless `--allow-private` is passed. Even then they are only accepted **for the scanned host** (and the other names of the loopback): metadata that points to another private address is not followed. `--allow-host <host>` names another host, for an authorization server on its own private address.
 - **Metadata is validated:** authorization server metadata whose issuer differs from the one it was fetched for is not used.
 - **Nothing is left behind:** temporary clients are deleted, also when the scan is interrupted; one that could not be deleted is listed in the report (`leftovers`). With `--journal <file>`, registered clients are recorded as they are created, and `mcp-authprobe cleanup --journal <file>` deletes what a killed scan left.
-- **No automatic redirects:** every redirect is inspected, never followed blindly.
+- **No automatic redirects:** every redirect is inspected, never followed blindly. In a [logged-in session](#in-a-logged-in-session), the redirect URI checks follow at most 3 redirects, within the authorization server's own origin.
+- **No consent given on your behalf:** the scanner never approves a consent page unless you pass `--approve-consent`, and then only for the test account whose session you supplied.
 - **Bounded resources:** per-request timeouts, response bodies capped at 1 MiB, no compression requested.
-- **Secrets stay secret:** tokens and the ownership secret are never printed, and are redacted from every report.
+- **Secrets stay secret:** tokens, session cookies and the ownership secret are never printed, and are redacted from every report.
 - **Server text is data:** everything taken from a server is neutralized (control, bidi and invisible characters escaped) and size-capped; text that looks like an injection is never copied into a report, only located; in MCP mode, the tool result tells the assistant that server content is data, not instructions.
 - **No telemetry.**
 
@@ -781,7 +812,8 @@ The scanner talks to servers that may be hostile, and it may be driven by an AI 
 - ~~Proof judged host by host, `plan`, presets, HMAC proofs, `cleanup`, a CLI Docker image~~ done.
 
 **Next**
-- A second browser session for `MAP-CSR01` and `MAP-RDR02` on servers that validate `redirect_uri` after login.
+- ~~`MAP-RDR01` and `MAP-RDR02` in a logged-in session, on servers that validate `redirect_uri` after login~~ done (`--session-cookie-file`).
+- The same session obtained from a browser window (as `consent-check` does), instead of a copied cookie.
 - Ideas welcome in the issues.
 
 ## Development
