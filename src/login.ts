@@ -5,8 +5,11 @@ import type { AddressInfo } from "node:net";
 import { CATALOGUE, LOGIN_CHECK_IDS } from "./checks/catalogue.js";
 import type { Observation, TestGrant } from "./credentials.js";
 import type { DiscoveryResult } from "./discovery.js";
+import type { ReasonCode } from "./types.js";
 import type { HttpClient } from "./net/http.js";
+import { jwtAudience, runAudienceCheck } from "./checks/audience.js";
 import { runEndpointChecks } from "./checks/endpoint.js";
+import { makeFinding } from "./checks/finding.js";
 import { bearerCredential, initializeStatus } from "./oauth/mcp-call.js";
 import { describe as describeOutcome, exchangeCode, refresh, type CodeExchangeOutcome } from "./oauth/token-client.js";
 import { deleteClient, registerClient, SAFE_DOMAIN, type RegisteredClient } from "./oauth/registration.js";
@@ -112,19 +115,10 @@ function withTimeout<T>(p: Promise<T>, ms: number, message: string): Promise<T> 
   ]).finally(() => clearTimeout(timer));
 }
 
-function observation(checkId: string, target: string, status: Observation["status"], message: string, evidence: string[]): Observation {
-  const def = CATALOGUE.find((c) => c.id === checkId);
-  if (!def) throw new Error(`Unknown check ${checkId}`);
-  return {
-    checkId,
-    title: def.title,
-    severity: def.severity,
-    status,
-    target,
-    message: safeText(message),
-    evidence: evidence.map((e) => safeText(e)),
-    observedAt: new Date().toISOString(),
-  };
+function observation(checkId: string, target: string, status: Observation["status"], message: string, evidence: string[], reason?: ReasonCode): Observation {
+  const inferred: ReasonCode | undefined =
+    reason ?? (/a request failed/i.test(message) ? "unreachable" : /^Not observed/.test(message) ? "not_observed" : /could not be told apart|issued no access token/.test(message) ? "ambiguous" : /server error/.test(message) ? "server_error" : undefined);
+  return { ...makeFinding(checkId, target, status, message, evidence, inferred), source: "login", observedAt: new Date().toISOString() };
 }
 
 function scopesFor(d: DiscoveryResult): string | undefined {
@@ -303,7 +297,7 @@ export async function login(opts: LoginOptions): Promise<LoginResult> {
     if (grant && client.clientSecret) grant.clientSecret = client.clientSecret;
 
     if (opts.probe) {
-      await postExchangeProbes({ http, target, tokenEndpoint, grant, tokens, correct, tokensFromProbe, observations, notes, results });
+      await postExchangeProbes({ http, target, tokenEndpoint, grant, tokens, correct, tokensFromProbe, observations, notes, results, resource });
       if (notes.some((n) => n.startsWith(REVOKED_NOTE))) return { grant: null, observations, notes };
     }
     if (!grant) {
@@ -356,23 +350,11 @@ interface PostExchange {
   observations: Observation[];
   notes: string[];
   results: Array<{ checkId: string }>;
+  /** The RFC 8707 resource the tokens were requested for. */
+  resource?: string;
 }
 
 const is2xx = (s: number | null): s is number => s !== null && s >= 200 && s < 300;
-
-/** Audience of a JWT access token, read without verification (attribution only), or null. */
-export function jwtAudience(token: string): string[] | null {
-  const parts = token.split(".");
-  if (parts.length !== 3) return null;
-  try {
-    const payload = JSON.parse(Buffer.from(parts[1] as string, "base64url").toString("utf8")) as { aud?: unknown };
-    if (typeof payload.aud === "string") return [payload.aud];
-    if (Array.isArray(payload.aud) && payload.aud.every((a) => typeof a === "string")) return payload.aud as string[];
-    return null;
-  } catch {
-    return null;
-  }
-}
 
 /**
  * Checks that need tokens: MAP-ORG01 and MAP-AUD01 (with the access token,
@@ -398,7 +380,7 @@ async function postExchangeProbes(c: PostExchange): Promise<void> {
   if (accessToken) {
     const ep = await runEndpointChecks(http, target, bearerCredential(accessToken));
     control = ep.control;
-    for (const f of ep.findings) observations.push({ ...f, observedAt: new Date().toISOString() });
+    for (const f of ep.findings) observations.push({ ...f, source: "login", observedAt: new Date().toISOString() });
   } else {
     for (const id of ["MAP-ORG01", "MAP-TOK01", "MAP-SES01", "MAP-BAT01", "MAP-BOD01", "MAP-INJ01"]) {
       observations.push(observation(id, target, "error", "Inconclusive: the token endpoint issued no access token.", []));
@@ -406,47 +388,8 @@ async function postExchangeProbes(c: PostExchange): Promise<void> {
   }
 
   await guard("MAP-AUD01", async () => {
-    const lines = [`control, token for this server: ${control === null ? "not available" : `HTTP ${control}`}`];
-    if (!is2xx(control)) {
-      observations.push(observation("MAP-AUD01", target, "error", "Inconclusive: the token issued for this server was not accepted by it, so audience binding cannot be judged.", lines));
-      return;
-    }
-    if (!grant) {
-      observations.push(observation("MAP-AUD01", target, "error", "Inconclusive: no refresh token was issued, so a token for another resource cannot be requested.", lines));
-      return;
-    }
-    const foreignResource = `https://other.${SAFE_DOMAIN}/mcp`;
-    const o = await refresh(http, tokenEndpoint, grant, grant.refreshToken, foreignResource);
-    lines.push(`refresh token used to request a token for ${foreignResource}: ${describeOutcome(o)}`);
-    if (o.refreshToken) grant.refreshToken = o.refreshToken; // rotation: keep the newest
-    if (!o.accessTokenIssued) {
-      // Only invalid_target says why; another refusal (scope, policy, throttling) proves nothing.
-      observations.push(
-        o.error === "invalid_target"
-          ? observation("MAP-AUD01", target, "pass", "The authorization server refused to issue a token for an unrelated resource (invalid_target).", lines)
-          : observation("MAP-AUD01", target, "error", "The request for a token for an unrelated resource was refused, but not with invalid_target; inconclusive.", lines),
-      );
-      return;
-    }
-    const st = await initializeStatus(http, target, { token: o.accessToken ?? "" });
-    lines.push(`that token presented to this MCP server: HTTP ${st}`);
-    const aud = o.accessToken ? jwtAudience(o.accessToken) : null;
-    if (aud) lines.push(`audience of that token (JWT, unverified): ${aud.join(", ")}`);
-    if (st === 401 || st === 403) {
-      observations.push(observation("MAP-AUD01", target, "pass", "A token issued for an unrelated resource is rejected by the MCP server.", lines));
-    } else if (!is2xx(st)) {
-      observations.push(observation("MAP-AUD01", target, "error", "Unexpected answer from the MCP server; inconclusive.", lines));
-    } else if (aud && aud.includes(foreignResource) && !aud.includes(target)) {
-      observations.push(observation("MAP-AUD01", target, "fail", "The MCP server accepts a token whose audience is another resource: it does not validate the token audience.", lines));
-    } else if (aud) {
-      observations.push(
-        observation("MAP-AUD01", target, "error", "Inconclusive: the authorization server ignored the resource parameter and issued a token for this server (RFC 8707 recommends refusing with invalid_target), so the MCP server's audience validation could not be tested.", lines),
-      );
-    } else {
-      observations.push(
-        observation("MAP-AUD01", target, "error", "Inconclusive: a token requested for an unrelated resource works on this server, but the token is opaque, so it cannot be told whether the authorization server ignored the resource parameter or the MCP server does not validate the audience. Check both.", lines),
-      );
-    }
+    const f = await runAudienceCheck({ http, target, tokenEndpoint, grant, control, ...(c.resource ? { ownAudiences: [c.resource] } : {}) });
+    observations.push({ ...f, source: "login", observedAt: new Date().toISOString() });
   });
 
   // Last: a compliant server may revoke the grant here.
@@ -502,3 +445,5 @@ async function postExchangeProbes(c: PostExchange): Promise<void> {
     }
   });
 }
+
+export { jwtAudience };

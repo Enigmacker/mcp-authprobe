@@ -1,8 +1,7 @@
 import type { HttpClient } from "../net/http.js";
 import { classifyAnswer, endSession, FOREIGN_ORIGIN, isJsonRpcError, isJsonRpcResult, jsonRpcMessages, mcpPost, type Credential } from "../oauth/mcp-call.js";
-import { safeText } from "../redact.js";
-import type { CheckStatus, Finding } from "../types.js";
-import { CATALOGUE } from "./catalogue.js";
+import type { CheckStatus, Finding, ReasonCode } from "../types.js";
+import { makeFinding } from "./finding.js";
 import { inspectMetadata, isPoisoned } from "./metadata.js";
 
 /**
@@ -24,12 +23,49 @@ export interface EndpointOptions {
   checks?: readonly EndpointCheckId[];
   /** Requests sent by MAP-THR02 (10-100, default 30). */
   rateAttempts?: number;
+  /**
+   * When the control request is rate limited and the server says for how
+   * long (Retry-After), wait up to this many milliseconds and try once more
+   * (--wait-on-rate-limit). Default 0: report the limit and stop.
+   */
+  waitOnRateLimitMs?: number;
 }
 
 export interface EndpointResult {
   findings: Finding[];
   /** Status of initialize with the credential (null if the request failed). */
   control: number | null;
+  /** Requests sent with the credential. */
+  authenticatedRequests: number;
+  /** Retry-After of a rate-limited control request, in seconds, when the server gave one. */
+  retryAfterSeconds?: number;
+}
+
+/** Seconds of a Retry-After header (delta-seconds or an HTTP date), or null. */
+export function retryAfterSeconds(headers: Record<string, string>): number | null {
+  const raw = headers["retry-after"];
+  if (raw === undefined) return null;
+  if (/^\d+$/.test(raw.trim())) return Number(raw.trim());
+  const at = Date.parse(raw);
+  return Number.isNaN(at) ? null : Math.max(0, Math.round((at - Date.now()) / 1000));
+}
+
+/**
+ * A rate limit the server announces in its answer headers: the IETF
+ * `RateLimit` / `RateLimit-Policy` fields (draft-ietf-httpapi-ratelimit-headers,
+ * both the structured and the older three-header form) and the common
+ * `X-RateLimit-*` ones. Returns what could be read, or null.
+ */
+export function announcedRateLimit(headers: Record<string, string>): { limit: number | null; remaining: number | null } | null {
+  const num = (v: string | undefined): number | null => (v !== undefined && /^\s*\d+/.test(v) ? Number.parseInt(v, 10) : null);
+  let limit = num(headers["ratelimit-limit"]) ?? num(headers["x-ratelimit-limit"]) ?? num(headers["x-rate-limit-limit"]);
+  let remaining = num(headers["ratelimit-remaining"]) ?? num(headers["x-ratelimit-remaining"]) ?? num(headers["x-rate-limit-remaining"]);
+  const structured = `${headers["ratelimit"] ?? ""}, ${headers["ratelimit-policy"] ?? ""}`;
+  const q = /(?:^|[;,\s])q=(\d+)/.exec(structured) ?? /(?:^|[;,\s])limit=(\d+)/.exec(structured);
+  const r = /(?:^|[;,\s])r=(\d+)/.exec(structured) ?? /(?:^|[;,\s])remaining=(\d+)/.exec(structured);
+  if (limit === null && q?.[1]) limit = Number(q[1]);
+  if (remaining === null && r?.[1]) remaining = Number(r[1]);
+  return limit === null && remaining === null ? null : { limit, remaining };
 }
 
 /** Size of the oversized bodies sent by MAP-BOD01 (above common 1-4 MB limits). */
@@ -47,10 +83,20 @@ const ORIGIN_VARIANTS = [
 
 const is2xx = (s: number | null | undefined): s is number => typeof s === "number" && s >= 200 && s < 300;
 
-function result(checkId: string, target: string, status: CheckStatus, message: string, evidence: string[]): Finding {
-  const def = CATALOGUE.find((c) => c.id === checkId);
-  if (!def) throw new Error(`Unknown check ${checkId}`);
-  return { checkId, title: def.title, severity: def.severity, status, target, message: safeText(message), evidence: evidence.map((e) => safeText(e)) };
+
+/** Reason codes for this file's inconclusive and skipped messages (first match wins; the default is "unexpected_answer"). */
+const REASONS: ReadonlyArray<[RegExp, ReasonCode]> = [
+  [/a request failed/i, "unreachable"],
+  [/rate limit|rate-limited/i, "rate_limited"],
+  [/server error/i, "server_error"],
+  [/stopped working/i, "credential_rejected"],
+  [/could not be read in full/i, "incomplete"],
+  [/also answers requests without any credential|is not accepted either|refused even at 1 KiB|could not be used even with|closed the connection/i, "ambiguous"],
+];
+const reasonOf = (message: string): ReasonCode | undefined => REASONS.find(([re]) => re.test(message))?.[1];
+
+function result(checkId: string, target: string, status: CheckStatus, message: string, evidence: string[], reason?: ReasonCode): Finding {
+  return makeFinding(checkId, target, status, message, evidence, reason ?? reasonOf(message));
 }
 
 export function clampRateAttempts(n: number | undefined): number {
@@ -74,6 +120,12 @@ export async function runEndpointChecks(http: HttpClient, target: string, cred: 
   const wanted = new Set<EndpointCheckId>(options.checks ?? ["MAP-ORG01", "MAP-TOK01", "MAP-SES01", "MAP-BAT01", "MAP-BOD01", "MAP-INJ01"]);
   const findings: Finding[] = [];
   const what = cred.kind === "static" ? "key" : "token";
+  let authenticatedRequests = 0;
+  /** Every request to the endpoint goes through here, so requests made with the credential are counted. */
+  const post = (o: Parameters<typeof mcpPost>[2] = {}): ReturnType<typeof mcpPost> => {
+    if (o.auth) authenticatedRequests += 1;
+    return mcpPost(http, target, o);
+  };
   const guard = async (checkId: EndpointCheckId, run: () => Promise<void>): Promise<void> => {
     if (!wanted.has(checkId)) return;
     try {
@@ -86,26 +138,50 @@ export async function runEndpointChecks(http: HttpClient, target: string, cred: 
   // Control: the credential must work, or nothing below can be judged.
   let control: number | null = null;
   let controlSession: string | null = null;
-  try {
-    const c = await mcpPost(http, target, { auth: cred });
-    control = c.status;
-    controlSession = c.sessionId;
-  } catch {
-    control = null;
+  let controlHeaders: Record<string, string> = {};
+  let controlFailure = "request failed";
+  const sendControl = async (): Promise<void> => {
+    try {
+      const c = await post({ auth: cred });
+      control = c.status;
+      controlSession = c.sessionId;
+      controlHeaders = c.headers;
+    } catch (e) {
+      control = null;
+      controlFailure = `request failed (${(e as Error).message})`;
+    }
+  };
+  await sendControl();
+  let retryAfter = control === null ? null : retryAfterSeconds(controlHeaders);
+  let waited = 0;
+  if (control !== null && classifyAnswer(control, controlHeaders) === "rate_limited" && retryAfter !== null && retryAfter * 1000 <= (options.waitOnRateLimitMs ?? 0)) {
+    // The server says when to come back, and the operator allowed the wait: once.
+    waited = retryAfter;
+    await new Promise((r) => setTimeout(r, retryAfter! * 1000 + 250));
+    await sendControl();
+    retryAfter = control === null ? null : retryAfterSeconds(controlHeaders);
   }
   if (controlSession) await endSession(http, target, cred, controlSession);
-  const controlLine = `initialize with the ${what}: ${control === null ? "request failed" : `HTTP ${control}`}`;
+  const controlLine = `initialize with the ${what}: ${control === null ? controlFailure : `HTTP ${control}`}${waited ? ` (after waiting ${waited} s for the rate limit)` : ""}`;
   if (!is2xx(control)) {
-    for (const id of wanted) {
-      findings.push(result(id, target, "error", `Inconclusive: the MCP endpoint did not accept the ${what}, so this check cannot be judged.`, [controlLine]));
-    }
-    return { findings, control };
+    // The cause decides what the operator should do: wait, fix the network, or fix the credential.
+    const cls = control === null ? "unreachable" : classifyAnswer(control, controlHeaders);
+    const [reason, message]: [ReasonCode, string] =
+      cls === "rate_limited"
+        ? ["rate_limited", `Inconclusive: the ${what} is valid as far as can be told, but the MCP endpoint is rate limiting it (HTTP ${control}${retryAfter !== null ? `, Retry-After ${retryAfter} s` : ""}). Scan again later, or pass --wait-on-rate-limit.`]
+        : cls === "unreachable"
+          ? ["unreachable", `Inconclusive: the control request with the ${what} got no answer, so this check cannot be judged.`]
+          : cls === "server_error"
+            ? ["server_error", `Inconclusive: the MCP endpoint answered the control request with a server error (HTTP ${control}), so this check cannot be judged.`]
+            : ["credential_rejected", `Inconclusive: the MCP endpoint did not accept the ${what}, so this check cannot be judged.`];
+    for (const id of wanted) findings.push(result(id, target, "error", message, [controlLine], reason));
+    return { findings, control, authenticatedRequests, ...(retryAfter !== null && cls === "rate_limited" ? { retryAfterSeconds: retryAfter } : {}) };
   }
 
   // Checks below mean nothing on an endpoint that also serves anonymous requests.
   let anonymous: number | null = null;
   try {
-    anonymous = (await mcpPost(http, target, {})).status;
+    anonymous = (await post({})).status;
   } catch {
     anonymous = null;
   }
@@ -113,7 +189,7 @@ export async function runEndpointChecks(http: HttpClient, target: string, cred: 
   const servesAnonymous = is2xx(anonymous);
 
   /** Opens a session if the server uses them; returns its ID (or null). */
-  const openSession = async (): Promise<string | null> => (await mcpPost(http, target, { auth: cred })).sessionId;
+  const openSession = async (): Promise<string | null> => (await post({ auth: cred })).sessionId;
 
   // --- MAP-ORG01: foreign, "null" and malformed Origins, with the credential.
   await guard("MAP-ORG01", async () => {
@@ -123,7 +199,7 @@ export async function runEndpointChecks(http: HttpClient, target: string, cred: 
     let unexpected = false;
     let limited = false;
     for (const v of ORIGIN_VARIANTS) {
-      const r = await mcpPost(http, target, { auth: cred, origin: v.value });
+      const r = await post({ auth: cred, origin: v.value });
       if (r.sessionId) await endSession(http, target, cred, r.sessionId);
       lines.push(`initialize with ${v.label}: HTTP ${r.status}`);
       const cls = classifyAnswer(r.status, r.headers);
@@ -136,7 +212,7 @@ export async function runEndpointChecks(http: HttpClient, target: string, cred: 
       }
     }
     // The credential must still work, or a refusal could come from a dead credential.
-    const again = await mcpPost(http, target, { auth: cred });
+    const again = await post({ auth: cred });
     if (again.sessionId) await endSession(http, target, cred, again.sessionId);
     lines.push(`control again without Origin: HTTP ${again.status}`);
     if (accepted.length > 0) {
@@ -162,14 +238,14 @@ export async function runEndpointChecks(http: HttpClient, target: string, cred: 
     const accepted: string[] = [];
     let unexpected = false;
     for (const name of QUERY_NAMES) {
-      const q = await mcpPost(http, target, { auth: cred, secretInQuery: name });
+      const q = await post({ auth: cred, secretInQuery: name });
       if (q.sessionId) await endSession(http, target, cred, q.sessionId);
       lines.push(`initialize with the ${what} as ?${name}= and no header: HTTP ${q.status}`);
       const cls = classifyAnswer(q.status, q.headers);
       if (cls === "accepted") accepted.push(name);
       else if (cls !== "refused") unexpected = true;
     }
-    const again = await mcpPost(http, target, { auth: cred });
+    const again = await post({ auth: cred });
     if (again.sessionId) await endSession(http, target, cred, again.sessionId);
     lines.push(`control again with the header: HTTP ${again.status}`);
     if (accepted.length > 0) {
@@ -191,16 +267,16 @@ export async function runEndpointChecks(http: HttpClient, target: string, cred: 
       findings.push(result("MAP-SES01", target, "error", "Inconclusive: the endpoint also answers requests without any credential.", [anonymousLine]));
       return;
     }
-    const init = await mcpPost(http, target, { auth: cred });
+    const init = await post({ auth: cred });
     const lines = [`initialize with the ${what}: HTTP ${init.status}, ${init.sessionId ? "session ID assigned" : "no session ID"}`];
     if (!init.sessionId) {
       findings.push(result("MAP-SES01", target, "not_applicable", "The server assigned no session ID (stateless): nothing to misuse.", lines));
       return;
     }
     try {
-      const withCred = await mcpPost(http, target, { auth: cred, sessionId: init.sessionId, method: "ping" });
+      const withCred = await post({ auth: cred, sessionId: init.sessionId, method: "ping" });
       lines.push(`ping with the session ID and the ${what}: HTTP ${withCred.status}`);
-      const without = await mcpPost(http, target, { sessionId: init.sessionId, method: "ping" });
+      const without = await post({ sessionId: init.sessionId, method: "ping" });
       lines.push(`ping with the session ID and no ${what}: HTTP ${without.status}`);
       if (!is2xx(withCred.status)) {
         findings.push(result("MAP-SES01", target, "error", `Inconclusive: the session could not be used even with the ${what}.`, lines));
@@ -223,13 +299,13 @@ export async function runEndpointChecks(http: HttpClient, target: string, cred: 
     const session = await openSession();
     try {
       // Control: one ping, same configuration, must work; otherwise a refused batch proves nothing.
-      const single = await mcpPost(http, target, { auth: cred, ...(session ? { sessionId: session } : {}), method: "ping" });
+      const single = await post({ auth: cred, ...(session ? { sessionId: session } : {}), method: "ping" });
       if (!is2xx(single.status)) {
         findings.push(result("MAP-BAT01", target, "error", "Inconclusive: a single ping is not accepted either, so a refused batch proves nothing.", [`control, one ping request: HTTP ${single.status}`]));
         return;
       }
       const batch = JSON.stringify(Array.from({ length: BATCH_SIZE }, (_, i) => ({ jsonrpc: "2.0", id: i + 1, method: "ping" })));
-      const r = await mcpPost(http, target, { auth: cred, ...(session ? { sessionId: session } : {}), body: batch });
+      const r = await post({ auth: cred, ...(session ? { sessionId: session } : {}), body: batch });
       const messages = jsonRpcMessages(r);
       // Only real JSON-RPC 2.0 messages count: any JSON object with an "error" key is not a JSON-RPC refusal.
       const results = messages.filter(isJsonRpcResult).length;
@@ -252,7 +328,7 @@ export async function runEndpointChecks(http: HttpClient, target: string, cred: 
         );
       } else if (cls === "refused" || (cls === "accepted" && results === 0 && errors >= 1)) {
         // The same single ping must still work: otherwise the refusal may be about something else (a limit, a dead credential).
-        const again = await mcpPost(http, target, { auth: cred, ...(session ? { sessionId: session } : {}), method: "ping" });
+        const again = await post({ auth: cred, ...(session ? { sessionId: session } : {}), method: "ping" });
         lines.push(`control again, one ping request: HTTP ${again.status}`);
         if (!is2xx(again.status)) {
           findings.push(result("MAP-BAT01", target, "error", `Inconclusive: a single ping stopped working after the batch (HTTP ${again.status}), so the refusal cannot be attributed to the batch.`, lines));
@@ -276,7 +352,7 @@ export async function runEndpointChecks(http: HttpClient, target: string, cred: 
     let controlAgain: number | null = null;
     try {
       // Control: the same request at 1 KiB must work, so a refusal is about the size.
-      const small = await mcpPost(http, target, { auth: cred, ...(session ? { sessionId: session } : {}), body: paddedPing(1024) });
+      const small = await post({ auth: cred, ...(session ? { sessionId: session } : {}), body: paddedPing(1024) });
       lines.push(`control, the same ping padded to 1 KiB: HTTP ${small.status}`);
       if (!is2xx(small.status)) {
         findings.push(result("MAP-BOD01", target, "error", "Inconclusive: the padded ping is refused even at 1 KiB, so a refusal of the large one proves nothing.", lines));
@@ -288,7 +364,7 @@ export async function runEndpointChecks(http: HttpClient, target: string, cred: 
         { label: `${mib} MiB body, chunked (no Content-Length)`, body: chunked(text) },
       ]) {
         try {
-          const r = await mcpPost(http, target, { auth: cred, ...(session ? { sessionId: session } : {}), body: variant.body, timeoutMs: UPLOAD_TIMEOUT_MS });
+          const r = await post({ auth: cred, ...(session ? { sessionId: session } : {}), body: variant.body, timeoutMs: UPLOAD_TIMEOUT_MS });
           lines.push(`${variant.label}: HTTP ${r.status}`);
           // A 4xx is about the size (413 is the expected one) only if it is not a rate limit, and if the control still works afterwards.
           const cls = classifyAnswer(r.status, r.headers);
@@ -300,7 +376,7 @@ export async function runEndpointChecks(http: HttpClient, target: string, cred: 
       }
       if (!verdicts.includes("accepted") && verdicts.every((v) => v === "refused")) {
         try {
-          controlAgain = (await mcpPost(http, target, { auth: cred, ...(session ? { sessionId: session } : {}), body: paddedPing(1024) })).status;
+          controlAgain = (await post({ auth: cred, ...(session ? { sessionId: session } : {}), body: paddedPing(1024) })).status;
           lines.push(`control again, the ping padded to 1 KiB: HTTP ${controlAgain}`);
         } catch (e) {
           lines.push(`control again, the ping padded to 1 KiB: request failed (${(e as Error).message})`);
@@ -334,18 +410,28 @@ export async function runEndpointChecks(http: HttpClient, target: string, cred: 
     const session = await openSession();
     const counts = new Map<number, number>();
     const started = Date.now();
+    const before = authenticatedRequests;
     let accepted = 0;
+    let firstRemaining: number | null = null;
+    let lastAnnounced: { limit: number | null; remaining: number | null } | null = null;
+    /** Everything this scan sent with the credential counts against its limit, not only this check's requests. */
+    const total = (sent: number): string => (before > 0 ? ` (${before + sent} requests sent with this ${what} since the scan started)` : "");
     try {
       for (let i = 1; i <= attempts; i += 1) {
-        const r = await mcpPost(http, target, { auth: cred, ...(session ? { sessionId: session } : {}), method: "ping" });
+        const r = await post({ auth: cred, ...(session ? { sessionId: session } : {}), method: "ping" });
         counts.set(r.status, (counts.get(r.status) ?? 0) + 1);
         const evidence = [`ping requests with the ${what}: ${[...counts].map(([s, n]) => `HTTP ${s} x${n}`).join(", ")}`];
         if (is2xx(r.status)) {
           accepted += 1;
+          const a = announcedRateLimit(r.headers);
+          if (a) {
+            lastAnnounced = a;
+            if (firstRemaining === null && a.remaining !== null) firstRemaining = a.remaining;
+          }
           continue;
         }
         if (r.status === 429 || (r.headers["retry-after"] !== undefined && r.status >= 400 && r.status < 500)) {
-          findings.push(result("MAP-THR02", target, "pass", `The ${what} is rate limited: refused after ${accepted} accepted requests in ${Date.now() - started} ms.`, evidence));
+          findings.push(result("MAP-THR02", target, "pass", `The ${what} is rate limited: refused after ${accepted} accepted requests in ${Date.now() - started} ms${total(i)}.${retryAfterSeconds(r.headers) !== null ? ` It stays limited for about ${retryAfterSeconds(r.headers)} s (Retry-After): other checks with this ${what} are inconclusive until then.` : ""}`, evidence));
         } else if (accepted > 0 && (r.status === 401 || r.status === 403)) {
           findings.push(result("MAP-THR02", target, "pass", `The ${what} was refused (HTTP ${r.status}) after ${accepted} accepted requests: probably a limit or a block; 429 with Retry-After is the standard answer.`, evidence));
         } else {
@@ -357,6 +443,20 @@ export async function runEndpointChecks(http: HttpClient, target: string, cred: 
       if (session) await endSession(http, target, cred, session);
     }
     const tally = [...counts].map(([s, n]) => `HTTP ${s} x${n}`).join(", ");
+    // No refusal within the cap, but the server announces a limit and its counter goes down: the limit exists, it is only higher than the cap.
+    const announced = lastAnnounced as { limit: number | null; remaining: number | null } | null;
+    if (announced && firstRemaining !== null && announced.remaining !== null && announced.remaining < firstRemaining) {
+      findings.push(
+        result(
+          "MAP-THR02",
+          target,
+          "pass",
+          `The ${what} is rate limited: the server announces a limit${announced.limit !== null ? ` of ${announced.limit}` : ""} in its RateLimit headers and the remaining count went from ${firstRemaining} to ${announced.remaining} over ${attempts} requests.`,
+          [`ping requests with the ${what}: ${tally}`],
+        ),
+      );
+      return;
+    }
     findings.push(
       result(
         "MAP-THR02",
@@ -368,7 +468,23 @@ export async function runEndpointChecks(http: HttpClient, target: string, cred: 
     );
   });
 
-  return { findings, control };
+  // An OAuth access token may expire while the checks run: say so instead of leaving unexplained inconclusive results.
+  if (cred.kind === "oauth" && findings.some((f) => f.status === "error")) {
+    try {
+      const last = await post({ auth: cred });
+      if (last.sessionId) await endSession(http, target, cred, last.sessionId);
+      if (last.status === 401) {
+        for (const f of findings) {
+          if (f.status !== "error" || f.reason === "rate_limited") continue;
+          f.reason = "credential_expired";
+          f.evidence.push("the access token was refused with 401 at the end of the checks: it probably expired or was revoked during the scan");
+        }
+      }
+    } catch {
+      /* the findings already say what happened */
+    }
+  }
+  return { findings, control, authenticatedRequests };
 }
 
 /**

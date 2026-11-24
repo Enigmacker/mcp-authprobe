@@ -45,8 +45,9 @@ export function toTable(report: ScanReport, options: TableOptions = {}): string 
     paint(BOLD, report.target),
     `  ownership: ${report.ownership.verified ? `verified (${report.ownership.method})` : "NOT verified"}`,
   ];
+  // By severity, then by ID, so a family reads in order (RTK01, RTK02, RTK03) whatever order the checks ran in.
   const sorted = [...report.findings].sort(
-    (a, b) => SEVERITY_ORDER.indexOf(b.severity) - SEVERITY_ORDER.indexOf(a.severity),
+    (a, b) => SEVERITY_ORDER.indexOf(b.severity) - SEVERITY_ORDER.indexOf(a.severity) || a.checkId.localeCompare(b.checkId),
   );
   // Without --verbose, checks that did not run are grouped by reason, one line each.
   const quiet = (st: CheckStatus): boolean => !options.verbose && (st === "skipped" || st === "not_applicable");
@@ -58,6 +59,7 @@ export function toTable(report: ScanReport, options: TableOptions = {}): string 
     g.ids.push(f.checkId);
     groups.set(key, g);
   }
+  for (const g of groups.values()) g.ids.sort();
   for (const f of sorted) {
     if (quiet(f.status)) continue;
     const status = paint(COLOR[f.status], STATUS_LABEL[f.status].padEnd(12));
@@ -92,5 +94,14 @@ export function toTable(report: ScanReport, options: TableOptions = {}): string 
     paint(DIM, `${count("skipped") + count("not_applicable")} skipped or n/a`),
   ];
   out.push("", `  ${parts.join(", ")}${options.verbose ? "" : paint(DIM, "  (--verbose for all evidence)")}`);
+  if (report.reachable === false) out.push(paint(COLOR.fail, "  The target is unreachable: no check was run."));
+  else if (report.complete === false) out.push(paint(COLOR.error, "  The scan was interrupted: this report is partial."));
+  const judged = count("pass") + count("fail");
+  if (report.reachable !== false && judged * 2 < report.findings.length) {
+    out.push(paint(DIM, `  Only ${judged} of ${report.findings.length} checks could be judged; the skipped lines above say what the others need.`));
+  }
+  for (const l of report.leftovers ?? []) out.push(paint(COLOR.error, `  Left on the server: test client ${l.clientId} (${l.reason}); it is named "mcp-authprobe test client (safe to delete)".`));
+  if (report.grant?.consumed) out.push(paint(DIM, "  The test grant was revoked by the server during the refresh token checks, as expected: log in again for a new one."));
+  else if (report.grant?.rewritten) out.push(paint(DIM, "  The grant file now holds the newest refresh token."));
   return `${out.join("\n")}\n`;
 }

@@ -36,6 +36,7 @@ Passive scanners read what a remote [Model Context Protocol](https://modelcontex
 - [Tool poisoning check](#tool-poisoning-check)
 - [Combine with mcp-posture](#combine-with-mcp-posture)
 - [Reports and exit codes](#reports-and-exit-codes)
+- [Integrating mcp-authprobe](docs/integration.md)
 - [GitHub Action](#github-action)
 - [Safety of the scanner](#safety-of-the-scanner)
 - [Roadmap](#roadmap)
@@ -199,7 +200,8 @@ The scan sends **at most three** `refresh_token` requests to the token endpoint 
 
 Important:
 
-- **The grant is consumed.** On a compliant server, step 3 revokes it. Never use a grant you still need.
+- **The full sequence consumes the grant.** On a compliant server, step 3 revokes it: that is what `MAP-RTK03` proves. Never use a grant you still need. `--rtk rotate-only` runs step 1 alone and keeps the grant usable; `--rtk off` skips the sequence.
+- **The file follows the grant.** Whenever the grant is still valid after the scan (one refresh only, or a server that accepted the replay), the file is rewritten with the newest refresh token: atomically, mode 600, never through a symbolic link. `--credentials-out <file>` writes it elsewhere instead. The report's `grant` block says what happened (`rotated`, `consumed`, `rewritten`), never the token.
 - If tokens are not rotated, `MAP-RTK01` fails and the two replay checks are reported as not applicable.
 - A throttled or unexpected response is reported as `error` (inconclusive), never as a pass.
 - Token values never appear in output or reports; evidence only shows status codes and OAuth error codes.
@@ -220,6 +222,7 @@ mcp-authprobe login https://mcp.example.com/mcp --out ./test-grant.json
 - The grant records the **target and token endpoint** it belongs to. A scan of any other target, or a server announcing another token endpoint, will not use it.
 - `login` itself does not require an ownership proof: it only does what any MCP client does when you connect it (one registration, your own browser login, one code exchange). Only the extra login checks below require the proof.
 - If login fails, the client it registered is deleted when the server allows it.
+- `--json <file>` writes the results as a report, without any token; the exit code is 0 when a grant was written, 5 when only results were, 3 when the login failed and 4 when the server was unreachable.
 
 **<!-- generated:login-checks -->10 checks are observed during login (`MAP-PKC01`, `MAP-RDR03`, `MAP-ORG01`, `MAP-TOK01`, `MAP-SES01`, `MAP-BAT01`, `MAP-BOD01`, `MAP-INJ01`, `MAP-AUD01`, `MAP-COD01`)<!-- /generated -->**, because they need a fresh authorization code or a valid access token. They run only when ownership of every contacted host is proven (`--no-probe` skips them), in this order:
 
@@ -349,6 +352,7 @@ The server is built so that the assistant, or a prompt injection reaching it, ca
 | `MCP_AUTHPROBE_TIMEOUT_MS` | Per-request timeout |
 | `MCP_AUTHPROBE_BEARER_FILE` and `MCP_AUTHPROBE_BEARER_TARGET` | Static API key, and the exact MCP URL it may be used for (both required) |
 | `MCP_AUTHPROBE_BEARER_HEADER` | Header for the key (default `Authorization`, sent as `Bearer`) |
+| `MCP_AUTHPROBE_ACCESS_TOKEN_FILE` and `MCP_AUTHPROBE_BEARER_TARGET` | OAuth access token instead of a static key, and the exact MCP URL it may be used for |
 
 
 ### With Docker
@@ -434,7 +438,17 @@ With the key, and only once ownership of the target is proven, the checks of the
 
 Only side-effect-free methods are sent (`initialize`, `ping` and the list methods); no tool is ever called. Every check has a hard request cap, the key is read from a file (a warning is printed if other users can read it), never accepted on the command line, and masked in every report. `MAP-BAT01`, `MAP-BOD01` and `MAP-INJ01` also run during `login` with the OAuth access token.
 
-Use a dedicated test key: `MAP-THR02` may get it rate-limited for a few minutes. The `static-bearer` and `static-bearer-secure` lab profiles show all of this without a real server.
+Use a dedicated test key: `MAP-THR02` may get it rate-limited for a few minutes, and says for how long when the server sends `Retry-After`. It also passes when the server announces its limit in `RateLimit` or `X-RateLimit-*` headers and the remaining count goes down, even if the limit is higher than the number of requests sent. A second scan while the key is still limited reports the checks as inconclusive with the reason `rate_limited`; `--wait-on-rate-limit <seconds>` waits once for a `Retry-After` of at most that long, and `--delay-ms` spaces the requests. The `static-bearer` and `static-bearer-secure` lab profiles show all of this without a real server.
+
+### With an OAuth access token
+
+When your application already holds an access token for the server (a web application with its own redirect URI, for instance), pass it instead of a key:
+
+```sh
+mcp-authprobe scan https://mcp.example.com/mcp --access-token-file access-token
+```
+
+The same endpoint checks run, reported as checks of a *token*; `MAP-DSC01` and the authorization server checks keep their OAuth meaning. `MAP-THR02` does not run unless you name it (`--only THR02`), since it may get the token limited. If the token expires while the checks run, the inconclusive results carry the reason `credential_expired`. With `--credentials-file` as well, `MAP-AUD01` is judged during the scan: the access token is the control, and one refresh asks for a token for another resource.
 
 ## Tool poisoning check
 
@@ -486,18 +500,23 @@ The report must be mcp-posture's JSON (`schema_version` 1.x) and contain a resul
 
 | Option | Output |
 | --- | --- |
-| *(always)* | Human-readable table on stdout |
-| `--json <file>` | Full report, schema `mcp-authprobe/report/v1` |
+| *(default)* | Human-readable table on stdout (`--quiet` drops it) |
+| `--json <file>` | Full report, schema `mcp-authprobe/report/v1`; `--json -` writes it to stdout instead of the table |
+| `--events <file>` | One JSON line per event while the scan runs (`-` for stderr) |
 | `--sarif <file>` | SARIF 2.1.0, for GitHub code scanning; only failing checks become results |
 | `--markdown <file>` | Table for a pull request comment or a CI job summary |
 | `--credentials-file <file>` | Test grant for the refresh token checks (input) |
 
 | Exit code | Meaning |
 | --- | --- |
-| `0` | No failing check at or above `--fail-on` (default `high`) |
+| `0` | No failing check at or above `--fail-on` (default `high`). For `login`: a test grant was written |
 | `1` | At least one failing check at or above `--fail-on` (or `ownership verify` failed) |
-| `2` | Usage error |
-| `3` | A check was inconclusive, or the target was unreachable. With `--fail-on-inconclusive false`, inconclusive checks no longer change the exit code; an unreachable target (no HTTP answer: the report says `"reachable": false` and one finding gives the cause, such as `ECONNREFUSED`) still exits 3 |
+| `2` | Usage error: nothing was sent |
+| `3` | A check was inconclusive; `--fail-on-inconclusive false` turns this into 0. For `login`: it failed |
+| `4` | The target gave no HTTP answer, or the scan could not run or was interrupted (signal, `--deadline`, `--max-requests`). `--fail-on-inconclusive` never silences it |
+| `5` | `login` wrote its results but no test grant |
+
+The JSON report is meant to be read by programs. Besides the findings it carries `reachable`, `complete`, a `summary` (counts, `coverage`, the exit code), what `discovery` found, the proof for each host (`ownership.hosts`), the kind of `credential` used, what became of the test `grant`, and the temporary clients left on the server (`leftovers`). Every finding that is `skipped` or inconclusive has a `reason` code (`needs_grant`, `rate_limited`, `unreachable`…), and a finding read from a grant file says so (`source: "login"`, `observedAt`); such results are no longer reported once they are older than `--max-observation-age` (24 hours by default, 0 for no limit). The JSON Schema ships in the package (`schema/report.schema.json`). [Integrating mcp-authprobe](docs/integration.md) describes the report, the reason codes, the exit codes, the library and the life of a test grant.
 
 All server-controlled text is neutralized before it reaches a report: terminal escape sequences, bidi overrides and invisible characters are escaped, and token-shaped values are redacted.
 
@@ -520,7 +539,7 @@ jobs:
   scan:
     runs-on: ubuntu-latest
     steps:
-      - uses: Enigmacker/mcp-authprobe@v0.10.2
+      - uses: Enigmacker/mcp-authprobe@v0.11.0
         with:
           url: https://staging.example.com/mcp
           secret: ${{ secrets.MCP_AUTHPROBE_SECRET }}
@@ -535,7 +554,7 @@ The results table is added to the job summary. The step fails when a check fails
 | `url` | (required) | MCP endpoint to scan |
 | `secret` | | Ownership secret, from a repository secret. Without it, only discovery, `MAP-ORG01` and `MAP-COR01` run |
 | `fail-on` | `high` | Fail on a failing check at or above this severity |
-| `fail-on-inconclusive` | `false` | Also fail when a check is inconclusive (otherwise a warning). An unreachable target always fails |
+| `fail-on-inconclusive` | `false` | Also fail when a check is inconclusive (otherwise a warning). An unreachable target always fails (exit code 4) |
 | `only` / `skip` | | Same as `--only` / `--skip` |
 | `bearer` | | Static API key, from a repository secret; written to a private temporary file, never on the command line |
 | `bearer-header`, `rate-attempts` | | Same as `--bearer-header`, `--rate-attempts` |
@@ -544,7 +563,7 @@ The results table is added to the job summary. The step fails when a check fails
 | `upload-sarif` | `false` | Upload the SARIF report to code scanning (needs `security-events: write`) |
 | `allow-private` | `false` | For a lab started in the same job only |
 | `node-version` | `22` | Node.js used to run the scanner |
-| `package` | this release | npm package spec to run, e.g. `mcp-authprobe@0.10.2` |
+| `package` | this release | npm package spec to run, e.g. `mcp-authprobe@0.11.0` |
 
 Both tools have an Action, so the passive and active views fit in one job:
 
@@ -554,7 +573,7 @@ Both tools have an Action, so the passive and active views fit in one job:
           targets: https://staging.example.com/mcp
           args: --json posture.json
           fail: false   # let the active scan run too; each tool reports its own findings
-      - uses: Enigmacker/mcp-authprobe@v0.10.2
+      - uses: Enigmacker/mcp-authprobe@v0.11.0
         with:
           url: https://staging.example.com/mcp
           secret: ${{ secrets.MCP_AUTHPROBE_SECRET }}

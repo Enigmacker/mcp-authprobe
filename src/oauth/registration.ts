@@ -99,6 +99,7 @@ export async function deleteClient(http: HttpClient, client: RegisteredClient, r
     const res = await http.request({
       url: client.registrationClientUri,
       method: "DELETE",
+      cleanup: true,
       headers: { authorization: `Bearer ${client.registrationAccessToken}` },
     });
     return res.status === 204 || res.status === 200;

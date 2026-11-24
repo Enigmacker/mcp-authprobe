@@ -72,7 +72,7 @@ inputs:
 
 outputs:
   exit-code:
-    description: "Scanner exit code: 0 no failing check at or above fail-on, 1 failing checks, 2 usage error, 3 inconclusive checks or unreachable target."
+    description: "Scanner exit code: 0 no failing check at or above fail-on, 1 failing checks, 2 usage error, 3 inconclusive checks, 4 unreachable target or interrupted scan."
     value: ${{ steps.scan.outputs.exit-code }}
   failed:
     description: Number of failing checks (any severity).
@@ -121,6 +121,8 @@ runs:
         if [ -z "$pkg" ]; then
           pkg="mcp-authprobe@$(node -p 'require(process.env.MAP_ACTION_PATH + "/package.json").version')"
         fi
+        # --fail-on-inconclusive is not passed to the scanner: the last step decides between a warning
+        # and a failure, and always fails on an unreachable target (exit 4, or "reachable": false).
         args=(scan "$MAP_URL" --fail-on "$MAP_FAIL_ON" --json "$out/report.json" --sarif "$out/report.sarif" --markdown "$out/report.md")
         [ -n "$MAP_ONLY" ] && args+=(--only "$MAP_ONLY")
         [ -n "$MAP_SKIP" ] && args+=(--skip "$MAP_SKIP")
@@ -173,8 +175,13 @@ runs:
         case "$MAP_CODE" in
           0) echo "mcp-authprobe: no failing check at or above the threshold." ;;
           1) echo "::error title=mcp-authprobe::$MAP_FAILED failing check(s); see the job summary."; exit 1 ;;
+          4)
+            # Never silenced: an unreachable target must not look like a clean scan.
+            echo "::error title=mcp-authprobe::The target is unreachable, or the scan was interrupted; see the job summary."; exit 4 ;;
           3)
-            if [ ! -f "$MAP_JSON" ]; then echo "::error title=mcp-authprobe::The scan could not run (target unreachable?)."; exit 3; fi
+            if [ ! -f "$MAP_JSON" ]; then echo "::error title=mcp-authprobe::The scan could not run."; exit 3; fi
+            # Releases before 0.11 exit 3 for an unreachable target too: the report says which case this is.
+            if node -e 'process.exit(require(process.argv[1]).reachable === false ? 0 : 1)' "$MAP_JSON" 2>/dev/null; then echo "::error title=mcp-authprobe::The target is unreachable."; exit 4; fi
             if [ "$MAP_STRICT" = "true" ]; then echo "::error title=mcp-authprobe::Some checks are inconclusive; see the job summary."; exit 3; fi
             echo "::warning title=mcp-authprobe::Some checks are inconclusive; see the job summary."
             ;;

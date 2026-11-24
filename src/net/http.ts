@@ -11,6 +11,12 @@ export interface HttpOptions {
   timeoutMs?: number;
   /** Maximum response body size in bytes. */
   maxBodyBytes?: number;
+  /** Pause before every request, in milliseconds (--delay-ms): a gentler scan. */
+  delayMs?: number;
+  /** Hard cap on the number of requests this client sends (--max-requests). */
+  maxRequests?: number;
+  /** Aborting it stops the scan: requests in flight fail and no new one starts, except cleanup requests. */
+  signal?: AbortSignal;
 }
 
 export interface HttpRequest {
@@ -23,6 +29,8 @@ export interface HttpRequest {
   maxBodyBytes?: number;
   /** Timeout for this request only (large uploads). */
   timeoutMs?: number;
+  /** A cleanup request (deleting a temporary client): sent even after the scan was aborted or its request budget spent. */
+  cleanup?: boolean;
   /** Redirects are never followed automatically; callers inspect them. */
 }
 
@@ -46,6 +54,14 @@ export class InsecureTransportError extends Error {
   constructor(url: string) {
     super(`Refusing plain HTTP to ${url}: secrets could travel in cleartext. Plain HTTP is only allowed for loopback or private-address labs with --allow-private.`);
     this.name = "InsecureTransportError";
+  }
+}
+
+/** The scan was stopped (signal, deadline) or reached its request budget: no further request is sent. */
+export class ScanInterruptedError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "ScanInterruptedError";
   }
 }
 
@@ -142,8 +158,16 @@ export class HttpClient {
   private readonly timeoutMs: number;
   private readonly maxBodyBytes: number;
   readonly allowPrivate: boolean;
+  private readonly delayMs: number;
+  private readonly maxRequests: number;
+  private readonly signal: AbortSignal | undefined;
+  /** Requests sent so far. */
+  requestCount = 0;
 
   constructor(options: HttpOptions = {}) {
+    this.delayMs = Math.max(0, options.delayMs ?? 0);
+    this.maxRequests = options.maxRequests ?? Number.POSITIVE_INFINITY;
+    this.signal = options.signal;
     this.allowPrivate = options.allowPrivate ?? false;
     this.timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
     this.maxBodyBytes = options.maxBodyBytes ?? DEFAULT_MAX_BODY;
@@ -155,8 +179,21 @@ export class HttpClient {
     });
   }
 
+  /** True once the scan was stopped or its request budget is spent. */
+  get interrupted(): string | null {
+    if (this.signal?.aborted) return "the scan was interrupted";
+    if (this.requestCount >= this.maxRequests) return `the request budget (--max-requests ${this.maxRequests}) is spent`;
+    return null;
+  }
+
   async request(req: HttpRequest): Promise<HttpResponse> {
     const url = new URL(req.url);
+    if (!req.cleanup) {
+      const why = this.interrupted;
+      if (why) throw new ScanInterruptedError(why);
+      if (this.delayMs > 0 && this.requestCount > 0) await new Promise((r) => setTimeout(r, this.delayMs));
+    }
+    this.requestCount += 1;
     if (url.protocol !== "https:" && url.protocol !== "http:") {
       throw new Error(`Unsupported URL scheme: ${url.protocol}`);
     }
@@ -179,7 +216,7 @@ export class HttpClient {
       headers,
       redirect: "manual",
       dispatcher: this.dispatcher,
-      signal: AbortSignal.timeout(req.timeoutMs ?? this.timeoutMs),
+      signal: this.signal && !req.cleanup ? AbortSignal.any([AbortSignal.timeout(req.timeoutMs ?? this.timeoutMs), this.signal]) : AbortSignal.timeout(req.timeoutMs ?? this.timeoutMs),
     };
     if (typeof req.body === "string") init.body = req.body;
     else if (req.body !== undefined) {
@@ -194,6 +231,7 @@ export class HttpClient {
       // fetch wraps connect errors as "fetch failed"; surface the policy refusal.
       const cause = (e as { cause?: unknown }).cause;
       if (cause instanceof BlockedAddressError) throw cause;
+      if (this.signal?.aborted && !req.cleanup) throw new ScanInterruptedError("the scan was interrupted");
       throw describeNetworkError(e);
     }
 

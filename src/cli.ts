@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { accessSync, constants as fsConstants, readFileSync, realpathSync, statSync, writeFileSync } from "node:fs";
+import { accessSync, appendFileSync, constants as fsConstants, realpathSync, statSync, writeFileSync } from "node:fs";
 import { isIP } from "node:net";
 import { dirname, resolve as resolvePath } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -7,7 +7,8 @@ import { parseArgs } from "node:util";
 import { CATALOGUE, getCheck, LOGIN_CHECK_IDS } from "./checks/catalogue.js";
 import { LAB_PROFILES } from "./lab/profiles.js";
 import { isBlockedAddress } from "./net/address-policy.js";
-import { loadGrant } from "./credentials.js";
+import { loadGrant, writeGrantFile, type LoadedGrant } from "./credentials.js";
+import { EXIT, exitCodeFor } from "./exit.js";
 import { HttpClient, plainHttpAllowed } from "./net/http.js";
 import { registerSecret } from "./redact.js";
 import { DNS_LABEL, generateSecret, proofFor, verifyOwnership, WELL_KNOWN_PATH } from "./ownership.js";
@@ -15,16 +16,18 @@ import { toJson } from "./report/json.js";
 import { toMarkdown } from "./report/markdown.js";
 import { toSarif } from "./report/sarif.js";
 import { colorWanted, toTable } from "./report/table.js";
-import { scan } from "./scan.js";
-import { parseSelection } from "./selection.js";
-import { loadBearerFile } from "./static-key.js";
+import { runScan, type ScanEvent } from "./scan.js";
+import { readSecretLine, SecretFileError } from "./secret-file.js";
+import { parseSelection, resolveChecks } from "./selection.js";
+import { loadAccessTokenFile, loadBearerFile } from "./static-key.js";
 import { loadPostureReport, postureSection, type LoadedPosture } from "./posture.js";
-import { severityAtLeast, type Severity } from "./types.js";
+import { REASON_CODES, type Severity } from "./types.js";
+import { REPORT_SCHEMA } from "./report/json.js";
 import { TOOL_NAME, TOOL_VERSION } from "./version.js";
 
 const SECRET_ENV = "MCP_AUTHPROBE_SECRET";
 
-export const EXIT = { ok: 0, findings: 1, usage: 2, error: 3 } as const;
+export { EXIT };
 /** Returned by main() when a long-running server was started: do not exit. */
 export const KEEP_RUNNING = -1;
 
@@ -36,7 +39,8 @@ Usage:
   ${TOOL_NAME} ownership init <host>       Create a secret and the proof to publish
   ${TOOL_NAME} ownership proof <host>      Print the proof for <host> from your secret
   ${TOOL_NAME} ownership verify <host>     Check that the proof is published
-  ${TOOL_NAME} checks list                 List every check
+  ${TOOL_NAME} checks list [--json]        List every check
+  ${TOOL_NAME} capabilities [--json]       What this version supports (for programs)
   ${TOOL_NAME} checks show <id>            Explain one check
   ${TOOL_NAME} login <mcp-url> --out <file> Log in with a test account and save a test grant
   ${TOOL_NAME} consent-check <mcp-url>     MAP-CSR01: consent CSRF, in a real browser
@@ -45,7 +49,9 @@ Usage:
                                            Run a local practice server (loopback only)
 
 Scan options:
-  --json <file>         Write the JSON report
+  --json <file>         Write the JSON report ("-" writes it to standard output
+                        instead of the table)
+  --quiet               Do not print the table
   --sarif <file>        Write a SARIF 2.1.0 report
   --markdown <file>     Write a Markdown report
   --fail-on <severity>  Exit 1 on a failing check at or above this severity (default: high)
@@ -63,16 +69,37 @@ Scan options:
   --skip <list>         Do not run these checks (same syntax; wins over --only)
   --credentials-file <file>
                         Test grant (JSON: client_id, refresh_token, optional
-                        client_secret) for the refresh token checks. The grant
-                        is consumed: use a dedicated test account.
+                        client_secret) for the refresh token checks. The full
+                        sequence consumes the grant: use a dedicated test account.
+                        When the grant is still valid afterwards, the file is
+                        rewritten with the newest refresh token.
+  --credentials-out <file>
+                        Write the newest grant there instead of rewriting the input
+  --rtk <mode>          Refresh token checks: destructive (default, RTK01-03: the
+                        grant is revoked on a compliant server), rotate-only
+                        (RTK01, one refresh: the grant stays usable) or off
+  --max-observation-age <hours>
+                        Oldest login result still reported (default 24; 0: no limit)
   --bearer-file <file>  Static API key for a server authenticated without OAuth
                         (one line, mode 600). Never put the key on the command line.
+  --access-token-file <file>
+                        OAuth access token for the MCP endpoint checks (one line,
+                        mode 600), when your application already holds one. With
+                        --credentials-file, MAP-AUD01 is judged in the scan too.
   --bearer-header <name>
                         Header for the key (default: Authorization, sent as Bearer;
                         any other header gets the key as is, e.g. X-API-Key)
   --rate-attempts <n>   Requests sent by MAP-THR02 with the key (10-100, default 30)
   --fail-on-inconclusive <true|false>
                         Exit 3 when a check is inconclusive (default: true)
+  --wait-on-rate-limit <seconds>
+                        When the credential is rate limited and the server gives a
+                        Retry-After of at most this long, wait once and go on
+  --delay-ms <ms>       Pause before every request (a gentler scan)
+  --max-requests <n>    Stop after this many requests, with a partial report
+  --deadline <seconds>  Stop after this long, with a partial report
+  --events <file>       Append one JSON line per event (scan and check start and
+                        end) to this file; "-" writes them to standard error
 
 Consent check options (needs the optional playwright-core package and Chrome or Edge):
   --browser <channel>   chrome (default), msedge or chromium
@@ -86,6 +113,7 @@ Login options:
                         (${LOGIN_CHECK_IDS.slice(0, 5).map((id) => id.slice(4)).join(", ")},
                         ${LOGIN_CHECK_IDS.slice(5).map((id) => id.slice(4)).join(", ")})
   --no-browser          Print the authorization URL instead of opening a browser
+  --json <file>         Write the login results as a report, without any token
   --allow-private, --secret-file, --timeout  as for scan
 
 Lab options:
@@ -94,9 +122,14 @@ ${Object.entries(LAB_PROFILES).map(([name, p]) => `                        ${nam
   --port <n>            Port on 127.0.0.1 (default: 8787; 0 picks a free port)
   --host <address>      127.0.0.1 (default) or ::1; nothing else is accepted
 
-Exit codes: 0 no failing check at or above --fail-on; 1 failing checks;
-2 usage error; 3 inconclusive checks (unless --fail-on-inconclusive false)
-or a scan that could not run.
+Exit codes:
+  0  no failing check at or above --fail-on (login: a test grant was written)
+  1  failing checks at or above --fail-on (ownership verify: proof not found)
+  2  usage error, nothing was sent
+  3  inconclusive checks, unless --fail-on-inconclusive false (login: it failed)
+  4  the target is unreachable, or the scan could not run or was interrupted;
+     --fail-on-inconclusive never silences it
+  5  login wrote its results but no test grant
 
 The ownership secret is read from ${SECRET_ENV} or --secret-file, never from
 the command line, so it does not end up in shell history or process lists.
@@ -104,11 +137,43 @@ the command line, so it does not end up in shell history or process lists.
 Only scan servers you own or are explicitly authorized to test.
 `;
 
+/** The ownership secret, from --secret-file (read like every secret file) or the environment. Throws SecretFileError. */
 function readSecret(secretFile: string | undefined): string | undefined {
-  const value = secretFile ? readFileSync(secretFile, "utf8").trim() : process.env[SECRET_ENV]?.trim();
+  let value: string | undefined;
+  if (secretFile) {
+    const loaded = readSecretLine(secretFile, { label: "ownership secret file", maxBytes: 8 * 1024, followLinks: true });
+    for (const w of loaded.warnings) err(`warning: ${w}\n`);
+    value = loaded.value;
+  } else {
+    value = process.env[SECRET_ENV]?.trim();
+  }
   if (!value) return undefined;
   registerSecret(value);
   return value;
+}
+
+/** A non-negative number option, undefined when absent, or null when invalid. */
+function parseNumber(value: string | undefined, o: { min?: number; max?: number; integer?: boolean } = {}): number | undefined | null {
+  if (value === undefined) return undefined;
+  const n = Number(value);
+  if (!Number.isFinite(n) || n < (o.min ?? 0) || n > (o.max ?? Number.MAX_SAFE_INTEGER) || (o.integer && !Number.isInteger(n))) return null;
+  return n;
+}
+
+/** What this version supports, for a program that drives it. */
+export function capabilities(): Record<string, unknown> {
+  return {
+    tool: TOOL_NAME,
+    version: TOOL_VERSION,
+    reportSchema: REPORT_SCHEMA,
+    mcpProtocol: { eras: ["legacy"], versions: ["2025-11-25"] },
+    checks: CATALOGUE.map((c) => c.id),
+    reasonCodes: REASON_CODES,
+    exitCodes: EXIT,
+    labProfiles: Object.keys(LAB_PROFILES),
+    credentials: ["bearer-file", "access-token-file", "credentials-file"],
+    reports: ["json", "sarif", "markdown", "events"],
+  };
 }
 
 /**
@@ -164,15 +229,18 @@ function err(text: string): void {
   process.stderr.write(text);
 }
 
-const SEVERITIES: readonly Severity[] = ["info", "low", "medium", "high", "critical"];
-
-export async function main(argv: string[]): Promise<number> {
-  const { values, positionals } = parseArgs({
-    args: argv,
-    allowPositionals: true,
-    strict: true,
-    options: {
+const CLI_OPTIONS = {
       json: { type: "string" },
+      quiet: { type: "boolean", default: false },
+      "credentials-out": { type: "string" },
+      rtk: { type: "string" },
+      "max-observation-age": { type: "string" },
+      "access-token-file": { type: "string" },
+      "wait-on-rate-limit": { type: "string" },
+      "delay-ms": { type: "string" },
+      "max-requests": { type: "string" },
+      deadline: { type: "string" },
+      events: { type: "string" },
       sarif: { type: "string" },
       markdown: { type: "string" },
       "fail-on": { type: "string", default: "high" },
@@ -200,8 +268,15 @@ export async function main(argv: string[]): Promise<number> {
       host: { type: "string", default: "127.0.0.1" },
       help: { type: "boolean", short: "h", default: false },
       version: { type: "boolean", short: "v", default: false },
-    },
-  });
+    } as const;
+
+const SEVERITIES: readonly Severity[] = ["info", "low", "medium", "high", "critical"];
+
+export async function main(argv: string[]): Promise<number> {
+  // `checks list --json` and `capabilities --json` take no file: the JSON goes to standard output.
+  const first = argv.find((a) => !a.startsWith("-"));
+  const args = first === "checks" || first === "capabilities" ? argv.map((a, i) => (a === "--json" && (argv[i + 1] === undefined || argv[i + 1]?.startsWith("--")) ? "--json=-" : a)) : argv;
+  const { values, positionals } = parseCli(args);
 
   if (values.version) {
     out(`${TOOL_VERSION}\n`);
@@ -211,6 +286,29 @@ export async function main(argv: string[]): Promise<number> {
   if (values.help || !command) {
     out(HELP);
     return values.help ? EXIT.ok : EXIT.usage;
+  }
+  try {
+    return await dispatch(command, sub, arg, values);
+  } catch (e) {
+    // A secret file that cannot be read is a usage error, whatever the command.
+    if (e instanceof SecretFileError) {
+      err(`${e.message}\n`);
+      return EXIT.usage;
+    }
+    throw e;
+  }
+}
+
+type Values = ReturnType<typeof parseCli>["values"];
+
+function parseCli(argv: string[]) {
+  return parseArgs({ args: argv, allowPositionals: true, strict: true, options: CLI_OPTIONS });
+}
+
+async function dispatch(command: string, sub: string | undefined, arg: string | undefined, values: Values): Promise<number> {
+  if (command === "capabilities") {
+    out(values.json !== undefined || sub === "--json" ? `${JSON.stringify(capabilities(), null, 2)}\n` : `${TOOL_NAME} ${TOOL_VERSION}\nreport schema: ${REPORT_SCHEMA}\nchecks: ${CATALOGUE.length}\nlab profiles: ${Object.keys(LAB_PROFILES).join(", ")}\nUse --json for the full, machine-readable description.\n`);
+    return EXIT.ok;
   }
 
   if (command === "mcp") {
@@ -237,6 +335,10 @@ export async function main(argv: string[]): Promise<number> {
   }
 
   if (command === "checks") {
+    if (sub === "list" && values.json !== undefined) {
+      out(`${JSON.stringify(CATALOGUE, null, 2)}\n`);
+      return EXIT.ok;
+    }
     if (sub === "list") {
       for (const c of CATALOGUE) {
         out(`${c.id.padEnd(10)} ${c.severity.padEnd(8)} ${(c.active ? "active" : "passive").padEnd(7)} ${c.availability.padEnd(9)} ${c.title}\n`);
@@ -370,6 +472,7 @@ export async function main(argv: string[]): Promise<number> {
       ...(timeoutMs !== undefined ? { requestTimeoutMs: timeoutMs } : {}),
       mcpUrl: url.toString(),
       out: values.out,
+      ...(values.json ? { json: values.json } : {}),
       force: values.force,
       probe: !values["no-probe"],
       browser: !values["no-browser"],
@@ -409,46 +512,64 @@ export async function main(argv: string[]): Promise<number> {
       }
     }
 
-    const options: Parameters<typeof scan>[1] = { allowPrivate: values["allow-private"] };
+    const options: Parameters<typeof runScan>[1] = { allowPrivate: values["allow-private"] };
+    let select: ReturnType<typeof parseSelection>;
     try {
-      const select = parseSelection(values.only, values.skip);
-      if (select) options.select = select;
+      select = parseSelection(values.only, values.skip);
+      // MAP-THR02 with an OAuth token only when it is named: it may get the token limited.
+      if (values.only !== undefined && resolveChecks(values.only).has("MAP-THR02") && /(^|,)\s*(MAP-)?THR(02)?\s*(,|$)/i.test(values.only)) options.rateLimitWithToken = true;
     } catch (e) {
       err(`${(e as Error).message}\n`);
       return EXIT.usage;
     }
+    const rtk = values.rtk ?? "destructive";
+    if (!["destructive", "rotate-only", "off"].includes(rtk)) {
+      err("--rtk must be destructive, rotate-only or off\n");
+      return EXIT.usage;
+    }
+    if (rtk !== "destructive") {
+      const inner = select;
+      const dropped = rtk === "off" ? ["MAP-RTK01", "MAP-RTK02", "MAP-RTK03"] : ["MAP-RTK02", "MAP-RTK03"];
+      select = (id) => !dropped.includes(id) && (inner ? inner(id) : true);
+    }
+    if (select) options.select = select;
     const secret = readSecret(values["secret-file"]);
     if (secret) options.secret = secret;
     if (timeoutMs !== undefined) options.timeoutMs = timeoutMs;
-    if (values["throttle-attempts"] !== undefined) {
-      const n = Number(values["throttle-attempts"]);
-      if (!Number.isInteger(n) || n < 5 || n > 20) {
-        err("--throttle-attempts must be an integer between 5 and 20\n");
+    const numbers: Array<[string, keyof typeof options, Parameters<typeof parseNumber>[1], number, string]> = [
+      ["throttle-attempts", "throttleAttempts", { min: 5, max: 20, integer: true }, 1, "an integer between 5 and 20"],
+      ["rate-attempts", "rateAttempts", { min: 10, max: 100, integer: true }, 1, "an integer between 10 and 100"],
+      ["max-observation-age", "maxObservationAgeMs", { min: 0 }, 3_600_000, "a number of hours (0 for no limit)"],
+      ["wait-on-rate-limit", "waitOnRateLimitMs", { min: 0, max: 600 }, 1000, "a number of seconds between 0 and 600"],
+      ["delay-ms", "delayMs", { min: 0, max: 60_000 }, 1, "a number of milliseconds between 0 and 60000"],
+      ["max-requests", "maxRequests", { min: 1, integer: true }, 1, "a positive integer"],
+      ["deadline", "deadlineMs", { min: 1 }, 1000, "a positive number of seconds"],
+    ];
+    for (const [flag, key, bounds, factor, expected] of numbers) {
+      const n = parseNumber(values[flag as keyof Values] as string | undefined, bounds);
+      if (n === null) {
+        err(`--${flag} must be ${expected}\n`);
         return EXIT.usage;
       }
-      options.throttleAttempts = n;
+      if (n !== undefined) (options as Record<string, unknown>)[key] = n * factor;
     }
     if (values["bearer-header"] !== undefined && !values["bearer-file"]) {
       err("--bearer-header needs --bearer-file\n");
       return EXIT.usage;
     }
-    if (values["bearer-file"]) {
+    if (values["bearer-file"] && values["access-token-file"]) {
+      err("Pass either --bearer-file (a static key) or --access-token-file (an OAuth access token), not both.\n");
+      return EXIT.usage;
+    }
+    if (values["bearer-file"] || values["access-token-file"]) {
       try {
-        const loaded = loadBearerFile(values["bearer-file"], values["bearer-header"]);
+        const loaded = values["bearer-file"] ? loadBearerFile(values["bearer-file"], values["bearer-header"]) : loadAccessTokenFile(values["access-token-file"] as string);
         for (const w of loaded.warnings) err(`warning: ${w}\n`);
         options.credential = loaded.credential;
       } catch (e) {
         err(`${(e as Error).message}\n`);
         return EXIT.usage;
       }
-    }
-    if (values["rate-attempts"] !== undefined) {
-      const n = Number(values["rate-attempts"]);
-      if (!Number.isInteger(n) || n < 10 || n > 100) {
-        err("--rate-attempts must be an integer between 10 and 100\n");
-        return EXIT.usage;
-      }
-      options.rateAttempts = n;
     }
     let failOnInconclusive = true;
     if (values["fail-on-inconclusive"] !== undefined) {
@@ -459,14 +580,24 @@ export async function main(argv: string[]): Promise<number> {
       }
       failOnInconclusive = ["true", "yes", "1"].includes(v);
     }
+    let loadedGrant: LoadedGrant | null = null;
+    if (values["credentials-out"] && !values["credentials-file"]) {
+      err("--credentials-out needs --credentials-file\n");
+      return EXIT.usage;
+    }
     if (values["credentials-file"]) {
       try {
-        const loaded = loadGrant(values["credentials-file"]);
-        for (const w of loaded.warnings) err(`warning: ${w}\n`);
-        if (loaded.grant) options.grant = loaded.grant;
-        options.observations = loaded.observations;
+        loadedGrant = loadGrant(values["credentials-file"]);
+        for (const w of loadedGrant.warnings) err(`warning: ${w}\n`);
+        if (loadedGrant.grant) options.grant = loadedGrant.grant;
+        options.observations = loadedGrant.observations;
       } catch (e) {
         err(`${(e as Error).message}\n`);
+        return EXIT.usage;
+      }
+      const p = values["credentials-out"] ? outputProblem("credentials-out", values["credentials-out"]) : null;
+      if (p) {
+        err(`${p}\n`);
         return EXIT.usage;
       }
     }
@@ -482,25 +613,68 @@ export async function main(argv: string[]): Promise<number> {
       }
     }
 
-    let report;
-    try {
-      report = await scan(url.toString(), options);
-      if (posture) report.posture = postureSection(report.findings, posture);
-    } catch (e) {
-      err(`Scan failed: ${(e as Error).message}\n`);
-      return EXIT.error;
+    if (values.events) {
+      const p = outputProblem("events", values.events);
+      if (p) {
+        err(`${p}\n`);
+        return EXIT.usage;
+      }
+      const file = values.events;
+      options.onEvent = (e: ScanEvent): void => {
+        const line = `${JSON.stringify(e)}\n`;
+        if (file === "-") err(line);
+        else appendFileSync(file, line);
+      };
     }
 
-    out(toTable(report, { color: colorWanted(), verbose: values.verbose }));
-    if (values.json) writeFileSync(values.json, toJson(report));
+    // SIGTERM or Ctrl-C stops the scan cleanly: temporary clients are deleted and a partial report is written.
+    const stop = new AbortController();
+    let signals = 0;
+    const onSignal = (): void => {
+      signals += 1;
+      if (signals > 1) process.exit(130);
+      err("Interrupted: cleaning up and writing a partial report (again to stop at once).\n");
+      stop.abort();
+    };
+    process.on("SIGINT", onSignal);
+    process.on("SIGTERM", onSignal);
+    options.signal = stop.signal;
+
+    let result;
+    try {
+      result = await runScan(url.toString(), options);
+    } catch (e) {
+      err(`Scan failed: ${(e as Error).message}\n`);
+      return EXIT.unreachable;
+    } finally {
+      process.off("SIGINT", onSignal);
+      process.off("SIGTERM", onSignal);
+    }
+    const report = result.report;
+    if (posture) report.posture = postureSection(report.findings, posture);
+
+    // Keep the grant usable: when the server did not revoke it, the newest refresh token replaces the old one.
+    if (loadedGrant?.grant && result.grant.latest && result.grant.state !== "revoked" && result.grant.state !== "unused") {
+      const target = values["credentials-out"] ?? (values["credentials-file"] as string);
+      if (result.grant.latest.refreshToken !== loadedGrant.grant.refreshToken || values["credentials-out"]) {
+        try {
+          writeGrantFile(target, result.grant.latest, loadedGrant.observations, true);
+          if (report.grant) report.grant.rewritten = true;
+        } catch (e) {
+          err(`warning: could not write the newest refresh token to ${target}: ${(e as Error).message}\n`);
+        }
+      }
+    }
+
+    const code = exitCodeFor(report, { failOn, failOnInconclusive });
+    if (report.summary) report.summary.exitCode = code;
+    const jsonToStdout = values.json === "-";
+    if (!values.quiet && !jsonToStdout) out(toTable(report, { color: colorWanted(), verbose: values.verbose }));
+    if (jsonToStdout) out(toJson(report));
+    else if (values.json) writeFileSync(values.json, toJson(report));
     if (values.sarif) writeFileSync(values.sarif, toSarif(report));
     if (values.markdown) writeFileSync(values.markdown, toMarkdown(report));
-
-    // A scan that could not run is an error whatever --fail-on-inconclusive says: it must never look like a clean scan.
-    if (report.reachable === false) return EXIT.error;
-    if (report.findings.some((f) => f.status === "fail" && severityAtLeast(f.severity, failOn))) return EXIT.findings;
-    if (failOnInconclusive && report.findings.some((f) => f.status === "error")) return EXIT.error;
-    return EXIT.ok;
+    return code;
   }
 
   err(HELP);

@@ -101,7 +101,7 @@ export async function initializeStatus(http: HttpClient, mcpUrl: string, opts: {
 export async function endSession(http: HttpClient, mcpUrl: string, auth: Credential | string, sessionId: string): Promise<void> {
   const cred = typeof auth === "string" ? bearerCredential(auth) : auth;
   try {
-    await http.request({ url: mcpUrl, method: "DELETE", headers: { [cred.header]: cred.value, "mcp-session-id": sessionId, "mcp-protocol-version": PROTOCOL_VERSION } });
+    await http.request({ url: mcpUrl, method: "DELETE", cleanup: true, headers: { [cred.header]: cred.value, "mcp-session-id": sessionId, "mcp-protocol-version": PROTOCOL_VERSION } });
   } catch {
     /* best effort */
   }

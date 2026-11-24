@@ -6,6 +6,38 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.11.0] - 2026-11-24
+
+The integration contract: what a program that runs the scanner needs. Options and report fields of 0.10 are all still accepted; the report keeps its `mcp-authprobe/report/v1` identifier and only gains fields.
+
+### Changed (read this before upgrading)
+
+- **Exit code 4** for a target that gives no HTTP answer, a scan that could not run, or one that was interrupted. It was 3, shared with inconclusive checks. `--fail-on-inconclusive false` never silences it. Exit code 3 now only means inconclusive checks.
+- **`login` exits 5** when it wrote its results but no test grant (it exited 0), and 4 when the server is unreachable. 0 means a grant was written.
+- **Login results older than 24 hours are no longer reported** by a scan: they are listed as skipped with the reason `stale_observation`. `--max-observation-age <hours>` changes the limit (0 for none).
+- **The grant file is rewritten** after a scan that left the grant valid, with the newest refresh token (atomically, mode 600). It used to keep a token the scan had already spent. `--credentials-out <file>` writes elsewhere.
+- The GitHub Action fails on an unreachable target, as its documentation said; it used to give a warning.
+
+### Added
+
+- Report, all additive: `summary` (counts, `judged`, `coverage`, highest failing severity, exit code), `discovery` (metadata URLs, issuer, endpoints, announced authorization servers, registration modes, PKCE methods, protocol), `ownership.hosts[]`, `credential` (kind and header, never the value), `grant` (`used`, `rotated`, `consumed`, `state`, `rewritten`), `leftovers[]` (temporary clients that could not be deleted), `complete`; per finding `family`, `active`, `reason`, `source`, `observedAt`, `durationMs`. `reason` is a stable code for every skipped or inconclusive check (`not_selected`, `ownership_unproven`, `needs_grant`, `needs_login`, `rate_limited`, `credential_rejected`, `unreachable`…).
+- The JSON Schema of the report ships in the package (`schema/report.schema.json`); the tests validate every report against it. In MCP mode, `structuredContent.report` carries the `schema` key too.
+- `--access-token-file <file>`: an OAuth access token for the MCP endpoint checks, reported as a token and not as a key. `MAP-THR02` then only runs when named with `--only`; an expiry during the scan gives the reason `credential_expired`; with `--credentials-file`, `MAP-AUD01` is judged during the scan. `MCP_AUTHPROBE_ACCESS_TOKEN_FILE` in MCP mode.
+- `--rtk destructive|rotate-only|off` for the refresh token sequence, and `--credentials-out`.
+- A credential that is rate limited at the control request is reported as such (`rate_limited`, with the `Retry-After`), not as a rejected key. `--wait-on-rate-limit <seconds>` waits once; `--delay-ms` spaces requests; `--max-requests` caps them.
+- `MAP-THR02` reads announced limits (`RateLimit`, `RateLimit-Policy`, `X-RateLimit-*`): a decreasing counter passes even when the limit is above the number of requests sent. Its message counts every request the scan sent with the credential, and says for how long the credential stays limited.
+- `--events <file>` (one JSON line per event), `--deadline <seconds>`, `--quiet`, `--json -`. `SIGTERM` and `SIGINT` stop a scan cleanly: temporary clients are deleted, then a partial report is written.
+- `login --json <file>`: the login results as a report, without any token.
+- `checks list --json` and `capabilities --json`.
+- Library: the package entry point now exports what is needed to build scan options and run checks (`runScan`, `login`, `bearerCredential`, `loadBearerFile`, `loadAccessTokenFile`, `parseSelection`, the check runners, `exitCodeFor`, `writeGrantFile`, the types `Credential`, `Observation`, `ScanEvent`…). `ScanOptions` takes an `AbortSignal`, a deadline and `onEvent`. `package.json` has an `exports` map; deep imports under `dist/` still resolve but are not covered by semantic versioning.
+- `docs/integration.md`: subprocess, library, report, reason codes, exit codes, what a scan consumes, the life of a test grant.
+
+### Security
+
+- One reader for every secret file (ownership secret, static key, access token, test grant): a regular file of bounded size, opened once, with a warning when other users can read it. The ownership secret file had no check at all. Key and token files are refused when they are symbolic links; the ownership secret and the grant may be links, since container secret volumes are.
+- Grant files are written to a new file and renamed: an interruption no longer destroys the grant.
+- `MAP-AUD01` compares the token audience with the `resource` the server announces as well as with the scanned URL.
+
 ## [0.10.2] - 2026-11-24
 
 Corrections only: wrong results, and gaps between the documentation and the tool. No option or report field is removed.
@@ -170,7 +202,8 @@ First release.
 - Hardening from an independent review before release: HTTPS is required for every request outside loopback/private labs; rate limits and server errors make redirect URI, registration and throttling checks inconclusive instead of passing; test grants record their target and token endpoint and are never used elsewhere (and must name their target in MCP mode); loopback targets need a proof in MCP mode unless listed in `MCP_AUTHPROBE_LAB_ORIGINS`; `login` output is neutralized; more IPv6 transition ranges are refused; a malformed issuer no longer aborts discovery.
 - Local fixture server with a stateful token endpoint, dynamic registration and an authorization endpoint and test suite; GitHub Actions CI.
 
-[Unreleased]: https://github.com/Enigmacker/mcp-authprobe/compare/v0.10.2...HEAD
+[Unreleased]: https://github.com/Enigmacker/mcp-authprobe/compare/v0.11.0...HEAD
+[0.11.0]: https://github.com/Enigmacker/mcp-authprobe/compare/v0.10.2...v0.11.0
 [0.10.2]: https://github.com/Enigmacker/mcp-authprobe/compare/v0.10.1...v0.10.2
 [0.10.1]: https://github.com/Enigmacker/mcp-authprobe/compare/v0.10.0...v0.10.1
 [0.10.0]: https://github.com/Enigmacker/mcp-authprobe/compare/v0.9.0...v0.10.0

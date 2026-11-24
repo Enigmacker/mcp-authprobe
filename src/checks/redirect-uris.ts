@@ -2,8 +2,8 @@ import type { HttpClient } from "../net/http.js";
 import { describeAnswer, probeAuthorize, signature, type AuthorizeAnswer, type AuthorizeParams } from "../oauth/authorize.js";
 import { deleteClient, REGISTERED_REDIRECT, registerClient, SAFE_DOMAIN, type RegisteredClient } from "../oauth/registration.js";
 import { safeText } from "../redact.js";
-import type { CheckDefinition, Finding } from "../types.js";
-import { CATALOGUE } from "./catalogue.js";
+import type { Finding, Leftover, ReasonCode } from "../types.js";
+import { makeFinding } from "./finding.js";
 
 /**
  * Redirect URI family: MAP-RDR01, MAP-RDR02, MAP-RDR04.
@@ -54,17 +54,24 @@ export interface RedirectCheckContext {
   /** RFC 8707 resource to send, normally the MCP server URL. */
   resource: string;
   scope?: string;
+  /** Receives the temporary clients that could not be deleted (also noted in the evidence). */
+  leftovers?: Leftover[];
 }
 
-function def(id: string): CheckDefinition {
-  const d = CATALOGUE.find((c) => c.id === id);
-  if (!d) throw new Error(`Unknown check ${id}`);
-  return d;
-}
+/** Reason codes for this file's inconclusive and skipped messages (first match wins; the default is "unexpected_answer"). */
+const REASONS: ReadonlyArray<[RegExp, ReasonCode]> = [
+  [/unreachable/i, "unreachable"],
+  [/rate limited/i, "rate_limited"],
+  [/server error/i, "server_error"],
+  [/answered exactly like the valid one/i, "deferred_validation"],
+  [/^No registration endpoint|^Needs a client/, "no_client"],
+  [/^No authorization endpoint/, "no_endpoint"],
+  [/was itself rejected/i, "ambiguous"],
+];
+const reasonOf = (message: string): ReasonCode | undefined => REASONS.find(([re]) => re.test(message))?.[1];
 
-function result(id: string, target: string, status: Finding["status"], message: string, evidence: string[] = []): Finding {
-  const d = def(id);
-  return { checkId: d.id, title: d.title, severity: d.severity, status, target, message: safeText(message), evidence: evidence.map((e) => safeText(e)) };
+function result(id: string, target: string, status: Finding["status"], message: string, evidence: string[] = [], reason?: ReasonCode): Finding {
+  return makeFinding(id, target, status, message, evidence, reason ?? reasonOf(message));
 }
 
 type VariantVerdict = "accepted" | "refused" | "inconclusive";
@@ -221,6 +228,7 @@ export async function runRedirectUriChecks(ctx: RedirectCheckContext): Promise<F
     for (const c of created) {
       if (!(await deleteClient(http, c, ctx.registrationEndpoint as string))) leftovers.push(c.clientId);
     }
+    for (const id of leftovers) ctx.leftovers?.push({ kind: "client", clientId: safeText(id, 200), endpoint: ctx.registrationEndpoint as string, reason: "the server offers no RFC 7592 deletion, or refused it" });
     if (leftovers.length > 0) {
       const note = `Test clients left on the server (no RFC 7592 deletion available): ${leftovers.join(", ")}. They are named "mcp-authprobe test client (safe to delete)".`;
       const target04 = findings.find((f) => f.checkId === "MAP-RDR04") ?? findings[0];

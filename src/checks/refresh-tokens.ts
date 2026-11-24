@@ -1,9 +1,8 @@
 import type { TestGrant } from "../credentials.js";
 import type { HttpClient } from "../net/http.js";
 import { describe, refresh, type RefreshOutcome } from "../oauth/token-client.js";
-import { safeText } from "../redact.js";
-import type { CheckDefinition, Finding } from "../types.js";
-import { CATALOGUE } from "./catalogue.js";
+import type { Finding, ReasonCode } from "../types.js";
+import { makeFinding } from "./finding.js";
 
 /**
  * Refresh token family: MAP-RTK01, MAP-RTK02, MAP-RTK03.
@@ -53,23 +52,17 @@ export interface RefreshSequenceResult {
   grant: GrantState;
 }
 
-function def(id: string): CheckDefinition {
-  const d = CATALOGUE.find((c) => c.id === id);
-  if (!d) throw new Error(`Unknown check ${id}`);
-  return d;
-}
+/** Reason codes for this file's inconclusive and skipped messages (first match wins; the default is "unexpected_answer"). */
+const REASONS: ReadonlyArray<[RegExp, ReasonCode]> = [
+  [/^Not selected/, "not_selected"],
+  [/unreachable/i, "unreachable"],
+  [/throttled/i, "rate_limited"],
+  [/was not accepted/i, "credential_rejected"],
+];
+const reasonOf = (message: string): ReasonCode | undefined => REASONS.find(([re]) => re.test(message))?.[1];
 
-function result(id: string, target: string, status: Finding["status"], message: string, evidence: string[]): Finding {
-  const d = def(id);
-  return {
-    checkId: d.id,
-    title: d.title,
-    severity: d.severity,
-    status,
-    target,
-    message: safeText(message),
-    evidence: evidence.map((e) => safeText(e)),
-  };
+function result(id: string, target: string, status: Finding["status"], message: string, evidence: string[], reason?: ReasonCode): Finding {
+  return makeFinding(id, target, status, message, evidence, reason ?? reasonOf(message));
 }
 
 const isRejection = (o: RefreshOutcome): boolean => !o.accessTokenIssued && o.status >= 400 && o.status < 500 && !o.throttled;

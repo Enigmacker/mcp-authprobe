@@ -3,7 +3,13 @@ import { LOGIN_CHECK_IDS } from "./checks/catalogue.js";
 import { loadGrant, writeGrantFile, type Observation } from "./credentials.js";
 import { discover } from "./discovery.js";
 import { login, LoginError, openInBrowser } from "./login.js";
-import { HttpClient } from "./net/http.js";
+import { summarize } from "./checks/finding.js";
+import { EXIT } from "./exit.js";
+import { BlockedAddressError, HttpClient, InsecureTransportError, NetworkError } from "./net/http.js";
+import { toJson } from "./report/json.js";
+import type { ScanReport } from "./types.js";
+import { TOOL_NAME, TOOL_VERSION } from "./version.js";
+import { writeFileSync } from "node:fs";
 import { verifyOwnership } from "./ownership.js";
 import { safeText } from "./redact.js";
 import { hostsToVerify } from "./scan.js";
@@ -21,6 +27,8 @@ export interface LoginCommandOptions {
   timeoutMs?: number;
   /** Per-request timeout in milliseconds (--timeout). */
   requestTimeoutMs?: number;
+  /** Write the results as a report, without any token (--json). */
+  json?: string;
 }
 
 // Everything printed here may contain server-controlled text: neutralize it.
@@ -30,6 +38,7 @@ const err = (t: string): void => {
 
 /** `mcp-authprobe login`: everything goes to stderr; tokens are only written to the grant file. */
 export async function runLoginCommand(o: LoginCommandOptions): Promise<number> {
+  const startedAt = new Date().toISOString();
   const http = new HttpClient({ allowPrivate: o.allowPrivate, ...(o.requestTimeoutMs !== undefined ? { timeoutMs: o.requestTimeoutMs } : {}) });
   try {
     const discovery = await discover(o.mcpUrl, http);
@@ -73,24 +82,42 @@ export async function runLoginCommand(o: LoginCommandOptions): Promise<number> {
         /* unreadable or not ours: replaced */
       }
     }
-    if (!result.grant && observations.length === 0) return 3;
+    if (o.json) {
+      // The results alone, in the report format: nothing here is secret, unlike the grant file.
+      const report: ScanReport = {
+        tool: { name: TOOL_NAME, version: TOOL_VERSION },
+        startedAt,
+        finishedAt: new Date().toISOString(),
+        target: new URL(o.mcpUrl).toString(),
+        reachable: true,
+        ownership: { verified: probe, method: null, detail: probe ? "Ownership proven: the login checks were observed." : "Ownership not proven, or --no-probe: the login checks were not observed." },
+        findings: result.observations,
+        summary: summarize(result.observations),
+      };
+      try {
+        writeFileSync(o.json, toJson(report));
+      } catch (e) {
+        err(`Could not write ${o.json}: ${(e as Error).message}`);
+      }
+    }
+    if (!result.grant && observations.length === 0) return EXIT.error;
 
     try {
       writeGrantFile(o.out, result.grant, observations, o.force);
     } catch (e) {
       const code = (e as NodeJS.ErrnoException).code;
       err(code === "EEXIST" ? `${o.out} already exists; use --force to overwrite it.` : `Could not write ${o.out}: ${(e as Error).message}`);
-      return 2;
+      return EXIT.usage;
     }
     if (!result.grant) {
       err(`Results written to ${o.out} (no test grant). Run login again with --no-probe --force --out ${o.out}: these results are kept.`);
-      return 0;
+      return EXIT.noGrant;
     }
     err(`Test grant written to ${o.out} (mode 600). It is consumed by the refresh token checks: scan with --credentials-file ${o.out}.`);
-    return 0;
+    return EXIT.ok;
   } catch (e) {
     err(e instanceof LoginError ? `Login failed: ${e.message}` : `Login failed: ${(e as Error).message}`);
-    return 3;
+    return e instanceof NetworkError || e instanceof BlockedAddressError || e instanceof InsecureTransportError ? EXIT.unreachable : EXIT.error;
   } finally {
     await http.close();
   }

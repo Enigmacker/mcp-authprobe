@@ -1,15 +1,17 @@
-import { readFileSync } from "node:fs";
 import { McpServer } from "@modelcontextprotocol/server";
 import { z } from "zod";
 import { CATALOGUE, getCheck } from "./checks/catalogue.js";
-import { loadGrant, type TestGrant } from "./credentials.js";
+import { loadGrant, writeGrantFile, type LoadedGrant } from "./credentials.js";
+import { registerSecret } from "./redact.js";
+import { REPORT_SCHEMA } from "./report/json.js";
+import { readSecretLine } from "./secret-file.js";
 import { HttpClient, plainHttpAllowed } from "./net/http.js";
 import { DNS_LABEL, proofFor, verifyOwnership, WELL_KNOWN_PATH } from "./ownership.js";
 import type { Credential } from "./oauth/mcp-call.js";
 import { parseSelection } from "./selection.js";
-import { loadBearerFile } from "./static-key.js";
+import { loadAccessTokenFile, loadBearerFile } from "./static-key.js";
 import { toMarkdown } from "./report/markdown.js";
-import { scan, type ScanOptions } from "./scan.js";
+import { runScan, type ScanOptions } from "./scan.js";
 import { TOOL_NAME, TOOL_VERSION } from "./version.js";
 
 /**
@@ -28,6 +30,8 @@ import { TOOL_NAME, TOOL_VERSION } from "./version.js";
  *   MCP_AUTHPROBE_BEARER_FILE + MCP_AUTHPROBE_BEARER_TARGET
  *                                                      static API key, used only for that exact URL
  *   MCP_AUTHPROBE_BEARER_HEADER                        header for the key (default Authorization)
+ *   MCP_AUTHPROBE_ACCESS_TOKEN_FILE + MCP_AUTHPROBE_BEARER_TARGET
+ *                                                      OAuth access token, used only for that exact URL
  *   MCP_AUTHPROBE_ALLOW_PRIVATE=1                      local labs only
  *   MCP_AUTHPROBE_LAB_ORIGINS                          comma-separated lab origins exempt from proof
  *   MCP_AUTHPROBE_TIMEOUT_MS                           per-request timeout
@@ -53,8 +57,16 @@ export interface ServerConfig {
 export function configFromEnv(env: NodeJS.ProcessEnv = process.env): ServerConfig {
   const config: ServerConfig = { allowPrivate: env["MCP_AUTHPROBE_ALLOW_PRIVATE"] === "1" };
   const secretFile = env["MCP_AUTHPROBE_SECRET_FILE"];
-  const secret = secretFile ? readFileSync(secretFile, "utf8").trim() : env["MCP_AUTHPROBE_SECRET"]?.trim();
-  if (secret) config.secret = secret;
+  let secret = env["MCP_AUTHPROBE_SECRET"]?.trim();
+  if (secretFile) {
+    const loaded = readSecretLine(secretFile, { label: "ownership secret file", maxBytes: 8 * 1024, followLinks: true });
+    for (const w of loaded.warnings) process.stderr.write(`mcp-authprobe: warning: ${w}\n`);
+    secret = loaded.value;
+  }
+  if (secret) {
+    registerSecret(secret);
+    config.secret = secret;
+  }
   const labs = env["MCP_AUTHPROBE_LAB_ORIGINS"];
   if (labs) {
     config.labOrigins = labs
@@ -72,10 +84,12 @@ export function configFromEnv(env: NodeJS.ProcessEnv = process.env): ServerConfi
   const creds = env["MCP_AUTHPROBE_CREDENTIALS_FILE"];
   if (creds) config.credentialsFile = creds;
   const keyFile = env["MCP_AUTHPROBE_BEARER_FILE"];
-  if (keyFile) {
+  const tokenFile = env["MCP_AUTHPROBE_ACCESS_TOKEN_FILE"];
+  if (keyFile && tokenFile) throw new Error("Set either MCP_AUTHPROBE_BEARER_FILE (a static key) or MCP_AUTHPROBE_ACCESS_TOKEN_FILE (an OAuth access token), not both.");
+  if (keyFile || tokenFile) {
     const target = env["MCP_AUTHPROBE_BEARER_TARGET"];
-    if (!target) throw new Error("MCP_AUTHPROBE_BEARER_FILE needs MCP_AUTHPROBE_BEARER_TARGET: the MCP URL the key belongs to.");
-    const loaded = loadBearerFile(keyFile, env["MCP_AUTHPROBE_BEARER_HEADER"] ?? "authorization");
+    if (!target) throw new Error("MCP_AUTHPROBE_BEARER_FILE and MCP_AUTHPROBE_ACCESS_TOKEN_FILE need MCP_AUTHPROBE_BEARER_TARGET: the MCP URL the credential belongs to.");
+    const loaded = keyFile ? loadBearerFile(keyFile, env["MCP_AUTHPROBE_BEARER_HEADER"] ?? "authorization") : loadAccessTokenFile(tokenFile as string);
     for (const w of loaded.warnings) process.stderr.write(`mcp-authprobe: warning: ${w}\n`);
     config.staticKey = { credential: loaded.credential, target: new URL(target).toString() };
   }
@@ -246,28 +260,42 @@ export function createAuthprobeServer(config: ServerConfig): McpServer {
         const notes: string[] = [];
         if (config.staticKey) {
           if (config.staticKey.target === parsed.toString()) options.credential = config.staticKey.credential;
-          else notes.push("The configured static key belongs to another URL (MCP_AUTHPROBE_BEARER_TARGET); it was not used.");
+          else notes.push("The configured key or access token belongs to another URL (MCP_AUTHPROBE_BEARER_TARGET); it was not used.");
         }
+        let loaded: LoadedGrant | null = null;
         if (config.credentialsFile) {
           try {
-            const loaded = loadGrant(config.credentialsFile);
-            if (loaded.grant) options.grant = loaded.grant satisfies TestGrant;
+            loaded = loadGrant(config.credentialsFile);
+            if (loaded.grant) options.grant = loaded.grant;
             options.observations = loaded.observations;
             notes.push(...loaded.warnings);
           } catch (e) {
             notes.push(`Test grant not loaded: ${(e as Error).message}`);
           }
         }
-        const report = await scan(parsed.toString(), options);
+        const result = await runScan(parsed.toString(), options);
+        const report = result.report;
+        // Keep the grant usable when the server did not revoke it.
+        if (config.credentialsFile && loaded?.grant && result.grant.latest && result.grant.state !== "revoked" && result.grant.state !== "unused" && result.grant.latest.refreshToken !== loaded.grant.refreshToken) {
+          try {
+            writeGrantFile(config.credentialsFile, result.grant.latest, loaded.observations, true);
+            if (report.grant) report.grant.rewritten = true;
+          } catch (e) {
+            notes.push(`The newest refresh token could not be written to the grant file: ${(e as Error).message}`);
+          }
+        }
         const failures = report.findings.filter((f) => f.status === "fail").length;
         const summary = [
-          `Scan of ${report.target}: ${failures} failing check(s). Ownership ${report.ownership.verified ? "verified" : "NOT verified (active checks skipped)"}.`,
+          report.reachable === false
+            ? `Scan of ${report.target}: the target is unreachable, no check was run.`
+            : `Scan of ${report.target}: ${failures} failing check(s), ${report.summary?.counts.error ?? 0} inconclusive, ${report.summary?.judged ?? 0} of ${report.findings.length} judged. Ownership ${report.ownership.verified ? "verified" : "NOT verified (active checks skipped)"}.`,
+          ...(report.grant?.consumed ? ["The test grant was revoked by the server during the refresh token checks: the user must log in again for a new one."] : []),
           ...notes.map((n) => `Warning: ${n}`),
           "",
           toMarkdown(report),
           DATA_NOTICE,
         ].join("\n");
-        return { content: [{ type: "text" as const, text: summary }], structuredContent: { report } };
+        return { content: [{ type: "text" as const, text: summary }], structuredContent: { report: { schema: REPORT_SCHEMA, ...report } } };
       } catch (e) {
         return errorResult(`Scan failed: ${(e as Error).message}`);
       } finally {

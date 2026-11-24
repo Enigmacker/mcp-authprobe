@@ -1,0 +1,498 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/Enigmacker/mcp-authprobe/blob/main/schema/report.schema.json",
+  "title": "mcp-authprobe report (mcp-authprobe/report/v1)",
+  "description": "Report written by `mcp-authprobe scan --json`, returned by the library and by the MCP `scan` tool. Within v1, fields are only added: a consumer must ignore the ones it does not know. Fields outside `required` were added after 0.10 and are absent from older reports.",
+  "type": "object",
+  "required": [
+    "schema",
+    "tool",
+    "startedAt",
+    "finishedAt",
+    "target",
+    "ownership",
+    "findings"
+  ],
+  "properties": {
+    "schema": {
+      "const": "mcp-authprobe/report/v1"
+    },
+    "tool": {
+      "type": "object",
+      "required": [
+        "name",
+        "version"
+      ],
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "version": {
+          "type": "string"
+        }
+      }
+    },
+    "startedAt": {
+      "type": "string"
+    },
+    "finishedAt": {
+      "type": "string"
+    },
+    "target": {
+      "type": "string"
+    },
+    "reachable": {
+      "type": "boolean",
+      "description": "False when the target gave no HTTP answer: no check ran, the exit code is 4."
+    },
+    "complete": {
+      "type": "boolean",
+      "description": "False when the scan was interrupted (signal, --deadline, --max-requests): the findings are partial."
+    },
+    "ownership": {
+      "type": "object",
+      "required": [
+        "verified",
+        "method",
+        "detail"
+      ],
+      "properties": {
+        "verified": {
+          "type": "boolean"
+        },
+        "method": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "detail": {
+          "type": "string"
+        },
+        "hosts": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": [
+              "host",
+              "verified",
+              "method",
+              "detail"
+            ],
+            "properties": {
+              "host": {
+                "type": "string"
+              },
+              "verified": {
+                "type": "boolean"
+              },
+              "method": {
+                "enum": [
+                  "well-known",
+                  "dns-txt",
+                  "well-known-v2",
+                  "dns-txt-v2",
+                  "loopback",
+                  null
+                ]
+              },
+              "detail": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      }
+    },
+    "findings": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "checkId",
+          "title",
+          "severity",
+          "status",
+          "target",
+          "message",
+          "evidence"
+        ],
+        "properties": {
+          "checkId": {
+            "type": "string",
+            "pattern": "^MAP-[A-Z]{3}[0-9]{2}$"
+          },
+          "title": {
+            "type": "string"
+          },
+          "severity": {
+            "type": "string",
+            "enum": [
+              "critical",
+              "high",
+              "medium",
+              "low",
+              "info"
+            ]
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "pass",
+              "fail",
+              "not_applicable",
+              "error",
+              "skipped"
+            ]
+          },
+          "target": {
+            "type": "string"
+          },
+          "message": {
+            "type": "string"
+          },
+          "evidence": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "family": {
+            "type": "string"
+          },
+          "active": {
+            "type": "boolean"
+          },
+          "reason": {
+            "type": "string",
+            "description": "Why the check is skipped or inconclusive. New codes may be added in minor versions: treat an unknown code like 'unexpected_answer'.",
+            "enum": [
+              "not_selected",
+              "ownership_unproven",
+              "needs_grant",
+              "needs_login",
+              "needs_browser",
+              "needs_static_key",
+              "needs_credential",
+              "no_client",
+              "no_endpoint",
+              "not_observed",
+              "stale_observation",
+              "unreachable",
+              "rate_limited",
+              "server_error",
+              "credential_rejected",
+              "credential_expired",
+              "deferred_validation",
+              "incomplete",
+              "ambiguous",
+              "protocol_unsupported",
+              "interrupted",
+              "unexpected_answer"
+            ]
+          },
+          "source": {
+            "type": "string",
+            "enum": [
+              "scan",
+              "login",
+              "consent-check"
+            ]
+          },
+          "observedAt": {
+            "type": "string"
+          },
+          "durationMs": {
+            "type": "number"
+          }
+        }
+      }
+    },
+    "summary": {
+      "type": "object",
+      "required": [
+        "counts",
+        "total",
+        "judged",
+        "coverage",
+        "highestFailingSeverity"
+      ],
+      "properties": {
+        "counts": {
+          "type": "object",
+          "required": [
+            "pass",
+            "fail",
+            "not_applicable",
+            "error",
+            "skipped"
+          ],
+          "properties": {
+            "pass": {
+              "type": "integer"
+            },
+            "fail": {
+              "type": "integer"
+            },
+            "not_applicable": {
+              "type": "integer"
+            },
+            "error": {
+              "type": "integer"
+            },
+            "skipped": {
+              "type": "integer"
+            }
+          }
+        },
+        "total": {
+          "type": "integer"
+        },
+        "judged": {
+          "type": "integer"
+        },
+        "coverage": {
+          "type": "number"
+        },
+        "highestFailingSeverity": {
+          "enum": [
+            "critical",
+            "high",
+            "medium",
+            "low",
+            "info",
+            null
+          ]
+        },
+        "exitCode": {
+          "type": "integer"
+        }
+      }
+    },
+    "discovery": {
+      "type": "object",
+      "required": [
+        "registration",
+        "protocol",
+        "authorizationServers",
+        "notes"
+      ],
+      "properties": {
+        "challengeStatus": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "resourceMetadataUrl": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "authorizationServerMetadataUrl": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "resource": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "issuer": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "authorizationServers": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "authorizationEndpoint": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "tokenEndpoint": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "registrationEndpoint": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "registration": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "enum": [
+              "dcr",
+              "cimd"
+            ]
+          }
+        },
+        "pkceMethods": {
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "type": "string"
+          }
+        },
+        "protocol": {
+          "type": "object",
+          "required": [
+            "era",
+            "version",
+            "supportedVersions"
+          ],
+          "properties": {
+            "era": {
+              "type": "string",
+              "enum": [
+                "legacy",
+                "modern",
+                "unknown"
+              ]
+            },
+            "version": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "supportedVersions": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "transport": {
+              "type": "string"
+            }
+          }
+        },
+        "notes": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "credential": {
+      "type": "object",
+      "required": [
+        "kind",
+        "header"
+      ],
+      "properties": {
+        "kind": {
+          "type": "string",
+          "enum": [
+            "static",
+            "oauth"
+          ]
+        },
+        "header": {
+          "type": "string"
+        }
+      }
+    },
+    "client": {
+      "type": "object",
+      "description": "How the scanner obtained an OAuth client for the checks that need one.",
+      "properties": {
+        "source": {
+          "type": "string",
+          "enum": [
+            "pre-registered",
+            "metadata-document",
+            "dynamic-registration",
+            "none"
+          ]
+        }
+      }
+    },
+    "grant": {
+      "type": "object",
+      "required": [
+        "used",
+        "rotated",
+        "consumed",
+        "state",
+        "rewritten"
+      ],
+      "properties": {
+        "used": {
+          "type": "boolean"
+        },
+        "rotated": {
+          "type": "boolean"
+        },
+        "consumed": {
+          "type": "boolean"
+        },
+        "state": {
+          "type": "string",
+          "enum": [
+            "valid",
+            "revoked",
+            "unknown",
+            "unused"
+          ]
+        },
+        "rewritten": {
+          "type": "boolean"
+        }
+      }
+    },
+    "leftovers": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "kind",
+          "clientId",
+          "endpoint",
+          "reason"
+        ],
+        "properties": {
+          "kind": {
+            "type": "string",
+            "enum": [
+              "client"
+            ]
+          },
+          "clientId": {
+            "type": "string"
+          },
+          "endpoint": {
+            "type": "string"
+          },
+          "reason": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "preset": {
+      "type": "string"
+    },
+    "posture": {
+      "type": "object"
+    }
+  }
+}

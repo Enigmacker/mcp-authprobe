@@ -4,8 +4,8 @@ import type { HttpClient } from "../net/http.js";
 import { deleteClient, REGISTERED_REDIRECT, registerClient, type RegisteredClient } from "../oauth/registration.js";
 import { exchangeCode, refresh, type RefreshOutcome } from "../oauth/token-client.js";
 import { safeText } from "../redact.js";
-import type { Finding } from "../types.js";
-import { CATALOGUE } from "./catalogue.js";
+import type { Finding, Leftover, ReasonCode } from "../types.js";
+import { makeFinding } from "./finding.js";
 
 /**
  * MAP-THR01: are repeated failed token requests throttled?
@@ -39,6 +39,8 @@ export interface ThrottleCheckContext {
   /** The operator's test grant: its client is used when present. */
   grant?: TestGrant;
   attempts?: number;
+  /** Receives the temporary client when it could not be deleted. */
+  leftovers?: Leftover[];
 }
 
 export function clampAttempts(n: number | undefined): number {
@@ -46,10 +48,17 @@ export function clampAttempts(n: number | undefined): number {
   return Math.min(MAX_ATTEMPTS, Math.max(MIN_ATTEMPTS, Math.trunc(n)));
 }
 
-function result(status: Finding["status"], target: string, message: string, evidence: string[] = []): Finding {
-  const def = CATALOGUE.find((c) => c.id === "MAP-THR01");
-  if (!def) throw new Error("MAP-THR01 missing from catalogue");
-  return { checkId: def.id, title: def.title, severity: def.severity, status, target, message: safeText(message), evidence: evidence.map((e) => safeText(e)) };
+/** Reason codes for this file's inconclusive and skipped messages (first match wins; the default is "unexpected_answer"). */
+const REASONS: ReadonlyArray<[RegExp, ReasonCode]> = [
+  [/unreachable/i, "unreachable"],
+  [/rate limited/i, "rate_limited"],
+  [/server error/i, "server_error"],
+  [/^Needs a client/, "no_client"],
+];
+const reasonOf = (message: string): ReasonCode | undefined => REASONS.find(([re]) => re.test(message))?.[1];
+
+function result(status: Finding["status"], target: string, message: string, evidence: string[] = [], reason?: ReasonCode): Finding {
+  return makeFinding("MAP-THR01", target, status, message, evidence, reason ?? reasonOf(message));
 }
 
 const THROTTLE_ERRORS = new Set(["slow_down", "temporarily_unavailable"]);
@@ -129,6 +138,8 @@ export async function runThrottlingCheck(ctx: ThrottleCheckContext): Promise<Fin
   } catch (err) {
     return result("error", target, `Token endpoint unreachable: ${(err as Error).message}`);
   } finally {
-    if (temporary && ctx.registrationEndpoint) await deleteClient(http, temporary, ctx.registrationEndpoint);
+    if (temporary && ctx.registrationEndpoint && !(await deleteClient(http, temporary, ctx.registrationEndpoint))) {
+      ctx.leftovers?.push({ kind: "client", clientId: safeText(temporary.clientId, 200), endpoint: ctx.registrationEndpoint, reason: "the server offers no RFC 7592 deletion, or refused it" });
+    }
   }
 }

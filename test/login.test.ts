@@ -265,7 +265,7 @@ describe("login command", () => {
     fixture = await startFixture({ authorization: { noSession: "auto-approve" }, tokens: { consumeCodeOnFailure: true } });
     const out = join(mkdtempSync(join(tmpdir(), "map-login-")), "lab.json");
     const base = { mcpUrl: fixture.mcpUrl, out, browser: false, allowPrivate: true, secret: undefined, openUrl: browser(), timeoutMs: 5000 };
-    expect(await runLoginCommand({ ...base, force: false, probe: true })).toBe(0);
+    expect(await runLoginCommand({ ...base, force: false, probe: true })).toBe(5);
     const first = loadGrant(out);
     expect(first.grant).toBeNull();
     expect(first.observations.map((o) => o.checkId).sort()).toEqual(["MAP-PKC01", "MAP-RDR03"]);
