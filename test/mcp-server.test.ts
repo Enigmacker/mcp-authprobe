@@ -43,6 +43,9 @@ describe("MCP server", () => {
     const scanProps = Object.keys((byName["scan"]?.inputSchema as { properties?: object }).properties ?? {});
     // only/skip can only narrow a scan, never widen it.
     expect(scanProps).toEqual(["url", "only", "skip"]);
+    // The scan's structured result is declared: a client can rely on report.schema, target and findings.
+    const out = byName["scan"]?.outputSchema as { properties?: { report?: { properties?: Record<string, unknown>; required?: string[] } } };
+    expect(Object.keys(out?.properties?.report?.properties ?? {})).toEqual(expect.arrayContaining(["schema", "target", "findings"]));
     // Every parameter is documented for the model, and every description says when to use the tool.
     for (const t of Object.values(byName)) {
       for (const [name, prop] of Object.entries((t.inputSchema as { properties?: Record<string, { description?: string }> }).properties ?? {})) {

@@ -6,6 +6,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Added
+
+- With `--access-token-file` and no test grant, `MAP-AUD01` stays skipped, but when the token is a JWT its evidence now says which audience it was issued for (read locally, never verified, never sent anywhere): a hint, not a result.
+- MCP mode: the `scan` tool declares its structured result (`outputSchema`): the report, with `schema`, `target` and `findings`, kept open for the fields later versions add.
+
 ## [0.13.0] - 2026-11-24
 
 ### Changed (read this before upgrading)

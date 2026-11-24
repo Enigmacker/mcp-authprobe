@@ -259,6 +259,17 @@ export function createAuthprobeServer(config: ServerConfig): McpServer {
         only: z.string().max(500).optional().describe("Run only these checks: comma-separated IDs (MAP-RDR01 or RDR01) or families (RDR)"),
         skip: z.string().max(500).optional().describe("Do not run these checks (same syntax; wins over only), e.g. THR to avoid failed token requests"),
       }),
+      // The full report, as the CLI writes it with --json (schema/report.schema.json): kept open so that additions
+      // to the report stay compatible.
+      outputSchema: z.object({
+        report: z
+          .object({
+            schema: z.literal(REPORT_SCHEMA),
+            target: z.string(),
+            findings: z.array(z.object({ checkId: z.string(), status: z.string(), severity: z.string(), message: z.string() }).passthrough()),
+          })
+          .passthrough(),
+      }),
       annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true },
     },
     async ({ url, only, skip }) => {

@@ -1,4 +1,4 @@
-import { runAudienceCheck } from "./checks/audience.js";
+import { jwtAudience, runAudienceCheck } from "./checks/audience.js";
 import { CATALOGUE } from "./checks/catalogue.js";
 import { runEndpointChecks, runMetadataCheck, type EndpointCheckId } from "./checks/endpoint.js";
 import { makeFinding, summarize } from "./checks/finding.js";
@@ -398,6 +398,21 @@ async function runRedirectFamily(ctx: Ctx, select: CheckSelector): Promise<Findi
 }
 
 /**
+ * What a supplied access token says of its own audience, read without verification and without any request. A
+ * JWT naming neither this server nor its announced resource is worth a look; an opaque token says nothing.
+ */
+export function audienceHint(token: string, target: string, resource: unknown): string | null {
+  const aud = jwtAudience(token);
+  if (!aud) return null;
+  const own = [target, ...(typeof resource === "string" ? [resource] : [])].map((u) => u.replace(/\/+$/, ""));
+  const named = aud.some((a) => own.includes(a.replace(/\/+$/, "")));
+  const shown = aud.slice(0, 5).map((a) => a.slice(0, 120)).join(", ");
+  return named
+    ? `the supplied access token is a JWT issued for this server (aud: ${shown}); whether the server checks the audience needs a test grant`
+    : `the supplied access token is a JWT whose audience does not name this server (aud: ${shown}): if the server accepts it, it may not check the audience; supply a test grant to judge MAP-AUD01`;
+}
+
+/**
  * MAP-AUD01 during a scan: possible when the operator supplies both an
  * access token for the server (the control) and a test grant (to ask for a
  * token for another resource). Uses one refresh; the grant keeps the newest token.
@@ -690,7 +705,15 @@ export async function runScan(mcpUrl: string, options: ScanOptions = {}): Promis
       if (asProven) await stage(RTK_IDS, () => runRefreshFamily(ctx));
       if (asProven) await stage(RDR_IDS, () => runRedirectFamily(ctx, wanted));
       for (const id of LOGIN_ONLY_IDS) {
-        if (!handled.has(id)) findings.push(fromObservation(ctx, id));
+        if (handled.has(id)) continue;
+        const f = fromObservation(ctx, id);
+        // With an access token but no grant, MAP-AUD01 cannot be judged; the token itself still says, without any
+        // request, which audience it was issued for: a hint for the operator, never a result.
+        if (id === "MAP-AUD01" && f.status === "skipped" && credential?.kind === "oauth") {
+          const hint = audienceHint(credential.secret, target, discovery?.prm?.metadata.resource);
+          if (hint) f.evidence = [...f.evidence, hint];
+        }
+        findings.push(f);
       }
       if (!handled.has("MAP-INJ01")) await stage(["MAP-INJ01"], () => metadataWithoutCredential(ctx));
       findings.push(makeFinding("MAP-CSR01", target, "skipped", "Needs a logged-in browser session: run `mcp-authprobe consent-check` separately.", [], "needs_browser"));
