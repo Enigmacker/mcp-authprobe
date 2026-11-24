@@ -19,6 +19,10 @@ export interface HttpRequest {
   headers?: Record<string, string>;
   /** A string is sent with Content-Length; an async iterable is streamed (chunked). */
   body?: string | AsyncIterable<Uint8Array>;
+  /** Response body cap for this request only (default: the client's cap, 1 MiB). */
+  maxBodyBytes?: number;
+  /** Timeout for this request only (large uploads). */
+  timeoutMs?: number;
   /** Redirects are never followed automatically; callers inspect them. */
 }
 
@@ -54,6 +58,54 @@ export function plainHttpAllowed(url: URL, allowPrivate: boolean): boolean {
   if (!allowPrivate) return false;
   const host = url.hostname.replace(/^\[|\]$/g, "");
   return isLoopbackHost(host) || (isIP(host) !== 0 && isBlockedAddress(host));
+}
+
+/**
+ * A request that got no HTTP answer. `code` is stable and machine-readable
+ * (ECONNREFUSED, ENOTFOUND, ETIMEDOUT, CERT_HAS_EXPIRED, ...); the message
+ * says the same in words and never contains the URL.
+ */
+export class NetworkError extends Error {
+  readonly code: string;
+  constructor(code: string, message: string) {
+    super(message);
+    this.name = "NetworkError";
+    this.code = code;
+  }
+}
+
+const NETWORK_WORDS: Record<string, string> = {
+  ECONNREFUSED: "connection refused",
+  ECONNRESET: "connection reset",
+  ENOTFOUND: "host not found",
+  EAI_AGAIN: "DNS lookup failed",
+  EHOSTUNREACH: "host unreachable",
+  ENETUNREACH: "network unreachable",
+  ETIMEDOUT: "timed out",
+  EPIPE: "connection closed while sending",
+  UND_ERR_CONNECT_TIMEOUT: "connection timed out",
+  UND_ERR_HEADERS_TIMEOUT: "no answer before the timeout",
+  UND_ERR_BODY_TIMEOUT: "answer body timed out",
+  UND_ERR_SOCKET: "connection closed",
+};
+
+/** Turn a fetch failure ("fetch failed") into its cause, with a stable code. */
+export function describeNetworkError(e: unknown): NetworkError {
+  if (e instanceof NetworkError) return e;
+  const err = e as { name?: string; code?: unknown; message?: string; cause?: unknown };
+  if (err?.name === "TimeoutError" || err?.name === "AbortError") return new NetworkError("ETIMEDOUT", "timed out");
+  let node: { code?: unknown; message?: string; cause?: unknown; errors?: unknown[] } | undefined = err;
+  for (let depth = 0; node && depth < 5; depth += 1) {
+    const inner = Array.isArray(node.errors) && node.errors.length > 0 ? (node.errors[0] as typeof node) : undefined;
+    const code = typeof node.code === "string" ? node.code : typeof inner?.code === "string" ? inner.code : undefined;
+    if (code) {
+      const tls = /^(?:CERT_|DEPTH_ZERO_|SELF_SIGNED_|UNABLE_TO_|ERR_TLS_|ERR_SSL_)/.test(code);
+      const words = NETWORK_WORDS[code] ?? (tls ? "TLS certificate error" : "network error");
+      return new NetworkError(code, `${words} (${code})`);
+    }
+    node = node.cause as typeof node;
+  }
+  return new NetworkError("EUNKNOWN", "network error");
 }
 
 const DEFAULT_TIMEOUT_MS = 10_000;
@@ -127,7 +179,7 @@ export class HttpClient {
       headers,
       redirect: "manual",
       dispatcher: this.dispatcher,
-      signal: AbortSignal.timeout(this.timeoutMs),
+      signal: AbortSignal.timeout(req.timeoutMs ?? this.timeoutMs),
     };
     if (typeof req.body === "string") init.body = req.body;
     else if (req.body !== undefined) {
@@ -142,10 +194,16 @@ export class HttpClient {
       // fetch wraps connect errors as "fetch failed"; surface the policy refusal.
       const cause = (e as { cause?: unknown }).cause;
       if (cause instanceof BlockedAddressError) throw cause;
-      throw e;
+      throw describeNetworkError(e);
     }
 
-    const { body, truncated } = await this.readCapped(res.body);
+    let read: { body: string; truncated: boolean };
+    try {
+      read = await this.readCapped(res.body, req.maxBodyBytes ?? this.maxBodyBytes);
+    } catch (e) {
+      throw describeNetworkError(e);
+    }
+    const { body, truncated } = read;
     const outHeaders: Record<string, string> = {};
     res.headers.forEach((value, key) => {
       outHeaders[key] = value;
@@ -166,6 +224,7 @@ export class HttpClient {
 
   private async readCapped(
     stream: ReadableStream<Uint8Array> | null,
+    max: number,
   ): Promise<{ body: string; truncated: boolean }> {
     if (!stream) return { body: "", truncated: false };
     const reader = stream.getReader();
@@ -175,8 +234,8 @@ export class HttpClient {
     for (;;) {
       const { done, value } = await reader.read();
       if (done) break;
-      if (size + value.byteLength > this.maxBodyBytes) {
-        chunks.push(value.subarray(0, this.maxBodyBytes - size));
+      if (size + value.byteLength > max) {
+        chunks.push(value.subarray(0, max - size));
         truncated = true;
         await reader.cancel();
         break;

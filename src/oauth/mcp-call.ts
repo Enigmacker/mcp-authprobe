@@ -39,10 +39,16 @@ export interface McpPostOptions {
   secretInQuery?: string;
   /** Raw body instead of one JSON-RPC message (MAP-BAT01, MAP-BOD01). */
   body?: string | AsyncIterable<Uint8Array>;
+  /** Response body cap for this request (list methods need more than the default 1 MiB). */
+  maxBodyBytes?: number;
+  /** Timeout for this request (large uploads). */
+  timeoutMs?: number;
 }
 
 export interface McpPostResult {
   status: number;
+  /** The answer was cut at the body cap: it cannot be parsed reliably. */
+  truncated?: boolean;
   sessionId: string | null;
   headers: Record<string, string>;
   body: string;
@@ -79,11 +85,11 @@ export async function mcpPost(http: HttpClient, mcpUrl: string, o: McpPostOption
   const body = o.body ?? JSON.stringify({ jsonrpc: "2.0", id: 1, method, ...(method === "initialize" ? { params: initializeParams() } : {}) });
   let res;
   try {
-    res = await http.request({ url, method: "POST", headers, body });
+    res = await http.request({ url, method: "POST", headers, body, ...(o.maxBodyBytes !== undefined ? { maxBodyBytes: o.maxBodyBytes } : {}), ...(o.timeoutMs !== undefined ? { timeoutMs: o.timeoutMs } : {}) });
   } catch (e) {
     throw new Error(o.secretInQuery ? "request failed" : (e as Error).message);
   }
-  return { status: res.status, sessionId: res.headers["mcp-session-id"] ?? null, headers: res.headers, body: res.body };
+  return { status: res.status, sessionId: res.headers["mcp-session-id"] ?? null, headers: res.headers, body: res.body, truncated: res.truncated };
 }
 
 /** Send one MCP initialize request and return the HTTP status. */
@@ -99,6 +105,35 @@ export async function endSession(http: HttpClient, mcpUrl: string, auth: Credent
   } catch {
     /* best effort */
   }
+}
+
+/** A JSON-RPC 2.0 error response: `jsonrpc` is "2.0" and `error.code` is a number. Any other object with an `error` key is not one. */
+export function isJsonRpcError(m: unknown): m is { jsonrpc: "2.0"; id?: unknown; error: { code: number; message?: string; data?: unknown } } {
+  if (typeof m !== "object" || m === null) return false;
+  const o = m as { jsonrpc?: unknown; error?: unknown };
+  return o.jsonrpc === "2.0" && typeof o.error === "object" && o.error !== null && typeof (o.error as { code?: unknown }).code === "number";
+}
+
+/** A JSON-RPC 2.0 success response. */
+export function isJsonRpcResult(m: unknown): m is { jsonrpc: "2.0"; id?: unknown; result: unknown } {
+  if (typeof m !== "object" || m === null) return false;
+  const o = m as { jsonrpc?: unknown };
+  return o.jsonrpc === "2.0" && "result" in o && !("error" in o);
+}
+
+export type AnswerClass = "accepted" | "refused" | "rate_limited" | "server_error" | "other";
+
+/**
+ * One classification of HTTP answers for every check: a rate limit (429, or a
+ * Retry-After on an error) and a server error (5xx) say nothing about the
+ * property under test, so they never count as a refusal.
+ */
+export function classifyAnswer(status: number, headers: Record<string, string> = {}): AnswerClass {
+  if (status >= 200 && status < 300) return "accepted";
+  if (status === 429 || (status >= 400 && headers["retry-after"] !== undefined)) return "rate_limited";
+  if (status >= 500) return "server_error";
+  if (status >= 400) return "refused";
+  return "other";
 }
 
 /**

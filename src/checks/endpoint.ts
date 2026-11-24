@@ -1,5 +1,5 @@
 import type { HttpClient } from "../net/http.js";
-import { endSession, FOREIGN_ORIGIN, jsonRpcMessages, mcpPost, type Credential } from "../oauth/mcp-call.js";
+import { classifyAnswer, endSession, FOREIGN_ORIGIN, isJsonRpcError, isJsonRpcResult, jsonRpcMessages, mcpPost, type Credential } from "../oauth/mcp-call.js";
 import { safeText } from "../redact.js";
 import type { CheckStatus, Finding } from "../types.js";
 import { CATALOGUE } from "./catalogue.js";
@@ -35,6 +35,8 @@ export interface EndpointResult {
 /** Size of the oversized bodies sent by MAP-BOD01 (above common 1-4 MB limits). */
 export const OVERSIZED_BODY_BYTES = 6 * 1024 * 1024;
 const BATCH_SIZE = 5;
+/** Large uploads get their own, longer timeout: 6 MiB on a slow link needs more than the default 10 s. */
+const UPLOAD_TIMEOUT_MS = 60_000;
 /** Names under which MAP-TOK01 tries the secret in the query string. */
 export const QUERY_NAMES = ["access_token", "api_key", "key", "token"] as const;
 const ORIGIN_VARIANTS = [
@@ -119,13 +121,19 @@ export async function runEndpointChecks(http: HttpClient, target: string, cred: 
     const accepted: string[] = [];
     const not403: string[] = [];
     let unexpected = false;
+    let limited = false;
     for (const v of ORIGIN_VARIANTS) {
       const r = await mcpPost(http, target, { auth: cred, origin: v.value });
       if (r.sessionId) await endSession(http, target, cred, r.sessionId);
       lines.push(`initialize with ${v.label}: HTTP ${r.status}`);
-      if (is2xx(r.status)) accepted.push(v.label);
-      else if (r.status !== 403 && r.status >= 400 && r.status < 500) not403.push(v.label);
-      else if (r.status !== 403) unexpected = true;
+      const cls = classifyAnswer(r.status, r.headers);
+      if (cls === "accepted") accepted.push(v.label);
+      else if (r.status === 403) continue;
+      else if (cls === "refused") not403.push(v.label);
+      else {
+        unexpected = true;
+        if (cls === "rate_limited") limited = true;
+      }
     }
     // The credential must still work, or a refusal could come from a dead credential.
     const again = await mcpPost(http, target, { auth: cred });
@@ -136,7 +144,7 @@ export async function runEndpointChecks(http: HttpClient, target: string, cred: 
     } else if (!is2xx(again.status)) {
       findings.push(result("MAP-ORG01", target, "error", `Inconclusive: the ${what} stopped working during the check.`, lines));
     } else if (unexpected) {
-      findings.push(result("MAP-ORG01", target, "error", "Unexpected answers to requests with an invalid Origin; inconclusive.", lines));
+      findings.push(result("MAP-ORG01", target, "error", limited ? `Inconclusive: the endpoint rate-limited the ${what} during the check (429 or Retry-After), which says nothing about Origin validation.` : "Unexpected answers to requests with an invalid Origin; inconclusive.", lines));
     } else if (not403.length > 0) {
       findings.push(result("MAP-ORG01", target, "pass", `Requests with an invalid Origin are refused; the MCP specification expects 403 (got another 4xx for ${not403.join(", ")}).`, lines));
     } else {
@@ -157,8 +165,9 @@ export async function runEndpointChecks(http: HttpClient, target: string, cred: 
       const q = await mcpPost(http, target, { auth: cred, secretInQuery: name });
       if (q.sessionId) await endSession(http, target, cred, q.sessionId);
       lines.push(`initialize with the ${what} as ?${name}= and no header: HTTP ${q.status}`);
-      if (is2xx(q.status)) accepted.push(name);
-      else if (q.status < 400 || q.status >= 500) unexpected = true;
+      const cls = classifyAnswer(q.status, q.headers);
+      if (cls === "accepted") accepted.push(name);
+      else if (cls !== "refused") unexpected = true;
     }
     const again = await mcpPost(http, target, { auth: cred });
     if (again.sessionId) await endSession(http, target, cred, again.sessionId);
@@ -222,8 +231,10 @@ export async function runEndpointChecks(http: HttpClient, target: string, cred: 
       const batch = JSON.stringify(Array.from({ length: BATCH_SIZE }, (_, i) => ({ jsonrpc: "2.0", id: i + 1, method: "ping" })));
       const r = await mcpPost(http, target, { auth: cred, ...(session ? { sessionId: session } : {}), body: batch });
       const messages = jsonRpcMessages(r);
-      const results = messages.filter((m) => typeof m === "object" && m !== null && "result" in m).length;
-      const errors = messages.filter((m) => typeof m === "object" && m !== null && "error" in m).length;
+      // Only real JSON-RPC 2.0 messages count: any JSON object with an "error" key is not a JSON-RPC refusal.
+      const results = messages.filter(isJsonRpcResult).length;
+      const errors = messages.filter(isJsonRpcError).length;
+      const cls = classifyAnswer(r.status, r.headers);
       const lines = [`control, one ping request: HTTP ${single.status}`, `one POST carrying a JSON-RPC batch of ${BATCH_SIZE} ping requests: HTTP ${r.status}, ${results} result(s), ${errors} error(s)`];
       if (results >= 2) {
         findings.push(
@@ -235,8 +246,19 @@ export async function runEndpointChecks(http: HttpClient, target: string, cred: 
             lines,
           ),
         );
-      } else if ((r.status >= 400 && r.status < 500) || (results === 0 && errors >= 1)) {
-        findings.push(result("MAP-BAT01", target, "pass", "A JSON-RPC batch is refused: one HTTP request carries one message, as MCP requires.", lines));
+      } else if (cls === "rate_limited" || cls === "server_error") {
+        findings.push(
+          result("MAP-BAT01", target, "error", cls === "rate_limited" ? "Inconclusive: the batch was answered with a rate limit (429 or Retry-After), which says nothing about batches. Scan again once the limit has passed." : "Inconclusive: the batch was answered with a server error (5xx), which is not a refusal of batches.", lines),
+        );
+      } else if (cls === "refused" || (cls === "accepted" && results === 0 && errors >= 1)) {
+        // The same single ping must still work: otherwise the refusal may be about something else (a limit, a dead credential).
+        const again = await mcpPost(http, target, { auth: cred, ...(session ? { sessionId: session } : {}), method: "ping" });
+        lines.push(`control again, one ping request: HTTP ${again.status}`);
+        if (!is2xx(again.status)) {
+          findings.push(result("MAP-BAT01", target, "error", `Inconclusive: a single ping stopped working after the batch (HTTP ${again.status}), so the refusal cannot be attributed to the batch.`, lines));
+        } else {
+          findings.push(result("MAP-BAT01", target, "pass", "A JSON-RPC batch is refused: one HTTP request carries one message, as MCP requires.", lines));
+        }
       } else {
         findings.push(result("MAP-BAT01", target, "error", "Unexpected answer to a JSON-RPC batch; inconclusive.", lines));
       }
@@ -250,7 +272,8 @@ export async function runEndpointChecks(http: HttpClient, target: string, cred: 
     const session = await openSession();
     const mib = OVERSIZED_BODY_BYTES / 1024 / 1024;
     const lines: string[] = [];
-    const verdicts: Array<"accepted" | "refused" | "unclear"> = [];
+    const verdicts: Array<"accepted" | "refused" | "limited" | "unclear"> = [];
+    let controlAgain: number | null = null;
     try {
       // Control: the same request at 1 KiB must work, so a refusal is about the size.
       const small = await mcpPost(http, target, { auth: cred, ...(session ? { sessionId: session } : {}), body: paddedPing(1024) });
@@ -265,13 +288,22 @@ export async function runEndpointChecks(http: HttpClient, target: string, cred: 
         { label: `${mib} MiB body, chunked (no Content-Length)`, body: chunked(text) },
       ]) {
         try {
-          const r = await mcpPost(http, target, { auth: cred, ...(session ? { sessionId: session } : {}), body: variant.body });
+          const r = await mcpPost(http, target, { auth: cred, ...(session ? { sessionId: session } : {}), body: variant.body, timeoutMs: UPLOAD_TIMEOUT_MS });
           lines.push(`${variant.label}: HTTP ${r.status}`);
-          // The 1 KiB control worked, so a 4xx here is about the size (413 is the expected one).
-          verdicts.push(is2xx(r.status) ? "accepted" : r.status >= 400 && r.status < 500 ? "refused" : "unclear");
+          // A 4xx is about the size (413 is the expected one) only if it is not a rate limit, and if the control still works afterwards.
+          const cls = classifyAnswer(r.status, r.headers);
+          verdicts.push(cls === "accepted" ? "accepted" : cls === "refused" ? "refused" : cls === "rate_limited" ? "limited" : "unclear");
         } catch (e) {
           lines.push(`${variant.label}: connection closed before an answer (${(e as Error).message})`);
           verdicts.push("unclear");
+        }
+      }
+      if (!verdicts.includes("accepted") && verdicts.every((v) => v === "refused")) {
+        try {
+          controlAgain = (await mcpPost(http, target, { auth: cred, ...(session ? { sessionId: session } : {}), body: paddedPing(1024) })).status;
+          lines.push(`control again, the ping padded to 1 KiB: HTTP ${controlAgain}`);
+        } catch (e) {
+          lines.push(`control again, the ping padded to 1 KiB: request failed (${(e as Error).message})`);
         }
       }
     } finally {
@@ -279,8 +311,14 @@ export async function runEndpointChecks(http: HttpClient, target: string, cred: 
     }
     if (verdicts.includes("accepted")) {
       findings.push(result("MAP-BOD01", target, "fail", `The endpoint accepts a ${mib} MiB request: without a body size limit, a few requests can exhaust memory.`, lines));
+    } else if (verdicts.includes("limited")) {
+      findings.push(result("MAP-BOD01", target, "error", "Inconclusive: a large request was answered with a rate limit (429 or Retry-After), which says nothing about the body size limit. Scan again once the limit has passed.", lines));
     } else if (verdicts.every((v) => v === "refused")) {
-      findings.push(result("MAP-BOD01", target, "pass", `${mib} MiB requests are refused, with and without Content-Length.`, lines));
+      if (!is2xx(controlAgain)) {
+        findings.push(result("MAP-BOD01", target, "error", "Inconclusive: the 1 KiB control stopped working after the large requests, so their refusal cannot be attributed to the size.", lines));
+      } else {
+        findings.push(result("MAP-BOD01", target, "pass", `${mib} MiB requests are refused, with and without Content-Length.`, lines));
+      }
     } else {
       findings.push(result("MAP-BOD01", target, "error", "Inconclusive: the server closed the connection or answered unexpectedly; many servers do this when a limit is hit, but it cannot be told apart from a network error.", lines));
     }
@@ -353,6 +391,10 @@ export async function runMetadataCheck(http: HttpClient, target: string, cred?: 
   if (isPoisoned(r.issues)) {
     const n = new Set(r.issues.filter((i) => i.kind !== "name").map((i) => i.item)).size;
     return result("MAP-INJ01", target, "fail", `Metadata the client's model reads contains hidden characters or instruction-like text (${n} place(s)): review it as a possible prompt injection.`, lines);
+  }
+  if (r.incomplete.length > 0) {
+    // What was read is clean, but not everything was read: never a pass.
+    return result("MAP-INJ01", target, "error", `Inconclusive: the metadata could not be read in full (${r.incomplete.slice(0, 3).join("; ")}${r.incomplete.length > 3 ? "; …" : ""}), so hidden instructions cannot be ruled out.`, lines);
   }
   const names = r.issues.filter((i) => i.kind === "name").length;
   return result("MAP-INJ01", target, "pass", `No hidden characters or instruction-like text in the metadata${names ? ` (${names} tool name(s) outside the recommended format)` : ""}.`, lines);

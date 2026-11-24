@@ -29,11 +29,17 @@ export interface MetadataResult {
   counts: Record<"tools" | "prompts" | "resources" | "templates", number>;
   issues: MetadataIssue[];
   notes: string[];
+  /** Why a list the server announces was not read in full (truncated answer, error, cap reached). Empty when everything was read. */
+  incomplete: string[];
 }
 
 const MAX_PAGES = 10;
 const MAX_ITEMS = 1000;
-const MAX_STRINGS_PER_ITEM = 200;
+const MAX_STRINGS_PER_ITEM = 2000;
+/** List answers may be large: read up to 8 MiB instead of the default 1 MiB, and say so when even that is not enough. */
+const LIST_BODY_BYTES = 8 * 1024 * 1024;
+/** Fields the model always reads: inspected first, whatever else the item holds. */
+const FIRST_FIELDS = ["name", "title", "description"] as const;
 
 /**
  * Characters a reader never sees: C0/C1 controls (tab, CR and LF allowed),
@@ -109,12 +115,15 @@ export function inspectText(where: string, s: string, item = where): MetadataIss
   return issues;
 }
 
-/** Every string inside a JSON value, with a path, capped. */
-function strings(v: unknown, path: string, out: Array<[string, string]>, depth = 0): void {
-  if (out.length >= MAX_STRINGS_PER_ITEM || depth > 12) return;
+/** Every string inside a JSON value, with a path, capped. `capped.hit` is set when something was left out. */
+function strings(v: unknown, path: string, out: Array<[string, string]>, depth = 0, capped: { hit: boolean } = { hit: false }): void {
+  if (out.length >= MAX_STRINGS_PER_ITEM || depth > 12) {
+    if (typeof v === "string" || (v !== null && typeof v === "object")) capped.hit = true;
+    return;
+  }
   if (typeof v === "string") out.push([path, v]);
-  else if (Array.isArray(v)) v.forEach((x, i) => strings(x, `${path}[${i}]`, out, depth + 1));
-  else if (v && typeof v === "object") for (const [k, x] of Object.entries(v)) strings(x, path ? `${path}.${k}` : k, out, depth + 1);
+  else if (Array.isArray(v)) v.forEach((x, i) => strings(x, `${path}[${i}]`, out, depth + 1, capped));
+  else if (v && typeof v === "object") for (const [k, x] of Object.entries(v)) strings(x, path ? `${path}.${k}` : k, out, depth + 1, capped);
 }
 
 function label(kind: string, item: Record<string, unknown>, index: number): string {
@@ -139,7 +148,7 @@ function resultOf(messages: unknown[], id: number): { result?: Record<string, un
 }
 
 export async function inspectMetadata(http: HttpClient, target: string, cred?: Credential): Promise<MetadataResult> {
-  const out: MetadataResult = { initializeStatus: null, counts: { tools: 0, prompts: 0, resources: 0, templates: 0 }, issues: [], notes: [] };
+  const out: MetadataResult = { initializeStatus: null, counts: { tools: 0, prompts: 0, resources: 0, templates: 0 }, issues: [], notes: [], incomplete: [] };
   const auth = cred ? { auth: cred } : {};
   const init = await mcpPost(http, target, {
     ...auth,
@@ -171,15 +180,28 @@ export async function inspectMetadata(http: HttpClient, target: string, cred?: C
       let pages = 0;
       do {
         id += 1;
-        const r = await mcpPost(http, target, { ...withSession, body: JSON.stringify({ jsonrpc: "2.0", id, method: list.method, ...(cursor ? { params: { cursor } } : {}) }) });
+        const r = await mcpPost(http, target, { ...withSession, maxBodyBytes: LIST_BODY_BYTES, body: JSON.stringify({ jsonrpc: "2.0", id, method: list.method, ...(cursor ? { params: { cursor } } : {}) }) });
+        if (r.truncated) {
+          out.incomplete.push(`${list.method}: the answer is larger than ${LIST_BODY_BYTES / 1024 / 1024} MiB and was not read`);
+          cursor = undefined;
+          break;
+        }
         const msg = resultOf(jsonRpcMessages(r), id);
         if (!msg?.result) {
-          out.notes.push(`${list.method}: ${msg?.error ? `JSON-RPC error ${msg.error.code ?? "?"}` : `HTTP ${r.status}, no result`}`);
+          const why = msg?.error ? `JSON-RPC error ${msg.error.code ?? "?"}` : `HTTP ${r.status}, no result`;
+          out.notes.push(`${list.method}: ${why}`);
+          // A server with resources but no templates answers "method not found": nothing to read there.
+          const absent = list.method === "resources/templates/list" && msg?.error?.code === -32601;
+          if (!absent) out.incomplete.push(`${list.method}: ${why}`);
+          cursor = undefined;
           break;
         }
         const items = Array.isArray(msg.result[list.key]) ? (msg.result[list.key] as unknown[]) : [];
         for (const raw of items) {
-          if (out.counts[list.count] >= MAX_ITEMS) break;
+          if (out.counts[list.count] >= MAX_ITEMS) {
+            out.incomplete.push(`${list.method}: more than ${MAX_ITEMS} items, the rest was not read`);
+            break;
+          }
           if (!raw || typeof raw !== "object") continue;
           const item = raw as Record<string, unknown>;
           const where = label(list.kind, item, out.counts[list.count]);
@@ -187,14 +209,19 @@ export async function inspectMetadata(http: HttpClient, target: string, cred?: C
           if (list.kind === "tool" && typeof item["name"] === "string" && !TOOL_NAME_RE.test(item["name"])) {
             out.issues.push({ kind: "name", where, item: where, detail: /[^\x20-\x7e]/.test(item["name"]) ? "name has non-ASCII characters (can imitate another tool)" : "name outside A-Z a-z 0-9 _ - . (1-128)" });
           }
+          // What the model always reads comes first, so a large schema can never push it past the cap.
           const all: Array<[string, string]> = [];
-          strings(item, "", all);
+          for (const k of FIRST_FIELDS) if (typeof item[k] === "string") all.push([k, item[k] as string]);
+          const rest = Object.fromEntries(Object.entries(item).filter(([k, v]) => !(FIRST_FIELDS as readonly string[]).includes(k) || typeof v !== "string"));
+          const capped = { hit: false };
+          strings(rest, "", all, 0, capped);
           for (const [path, s] of all) out.issues.push(...inspectText(`${where} ${path}`, s, where));
+          if (capped.hit) out.incomplete.push(`${where}: more than ${MAX_STRINGS_PER_ITEM} strings or 12 levels, the rest was not read`);
         }
         cursor = typeof msg.result["nextCursor"] === "string" ? msg.result["nextCursor"] : undefined;
         pages += 1;
       } while (cursor && pages < MAX_PAGES && out.counts[list.count] < MAX_ITEMS);
-      if (cursor) out.notes.push(`${list.method}: stopped after ${pages} pages / ${out.counts[list.count]} items.`);
+      if (cursor) out.incomplete.push(`${list.method}: stopped after ${pages} pages / ${out.counts[list.count]} items, more were announced`);
     }
   } finally {
     if (session && cred) await endSession(http, target, cred, session);

@@ -54,9 +54,9 @@ function result(status: Finding["status"], target: string, message: string, evid
 
 const THROTTLE_ERRORS = new Set(["slow_down", "temporarily_unavailable"]);
 
-/** Only an explicit rate limit counts: a 5xx with Retry-After is an outage, not throttling. */
+/** Only an explicit rate limit counts (429, a Retry-After on a 4xx, slow_down): a 5xx with Retry-After is an outage, not throttling. */
 function isThrottled(o: RefreshOutcome): boolean {
-  return o.status === 429 || (o.error !== null && THROTTLE_ERRORS.has(o.error));
+  return o.status === 429 || (o.throttled && o.status >= 400 && o.status < 500) || (o.error !== null && THROTTLE_ERRORS.has(o.error));
 }
 
 export async function runThrottlingCheck(ctx: ThrottleCheckContext): Promise<Finding> {
@@ -112,7 +112,9 @@ export async function runThrottlingCheck(ctx: ThrottleCheckContext): Promise<Fin
         return result("error", target, "The token endpoint answered with a server error; the outcome is inconclusive.", [`attempt ${i}: ${tally}`]);
       }
       if (isThrottled(outcome)) {
-        return result("pass", target, `Throttling started after ${i} failed request(s).`, [
+        // Limited from the very first request: the limit was already active (an earlier scan, or a block of this address), not triggered by this check.
+        const already = i === 1 ? " The endpoint was already limiting before this check sent anything: a limit exists, but its threshold was not observed (an earlier scan may have triggered it, or this address is blocked)." : "";
+        return result("pass", target, `Throttling started after ${i} failed request(s).${already}`, [
           `${tally}${outcome.error ? `, last error=${outcome.error}` : ""}`,
         ]);
       }
