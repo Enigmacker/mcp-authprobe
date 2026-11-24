@@ -1,6 +1,6 @@
 import type { TestGrant } from "../credentials.js";
 import type { HttpClient } from "../net/http.js";
-import { initializeStatus } from "../oauth/mcp-call.js";
+import { initializeStatus, type Era } from "../oauth/mcp-call.js";
 import { SAFE_DOMAIN } from "../oauth/registration.js";
 import { describe as describeOutcome, refresh } from "../oauth/token-client.js";
 import type { Finding } from "../types.js";
@@ -24,6 +24,8 @@ export interface AudienceCheckContext {
   control: number | null;
   /** Identifiers this server may legitimately appear under in a token audience: its URL and the `resource` it announces. */
   ownAudiences?: string[];
+  /** MCP era the server speaks (default legacy). */
+  era?: Era;
 }
 
 /** An unrelated resource under the reserved .invalid domain: no token for it can be used anywhere. */
@@ -64,7 +66,7 @@ export async function runAudienceCheck(c: AudienceCheckContext): Promise<Finding
       ? makeFinding("MAP-AUD01", target, "pass", "The authorization server refused to issue a token for an unrelated resource (invalid_target).", lines)
       : makeFinding("MAP-AUD01", target, "error", "The request for a token for an unrelated resource was refused, but not with invalid_target; inconclusive.", lines, o.throttled ? "rate_limited" : o.status >= 500 ? "server_error" : "ambiguous");
   }
-  const st = await initializeStatus(http, target, { token: o.accessToken ?? "" });
+  const st = await initializeStatus(http, target, { token: o.accessToken ?? "", ...(c.era ? { era: c.era } : {}) });
   lines.push(`that token presented to this MCP server: HTTP ${st}`);
   const aud = o.accessToken ? jwtAudience(o.accessToken) : null;
   if (aud) lines.push(`audience of that token (JWT, unverified): ${aud.join(", ")}`);

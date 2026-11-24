@@ -8,12 +8,12 @@
     "source": "github"
   },
   "websiteUrl": "https://github.com/Enigmacker/mcp-authprobe#readme",
-  "version": "0.11.0",
+  "version": "0.12.0",
   "packages": [
     {
       "registryType": "npm",
       "identifier": "mcp-authprobe",
-      "version": "0.11.0",
+      "version": "0.12.0",
       "transport": {
         "type": "stdio"
       },
@@ -38,7 +38,7 @@
         },
         {
           "name": "MCP_AUTHPROBE_CREDENTIALS_FILE",
-          "description": "Path to a test grant written by `mcp-authprobe login`, for the refresh token checks. It is consumed by a scan.",
+          "description": "Path to a test grant written by `mcp-authprobe login`, for the refresh token checks. The full sequence consumes it; a grant that stays valid is rewritten with the newest refresh token.",
           "format": "filepath",
           "isRequired": false
         },
@@ -66,12 +66,39 @@
         },
         {
           "name": "MCP_AUTHPROBE_BEARER_TARGET",
-          "description": "The exact MCP URL the static key may be used for.",
+          "description": "The exact MCP URL the static key or access token may be used for.",
           "isRequired": false
         },
         {
           "name": "MCP_AUTHPROBE_BEARER_HEADER",
           "description": "Header for the static key (default Authorization, sent as Bearer).",
+          "isRequired": false
+        },
+        {
+          "name": "MCP_AUTHPROBE_ACCESS_TOKEN_FILE",
+          "description": "Path to an OAuth access token (one line, mode 600) instead of a static key. Needs MCP_AUTHPROBE_BEARER_TARGET.",
+          "format": "filepath",
+          "isRequired": false
+        },
+        {
+          "name": "MCP_AUTHPROBE_CLIENT_ID",
+          "description": "A pre-registered OAuth client (or client ID metadata document URL) for servers without dynamic client registration.",
+          "isRequired": false
+        },
+        {
+          "name": "MCP_AUTHPROBE_CLIENT_SECRET_FILE",
+          "description": "Path to that client's secret, for a confidential client.",
+          "format": "filepath",
+          "isRequired": false
+        },
+        {
+          "name": "MCP_AUTHPROBE_REDIRECT_URI",
+          "description": "One of that client's registered redirect URIs, for the redirect URI checks.",
+          "isRequired": false
+        },
+        {
+          "name": "MCP_AUTHPROBE_PROTOCOL",
+          "description": "legacy (MCP 2025-11-25) or modern (2026-07-28), instead of detecting the revision.",
           "isRequired": false
         }
       ]

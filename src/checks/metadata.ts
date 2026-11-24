@@ -1,6 +1,5 @@
 import type { HttpClient } from "../net/http.js";
-import { endSession, jsonRpcMessages, mcpPost, PROTOCOL_VERSION, type Credential } from "../oauth/mcp-call.js";
-import { TOOL_NAME, TOOL_VERSION } from "../version.js";
+import { endSession, jsonRpcMessages, mcpPost, type Credential, type Era, type McpMethod } from "../oauth/mcp-call.js";
 
 /**
  * MAP-INJ01: what the server tells the model about itself. Tool, prompt and
@@ -147,31 +146,31 @@ function resultOf(messages: unknown[], id: number): { result?: Record<string, un
   return undefined;
 }
 
-export async function inspectMetadata(http: HttpClient, target: string, cred?: Credential): Promise<MetadataResult> {
+export async function inspectMetadata(http: HttpClient, target: string, cred?: Credential, era: Era = "legacy"): Promise<MetadataResult> {
   const out: MetadataResult = { initializeStatus: null, counts: { tools: 0, prompts: 0, resources: 0, templates: 0 }, issues: [], notes: [], incomplete: [] };
-  const auth = cred ? { auth: cred } : {};
-  const init = await mcpPost(http, target, {
-    ...auth,
-    body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: PROTOCOL_VERSION, capabilities: {}, clientInfo: { name: TOOL_NAME, version: TOOL_VERSION } } }),
-  });
+  const auth = cred ? { auth: cred, era } : { era };
+  // Legacy: the handshake. Modern: server/discover, which carries the same capabilities and instructions.
+  const init = await mcpPost(http, target, { ...auth });
   out.initializeStatus = init.status;
   if (init.status < 200 || init.status >= 300) return out;
   const session = init.sessionId;
+  const opening = era === "modern" ? "server/discover" : "initialize";
   try {
     const initResult = resultOf(jsonRpcMessages(init), 1)?.result;
     if (!initResult) {
-      out.notes.push("The initialize answer carries no JSON-RPC result.");
+      out.notes.push(`The ${opening} answer carries no JSON-RPC result.`);
       out.initializeStatus = null;
       return out;
     }
     const capabilities = (initResult["capabilities"] ?? {}) as Record<string, unknown>;
     const fromInit: Array<[string, string]> = [];
     strings(initResult["serverInfo"], "serverInfo", fromInit);
+    strings((initResult["_meta"] as Record<string, unknown> | undefined)?.["io.modelcontextprotocol/serverInfo"], "serverInfo", fromInit);
     if (typeof initResult["instructions"] === "string") fromInit.push(["instructions", initResult["instructions"]]);
-    for (const [path, s] of fromInit) out.issues.push(...inspectText(`initialize ${path}`, s, "initialize"));
+    for (const [path, s] of fromInit) out.issues.push(...inspectText(`${opening} ${path}`, s, opening));
 
     const withSession = { ...auth, ...(session ? { sessionId: session } : {}) };
-    await mcpPost(http, target, { ...withSession, body: JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized" }) });
+    if (era === "legacy") await mcpPost(http, target, { ...withSession, body: JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized" }) });
 
     let id = 1;
     for (const list of LISTS) {
@@ -180,7 +179,7 @@ export async function inspectMetadata(http: HttpClient, target: string, cred?: C
       let pages = 0;
       do {
         id += 1;
-        const r = await mcpPost(http, target, { ...withSession, maxBodyBytes: LIST_BODY_BYTES, body: JSON.stringify({ jsonrpc: "2.0", id, method: list.method, ...(cursor ? { params: { cursor } } : {}) }) });
+        const r = await mcpPost(http, target, { ...withSession, maxBodyBytes: LIST_BODY_BYTES, method: list.method as McpMethod, id, ...(cursor ? { params: { cursor } } : {}) });
         if (r.truncated) {
           out.incomplete.push(`${list.method}: the answer is larger than ${LIST_BODY_BYTES / 1024 / 1024} MiB and was not read`);
           cursor = undefined;

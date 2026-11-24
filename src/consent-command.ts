@@ -31,6 +31,8 @@ export interface ConsentCommandOptions {
   markdown?: string;
   /** Per-request timeout in milliseconds (--timeout). */
   requestTimeoutMs?: number;
+  /** A supplied client and its loopback redirect URI, instead of dynamic registration. */
+  client?: { clientId: string; redirectUri?: string };
 }
 
 const err = (t: string): void => {
@@ -82,8 +84,24 @@ export async function runConsentCommand(o: ConsentCommandOptions): Promise<numbe
       return 3;
     }
     registrationEndpoint = typeof meta.registration_endpoint === "string" ? meta.registration_endpoint : null;
-    if (!registrationEndpoint) {
-      err("The consent check needs dynamic client registration to create a test client.");
+    let fixedPort = 0;
+    let fixedPath = "/callback";
+    if (o.client) {
+      // A supplied client: its redirect URI must be a loopback one this command can own.
+      let u: URL | null = null;
+      try {
+        u = o.client.redirectUri ? new URL(o.client.redirectUri) : null;
+      } catch {
+        u = null;
+      }
+      if (!u || u.protocol !== "http:" || !["127.0.0.1", "localhost"].includes(u.hostname) || !u.port) {
+        err("With --client-id, the consent check needs --redirect-uri with a loopback redirect URI registered for that client (http://127.0.0.1:<port>/<path>): the tool listens on it, so a code granted by mistake goes nowhere else.");
+        return 2;
+      }
+      fixedPort = Number(u.port);
+      fixedPath = u.pathname;
+    } else if (!registrationEndpoint) {
+      err("This authorization server offers no dynamic client registration: pass a pre-registered client with --client-id and its loopback redirect URI with --redirect-uri.");
       return 3;
     }
 
@@ -115,15 +133,24 @@ export async function runConsentCommand(o: ConsentCommandOptions): Promise<numbe
             res.writeHead(200, { "content-type": "text/plain; charset=utf-8", "cache-control": "no-store" });
             res.end("mcp-authprobe: received and discarded. The consent check needs the consent page itself; you can close this tab.");
           });
-          await new Promise<void>((resolve) => (sink as Server).listen(0, "127.0.0.1", resolve));
-          const redirectUri = `http://127.0.0.1:${((sink as Server).address() as AddressInfo).port}/callback`;
-          const reg = await registerClient(http, registrationEndpoint as string, [redirectUri], { clientName: "mcp-authprobe consent check (safe to delete)" });
-          if (!reg.client) throw new Error(`Dynamic client registration failed (HTTP ${reg.status}).`);
-          client = reg.client;
+          await new Promise<void>((resolve, reject) => {
+            (sink as Server).once("error", () => reject(new Error(`Cannot listen on port ${fixedPort} for the redirect URI.`)));
+            (sink as Server).listen(fixedPort, "127.0.0.1", resolve);
+          });
+          const redirectUri = o.client?.redirectUri ?? `http://127.0.0.1:${((sink as Server).address() as AddressInfo).port}${fixedPath}`;
+          let clientId: string;
+          if (o.client) {
+            clientId = o.client.clientId;
+          } else {
+            const reg = await registerClient(http, registrationEndpoint as string, [redirectUri], { clientName: "mcp-authprobe consent check (safe to delete)", applicationType: "native" });
+            if (!reg.client) throw new Error(`Dynamic client registration failed (HTTP ${reg.status}).`);
+            client = reg.client;
+            clientId = reg.client.clientId;
+          }
 
           const auth = new URL(meta.authorization_endpoint as string);
           auth.searchParams.set("response_type", "code");
-          auth.searchParams.set("client_id", client.clientId);
+          auth.searchParams.set("client_id", clientId);
           auth.searchParams.set("redirect_uri", redirectUri);
           auth.searchParams.set("state", randomBytes(16).toString("base64url"));
           auth.searchParams.set("code_challenge", createHash("sha256").update(randomBytes(32).toString("base64url")).digest("base64url"));

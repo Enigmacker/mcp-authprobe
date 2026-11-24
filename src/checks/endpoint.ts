@@ -1,5 +1,5 @@
-import type { HttpClient } from "../net/http.js";
-import { classifyAnswer, endSession, FOREIGN_ORIGIN, isJsonRpcError, isJsonRpcResult, jsonRpcMessages, mcpPost, type Credential } from "../oauth/mcp-call.js";
+import { ScanInterruptedError, type HttpClient } from "../net/http.js";
+import { classifyAnswer, detectEra, endSession, FOREIGN_ORIGIN, helloName, isJsonRpcError, MODERN_ERROR_CODES, isJsonRpcResult, jsonRpcMessages, mcpPost, noopName, paddedNoop, rpcMessage, versionOf, type Credential, type Era, type EraProbe } from "../oauth/mcp-call.js";
 import type { CheckStatus, Finding, ReasonCode } from "../types.js";
 import { makeFinding } from "./finding.js";
 import { inspectMetadata, isPoisoned } from "./metadata.js";
@@ -29,6 +29,12 @@ export interface EndpointOptions {
    * (--wait-on-rate-limit). Default 0: report the limit and stop.
    */
   waitOnRateLimitMs?: number;
+  /**
+   * MCP era to speak. Left out, it is detected with the credential: a modern
+   * request first (server/discover), then the `initialize` handshake of the
+   * earlier revisions. Set it to skip the detection (--protocol).
+   */
+  era?: Era;
 }
 
 export interface EndpointResult {
@@ -37,6 +43,10 @@ export interface EndpointResult {
   control: number | null;
   /** Requests sent with the credential. */
   authenticatedRequests: number;
+  /** The era the checks spoke, or null when none could be determined. */
+  era: Era | null;
+  /** Protocol versions the server announced to the credentialed request, when it did. */
+  supportedVersions?: string[];
   /** Retry-After of a rate-limited control request, in seconds, when the server gave one. */
   retryAfterSeconds?: number;
 }
@@ -104,13 +114,6 @@ export function clampRateAttempts(n: number | undefined): number {
   return Math.min(100, Math.max(10, Math.round(n)));
 }
 
-/** A JSON-RPC ping padded to `size` bytes, still valid JSON. */
-function paddedPing(size: number): string {
-  const head = '{"jsonrpc":"2.0","id":1,"method":"ping","params":{"_meta":{"pad":"';
-  const tail = '"}}}';
-  return head + "x".repeat(Math.max(0, size - head.length - tail.length)) + tail;
-}
-
 async function* chunked(text: string): AsyncIterable<Uint8Array> {
   const buf = Buffer.from(text);
   for (let i = 0; i < buf.length; i += 256 * 1024) yield buf.subarray(i, i + 256 * 1024);
@@ -122,16 +125,17 @@ export async function runEndpointChecks(http: HttpClient, target: string, cred: 
   const what = cred.kind === "static" ? "key" : "token";
   let authenticatedRequests = 0;
   /** Every request to the endpoint goes through here, so requests made with the credential are counted. */
+  let era: Era = options.era ?? "legacy";
   const post = (o: Parameters<typeof mcpPost>[2] = {}): ReturnType<typeof mcpPost> => {
     if (o.auth) authenticatedRequests += 1;
-    return mcpPost(http, target, o);
+    return mcpPost(http, target, { era, ...o });
   };
   const guard = async (checkId: EndpointCheckId, run: () => Promise<void>): Promise<void> => {
     if (!wanted.has(checkId)) return;
     try {
       await run();
     } catch (e) {
-      findings.push(result(checkId, target, "error", `Inconclusive: a request failed (${(e as Error).message}).`, []));
+      findings.push(result(checkId, target, "error", e instanceof ScanInterruptedError ? `Interrupted: ${e.message}.` : `Inconclusive: a request failed (${(e as Error).message}).`, [], e instanceof ScanInterruptedError ? "interrupted" : undefined));
     }
   };
 
@@ -140,13 +144,33 @@ export async function runEndpointChecks(http: HttpClient, target: string, cred: 
   let controlSession: string | null = null;
   let controlHeaders: Record<string, string> = {};
   let controlFailure = "request failed";
+  let probe: EraProbe | null = null;
+  let controlBody: Awaited<ReturnType<typeof mcpPost>> | null = null;
+  let eraKnown = options.era !== undefined;
   const sendControl = async (): Promise<void> => {
     try {
-      const c = await post({ auth: cred });
-      control = c.status;
-      controlSession = c.sessionId;
-      controlHeaders = c.headers;
+      if (eraKnown) {
+        const c = await post({ auth: cred });
+        control = c.status;
+        controlSession = c.sessionId;
+        controlHeaders = c.headers;
+        controlBody = c;
+        return;
+      }
+      // The credential makes the detection reliable: a server that answers 401 to anyone says nothing about its era.
+      probe = await detectEra(http, target, { auth: cred });
+      authenticatedRequests += probe.trace.length;
+      control = probe.response?.status ?? null;
+      controlSession = probe.response?.sessionId ?? null;
+      controlHeaders = probe.response?.headers ?? {};
+      if (probe.dialect.era !== "unknown") {
+        era = probe.dialect.era;
+        eraKnown = true;
+      } else if (!probe.response) {
+        controlFailure = probe.trace.at(-1) ?? "request failed";
+      }
     } catch (e) {
+      if (e instanceof ScanInterruptedError) throw e;
       control = null;
       controlFailure = `request failed (${(e as Error).message})`;
     }
@@ -162,7 +186,30 @@ export async function runEndpointChecks(http: HttpClient, target: string, cred: 
     retryAfter = control === null ? null : retryAfterSeconds(controlHeaders);
   }
   if (controlSession) await endSession(http, target, cred, controlSession);
-  const controlLine = `initialize with the ${what}: ${control === null ? controlFailure : `HTTP ${control}`}${waited ? ` (after waiting ${waited} s for the rate limit)` : ""}`;
+  const detected = probe as EraProbe | null;
+  const hello = helloName(era);
+  const noop = noopName(era);
+  const controlLine = eraKnown
+    ? `${hello} with the ${what} (MCP ${versionOf(era)}): ${control === null ? controlFailure : `HTTP ${control}`}${waited ? ` (after waiting ${waited} s for the rate limit)` : ""}`
+    : `with the ${what}: ${detected?.trace.join("; ") ?? controlFailure}`;
+  if (!eraKnown && detected && (detected.undetermined === "not_mcp" || detected.undetermined === "unsupported_version")) {
+    // The credential may be perfectly valid: it is the protocol that was refused.
+    const message =
+      detected.dialect.transport === "http+sse"
+        ? "Inconclusive: this URL speaks the deprecated HTTP+SSE transport of MCP 2024-11-05, which this tool does not test. Migrate to Streamable HTTP."
+        : detected.undetermined === "unsupported_version"
+          ? `Inconclusive: the server speaks MCP ${detected.dialect.supportedVersions.join(", ") || "revisions it did not name"}, none of which this version of the tool speaks.`
+          : `Inconclusive: the endpoint answered neither a 2026-07-28 request (server/discover) nor a 2025-11-25 one (initialize) as an MCP server would, so this check cannot be judged. This says nothing about the ${what}.`;
+    for (const id of wanted) findings.push(result(id, target, "error", message, [controlLine], "protocol_unsupported"));
+    return { findings, control, authenticatedRequests, era: null };
+  }
+  // An era that was imposed (--protocol) and that the server refuses with a protocol error: not the credential's fault either.
+  const refusedRevision = controlBody ? jsonRpcMessages(controlBody).find((m) => isJsonRpcError(m) && (MODERN_ERROR_CODES.includes(m.error.code) || m.error.code === -32601)) : undefined;
+  if (!is2xx(control) && refusedRevision && isJsonRpcError(refusedRevision)) {
+    const message = `Inconclusive: the server refused the MCP ${versionOf(era)} request itself (JSON-RPC error ${refusedRevision.error.code}), so this check cannot be judged. This says nothing about the ${what}: let the tool detect the revision (--protocol auto).`;
+    for (const id of wanted) findings.push(result(id, target, "error", message, [controlLine], "protocol_unsupported"));
+    return { findings, control, authenticatedRequests, era: null };
+  }
   if (!is2xx(control)) {
     // The cause decides what the operator should do: wait, fix the network, or fix the credential.
     const cls = control === null ? "unreachable" : classifyAnswer(control, controlHeaders);
@@ -175,7 +222,7 @@ export async function runEndpointChecks(http: HttpClient, target: string, cred: 
             ? ["server_error", `Inconclusive: the MCP endpoint answered the control request with a server error (HTTP ${control}), so this check cannot be judged.`]
             : ["credential_rejected", `Inconclusive: the MCP endpoint did not accept the ${what}, so this check cannot be judged.`];
     for (const id of wanted) findings.push(result(id, target, "error", message, [controlLine], reason));
-    return { findings, control, authenticatedRequests, ...(retryAfter !== null && cls === "rate_limited" ? { retryAfterSeconds: retryAfter } : {}) };
+    return { findings, control, authenticatedRequests, era: eraKnown ? era : null, ...(retryAfter !== null && cls === "rate_limited" ? { retryAfterSeconds: retryAfter } : {}) };
   }
 
   // Checks below mean nothing on an endpoint that also serves anonymous requests.
@@ -185,11 +232,11 @@ export async function runEndpointChecks(http: HttpClient, target: string, cred: 
   } catch {
     anonymous = null;
   }
-  const anonymousLine = `initialize without any credential: ${anonymous === null ? "request failed" : `HTTP ${anonymous}`}`;
+  const anonymousLine = `${hello} without any credential: ${anonymous === null ? "request failed" : `HTTP ${anonymous}`}`;
   const servesAnonymous = is2xx(anonymous);
 
   /** Opens a session if the server uses them; returns its ID (or null). */
-  const openSession = async (): Promise<string | null> => (await post({ auth: cred })).sessionId;
+  const openSession = async (): Promise<string | null> => (era === "modern" ? null : (await post({ auth: cred })).sessionId);
 
   // --- MAP-ORG01: foreign, "null" and malformed Origins, with the credential.
   await guard("MAP-ORG01", async () => {
@@ -201,7 +248,7 @@ export async function runEndpointChecks(http: HttpClient, target: string, cred: 
     for (const v of ORIGIN_VARIANTS) {
       const r = await post({ auth: cred, origin: v.value });
       if (r.sessionId) await endSession(http, target, cred, r.sessionId);
-      lines.push(`initialize with ${v.label}: HTTP ${r.status}`);
+      lines.push(`${hello} with ${v.label}: HTTP ${r.status}`);
       const cls = classifyAnswer(r.status, r.headers);
       if (cls === "accepted") accepted.push(v.label);
       else if (r.status === 403) continue;
@@ -240,7 +287,7 @@ export async function runEndpointChecks(http: HttpClient, target: string, cred: 
     for (const name of QUERY_NAMES) {
       const q = await post({ auth: cred, secretInQuery: name });
       if (q.sessionId) await endSession(http, target, cred, q.sessionId);
-      lines.push(`initialize with the ${what} as ?${name}= and no header: HTTP ${q.status}`);
+      lines.push(`${hello} with the ${what} as ?${name}= and no header: HTTP ${q.status}`);
       const cls = classifyAnswer(q.status, q.headers);
       if (cls === "accepted") accepted.push(name);
       else if (cls !== "refused") unexpected = true;
@@ -265,6 +312,11 @@ export async function runEndpointChecks(http: HttpClient, target: string, cred: 
   await guard("MAP-SES01", async () => {
     if (servesAnonymous) {
       findings.push(result("MAP-SES01", target, "error", "Inconclusive: the endpoint also answers requests without any credential.", [anonymousLine]));
+      return;
+    }
+    if (era === "modern") {
+      // 2026-07-28 removed protocol sessions: a server ignores Mcp-Session-Id, so there is nothing to test and no session to open or end.
+      findings.push(result("MAP-SES01", target, "not_applicable", "Not applicable: the server speaks MCP 2026-07-28, which has no protocol session (Mcp-Session-Id was removed). Every request is authenticated on its own.", [controlLine]));
       return;
     }
     const init = await post({ auth: cred });
@@ -300,18 +352,22 @@ export async function runEndpointChecks(http: HttpClient, target: string, cred: 
     try {
       // Control: one ping, same configuration, must work; otherwise a refused batch proves nothing.
       const single = await post({ auth: cred, ...(session ? { sessionId: session } : {}), method: "ping" });
-      if (!is2xx(single.status)) {
-        findings.push(result("MAP-BAT01", target, "error", "Inconclusive: a single ping is not accepted either, so a refused batch proves nothing.", [`control, one ping request: HTTP ${single.status}`]));
+      if (classifyAnswer(single.status, single.headers) === "rate_limited") {
+        findings.push(result("MAP-BAT01", target, "error", `Inconclusive: the ${what} hit a rate limit (HTTP ${single.status}) before the batch could be tried. Scan again once the limit has passed.`, [`control, one ${noop} request: HTTP ${single.status}`]));
         return;
       }
-      const batch = JSON.stringify(Array.from({ length: BATCH_SIZE }, (_, i) => ({ jsonrpc: "2.0", id: i + 1, method: "ping" })));
-      const r = await post({ auth: cred, ...(session ? { sessionId: session } : {}), body: batch });
+      if (!is2xx(single.status)) {
+        findings.push(result("MAP-BAT01", target, "error", `Inconclusive: a single ${noop} is not accepted either, so a refused batch proves nothing.`, [`control, one ${noop} request: HTTP ${single.status}`]));
+        return;
+      }
+      const batch = JSON.stringify(Array.from({ length: BATCH_SIZE }, (_, i) => rpcMessage(era, "ping", i + 1)));
+      const r = await post({ auth: cred, ...(session ? { sessionId: session } : {}), method: "ping", body: batch });
       const messages = jsonRpcMessages(r);
       // Only real JSON-RPC 2.0 messages count: any JSON object with an "error" key is not a JSON-RPC refusal.
       const results = messages.filter(isJsonRpcResult).length;
       const errors = messages.filter(isJsonRpcError).length;
       const cls = classifyAnswer(r.status, r.headers);
-      const lines = [`control, one ping request: HTTP ${single.status}`, `one POST carrying a JSON-RPC batch of ${BATCH_SIZE} ping requests: HTTP ${r.status}, ${results} result(s), ${errors} error(s)`];
+      const lines = [`control, one ${noop} request: HTTP ${single.status}`, `one POST carrying a JSON-RPC batch of ${BATCH_SIZE} ${noop} requests: HTTP ${r.status}, ${results} result(s), ${errors} error(s)`];
       if (results >= 2) {
         findings.push(
           result(
@@ -329,9 +385,9 @@ export async function runEndpointChecks(http: HttpClient, target: string, cred: 
       } else if (cls === "refused" || (cls === "accepted" && results === 0 && errors >= 1)) {
         // The same single ping must still work: otherwise the refusal may be about something else (a limit, a dead credential).
         const again = await post({ auth: cred, ...(session ? { sessionId: session } : {}), method: "ping" });
-        lines.push(`control again, one ping request: HTTP ${again.status}`);
+        lines.push(`control again, one ${noop} request: HTTP ${again.status}`);
         if (!is2xx(again.status)) {
-          findings.push(result("MAP-BAT01", target, "error", `Inconclusive: a single ping stopped working after the batch (HTTP ${again.status}), so the refusal cannot be attributed to the batch.`, lines));
+          findings.push(result("MAP-BAT01", target, "error", `Inconclusive: a single ${noop} stopped working after the batch (HTTP ${again.status}), so the refusal cannot be attributed to the batch.`, lines));
         } else {
           findings.push(result("MAP-BAT01", target, "pass", "A JSON-RPC batch is refused: one HTTP request carries one message, as MCP requires.", lines));
         }
@@ -352,19 +408,23 @@ export async function runEndpointChecks(http: HttpClient, target: string, cred: 
     let controlAgain: number | null = null;
     try {
       // Control: the same request at 1 KiB must work, so a refusal is about the size.
-      const small = await post({ auth: cred, ...(session ? { sessionId: session } : {}), body: paddedPing(1024) });
-      lines.push(`control, the same ping padded to 1 KiB: HTTP ${small.status}`);
-      if (!is2xx(small.status)) {
-        findings.push(result("MAP-BOD01", target, "error", "Inconclusive: the padded ping is refused even at 1 KiB, so a refusal of the large one proves nothing.", lines));
+      const small = await post({ auth: cred, ...(session ? { sessionId: session } : {}), method: "ping", body: paddedNoop(era, 1024) });
+      lines.push(`control, the same ${noop} padded to 1 KiB: HTTP ${small.status}`);
+      if (classifyAnswer(small.status, small.headers) === "rate_limited") {
+        findings.push(result("MAP-BOD01", target, "error", `Inconclusive: the ${what} hit a rate limit (HTTP ${small.status}) before the large requests could be tried. Scan again once the limit has passed.`, lines));
         return;
       }
-      const text = paddedPing(OVERSIZED_BODY_BYTES);
+      if (!is2xx(small.status)) {
+        findings.push(result("MAP-BOD01", target, "error", `Inconclusive: the padded ${noop} is refused even at 1 KiB, so a refusal of the large one proves nothing.`, lines));
+        return;
+      }
+      const text = paddedNoop(era, OVERSIZED_BODY_BYTES);
       for (const variant of [
         { label: `${mib} MiB body with Content-Length`, body: text as string | AsyncIterable<Uint8Array> },
         { label: `${mib} MiB body, chunked (no Content-Length)`, body: chunked(text) },
       ]) {
         try {
-          const r = await post({ auth: cred, ...(session ? { sessionId: session } : {}), body: variant.body, timeoutMs: UPLOAD_TIMEOUT_MS });
+          const r = await post({ auth: cred, ...(session ? { sessionId: session } : {}), method: "ping", body: variant.body, timeoutMs: UPLOAD_TIMEOUT_MS });
           lines.push(`${variant.label}: HTTP ${r.status}`);
           // A 4xx is about the size (413 is the expected one) only if it is not a rate limit, and if the control still works afterwards.
           const cls = classifyAnswer(r.status, r.headers);
@@ -376,10 +436,10 @@ export async function runEndpointChecks(http: HttpClient, target: string, cred: 
       }
       if (!verdicts.includes("accepted") && verdicts.every((v) => v === "refused")) {
         try {
-          controlAgain = (await post({ auth: cred, ...(session ? { sessionId: session } : {}), body: paddedPing(1024) })).status;
-          lines.push(`control again, the ping padded to 1 KiB: HTTP ${controlAgain}`);
+          controlAgain = (await post({ auth: cred, ...(session ? { sessionId: session } : {}), method: "ping", body: paddedNoop(era, 1024) })).status;
+          lines.push(`control again, the ${noop} padded to 1 KiB: HTTP ${controlAgain}`);
         } catch (e) {
-          lines.push(`control again, the ping padded to 1 KiB: request failed (${(e as Error).message})`);
+          lines.push(`control again, the ${noop} padded to 1 KiB: request failed (${(e as Error).message})`);
         }
       }
     } finally {
@@ -402,7 +462,7 @@ export async function runEndpointChecks(http: HttpClient, target: string, cred: 
 
   // --- MAP-THR02: a rate limit per credential (last: it may lock the credential for a while).
   await guard("MAP-INJ01", async () => {
-    findings.push(await runMetadataCheck(http, target, cred));
+    findings.push(await runMetadataCheck(http, target, cred, era));
   });
 
   await guard("MAP-THR02", async () => {
@@ -420,7 +480,7 @@ export async function runEndpointChecks(http: HttpClient, target: string, cred: 
       for (let i = 1; i <= attempts; i += 1) {
         const r = await post({ auth: cred, ...(session ? { sessionId: session } : {}), method: "ping" });
         counts.set(r.status, (counts.get(r.status) ?? 0) + 1);
-        const evidence = [`ping requests with the ${what}: ${[...counts].map(([s, n]) => `HTTP ${s} x${n}`).join(", ")}`];
+        const evidence = [`${noop} requests with the ${what}: ${[...counts].map(([s, n]) => `HTTP ${s} x${n}`).join(", ")}`];
         if (is2xx(r.status)) {
           accepted += 1;
           const a = announcedRateLimit(r.headers);
@@ -435,7 +495,7 @@ export async function runEndpointChecks(http: HttpClient, target: string, cred: 
         } else if (accepted > 0 && (r.status === 401 || r.status === 403)) {
           findings.push(result("MAP-THR02", target, "pass", `The ${what} was refused (HTTP ${r.status}) after ${accepted} accepted requests: probably a limit or a block; 429 with Retry-After is the standard answer.`, evidence));
         } else {
-          findings.push(result("MAP-THR02", target, "error", `Unexpected answer (HTTP ${r.status}) to a ping with the ${what}; inconclusive.`, evidence));
+          findings.push(result("MAP-THR02", target, "error", `Unexpected answer (HTTP ${r.status}) to a ${noop} with the ${what}; inconclusive.`, evidence));
         }
         return;
       }
@@ -452,7 +512,7 @@ export async function runEndpointChecks(http: HttpClient, target: string, cred: 
           target,
           "pass",
           `The ${what} is rate limited: the server announces a limit${announced.limit !== null ? ` of ${announced.limit}` : ""} in its RateLimit headers and the remaining count went from ${firstRemaining} to ${announced.remaining} over ${attempts} requests.`,
-          [`ping requests with the ${what}: ${tally}`],
+          [`${noop} requests with the ${what}: ${tally}`],
         ),
       );
       return;
@@ -463,7 +523,7 @@ export async function runEndpointChecks(http: HttpClient, target: string, cred: 
         target,
         "fail",
         `No rate limit observed for the ${what} after ${attempts} requests in ${Date.now() - started} ms. If your limit is higher on purpose, raise --rate-attempts (up to 100) or skip THR02.`,
-        [`ping requests with the ${what}: ${tally}`],
+        [`${noop} requests with the ${what}: ${tally}`],
       ),
     );
   });
@@ -484,24 +544,26 @@ export async function runEndpointChecks(http: HttpClient, target: string, cred: 
       /* the findings already say what happened */
     }
   }
-  return { findings, control, authenticatedRequests };
+  const announced = (probe as EraProbe | null)?.dialect.supportedVersions;
+  return { findings, control, authenticatedRequests, era, ...(announced && announced.length > 0 ? { supportedVersions: announced } : {}) };
 }
 
 /**
  * MAP-INJ01 on its own: with a credential, or anonymously for a server that
  * serves anonymous requests (`cred` undefined).
  */
-export async function runMetadataCheck(http: HttpClient, target: string, cred?: Credential): Promise<Finding> {
+export async function runMetadataCheck(http: HttpClient, target: string, cred?: Credential, era: Era = "legacy"): Promise<Finding> {
   const what = !cred ? "no credential" : cred.kind === "static" ? "the key" : "the token";
-  const r = await inspectMetadata(http, target, cred);
+  const hello = helloName(era);
+  const r = await inspectMetadata(http, target, cred, era);
   if (r.initializeStatus === null || r.initializeStatus < 200 || r.initializeStatus >= 300) {
-    return result("MAP-INJ01", target, "error", `Inconclusive: initialize with ${what} did not work, so the metadata cannot be read.`, [
-      `initialize with ${what}: ${r.initializeStatus === null ? "no usable answer" : `HTTP ${r.initializeStatus}`}`,
+    return result("MAP-INJ01", target, "error", `Inconclusive: ${hello} with ${what} did not work, so the metadata cannot be read.`, [
+      `${hello} with ${what}: ${r.initializeStatus === null ? "no usable answer" : `HTTP ${r.initializeStatus}`}`,
       ...r.notes,
-    ]);
+    ], r.initializeStatus === 429 ? "rate_limited" : r.initializeStatus === 401 || r.initializeStatus === 403 ? "credential_rejected" : undefined);
   }
   const c = r.counts;
-  const read = `read: ${c.tools} tool(s), ${c.prompts} prompt(s), ${c.resources} resource(s), ${c.templates} resource template(s) and the initialize result`;
+  const read = `read: ${c.tools} tool(s), ${c.prompts} prompt(s), ${c.resources} resource(s), ${c.templates} resource template(s) and the ${hello} result`;
   // Locations and pattern names only: the suspicious text itself is never copied into the report.
   const lines = [read, ...r.issues.slice(0, 30).map((i) => `${i.where}: ${i.detail}`), ...(r.issues.length > 30 ? [`… and ${r.issues.length - 30} more`] : []), ...r.notes];
   if (isPoisoned(r.issues)) {

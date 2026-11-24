@@ -6,6 +6,32 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.12.0] - 2026-11-24
+
+MCP 2026-07-28. Until now the scanner only spoke the `initialize` handshake of 2025-11-25: against a server that only speaks the stateless revision, every check of the MCP endpoint was inconclusive, with a message that blamed the credential.
+
+### Added
+
+- **Both MCP eras.** The scanner sends a 2026-07-28 request first (`server/discover`, with the `MCP-Protocol-Version` and `Mcp-Method` headers and the per-request `_meta`), recognises a modern server by its answer or by the errors only that revision defines (`-32020`, `-32021`, `-32022`), and otherwise falls back to `initialize`, as the specification describes for a dual-era client. `--protocol auto|modern|legacy`. The era, the version and the versions the server announces are in the report (`discovery.protocol`).
+- In the modern era `server/discover` replaces `initialize` and `ping` as the harmless request of `MAP-ORG01`, `MAP-TOK01`, `MAP-BAT01`, `MAP-BOD01`, `MAP-THR02`, `MAP-COR01` and the controls; `MAP-INJ01` reads the instructions from `server/discover` and the lists with `_meta`; `MAP-SES01` is not applicable (the revision has no session) and no DELETE is sent.
+- A server that speaks neither revision is reported as such (`protocol_unsupported`); the deprecated HTTP+SSE transport of 2024-11-05 is recognised and named.
+- **Clients without dynamic registration** (deprecated by 2026-07-28): `--client-id`, `--client-secret-file` and `--redirect-uri` for `login`, `scan` (`MAP-RDR01`, `MAP-RDR02`, `MAP-THR01`) and `consent-check`. A client ID that is an https URL is passed through as a client ID metadata document. The order is the specification's: supplied client, then dynamic registration. The report says which was used (`client.source`).
+- **`login begin` and `login complete`**: the login in two steps, without a loopback listener, for an application that receives the redirect itself. `beginLogin` and `completeLogin` in the library.
+- `login --rounds 2`: a second authorization gives `MAP-RDR03` a code of its own when a probe spent the first one (a server that does not enforce PKCE otherwise hid it).
+- `--issuer <url>` when a resource announces several authorization servers; all of them are listed in the report.
+- Lab profiles `modern`, `dual` and `preregistered`, and `lab --auto-approve`. The limit on failed token requests of the lab is per client and lifts after 60 seconds, so the documented order (scan, login, scan) works; the `secure` profile announces a per-token rate limit in `RateLimit` headers.
+- The catalogue says which revisions each check applies to (`appliesTo`), and references both.
+
+### Changed
+
+- **Metadata is validated, as a client must.** Authorization server metadata whose `issuer` is not identical to the issuer it was fetched for is not used (RFC 8414 section 3.3; a MUST of the MCP specification): on such a server `MAP-DSC01` now fails instead of passing. A Protected Resource Metadata document whose `resource` is neither the scanned URL nor a prefix of it is remarked in `MAP-DSC01` (which still passes, with the inconsistency in its message) and its value is not sent as the `resource` parameter.
+- Dynamic registration requests carry `application_type` (`native` for a loopback redirect URI, `web` otherwise), as 2026-07-28 requires; `login` retries once without it when a server rejects the field.
+- The refresh token checks send the `resource` parameter with every refresh (RFC 8707: in every token request).
+- `login` checks `iss` before it reads `error` from the authorization response: an error from another issuer is no longer displayed.
+- The redirect URI checks request the same scopes as `login` (the challenge first, then `scopes_supported`).
+- The CORS preflight of `MAP-COR01` asks for the 2026-07-28 headers too (`mcp-protocol-version`, `mcp-method`, `mcp-name`).
+- Missing `code_challenge_methods_supported` is noted in `MAP-DSC01` and by `login`, which goes on (the specification tells clients to stop; the tool tests what the server enforces).
+
 ## [0.11.0] - 2026-11-24
 
 The integration contract: what a program that runs the scanner needs. Options and report fields of 0.10 are all still accepted; the report keeps its `mcp-authprobe/report/v1` identifier and only gains fields.
@@ -202,7 +228,8 @@ First release.
 - Hardening from an independent review before release: HTTPS is required for every request outside loopback/private labs; rate limits and server errors make redirect URI, registration and throttling checks inconclusive instead of passing; test grants record their target and token endpoint and are never used elsewhere (and must name their target in MCP mode); loopback targets need a proof in MCP mode unless listed in `MCP_AUTHPROBE_LAB_ORIGINS`; `login` output is neutralized; more IPv6 transition ranges are refused; a malformed issuer no longer aborts discovery.
 - Local fixture server with a stateful token endpoint, dynamic registration and an authorization endpoint and test suite; GitHub Actions CI.
 
-[Unreleased]: https://github.com/Enigmacker/mcp-authprobe/compare/v0.11.0...HEAD
+[Unreleased]: https://github.com/Enigmacker/mcp-authprobe/compare/v0.12.0...HEAD
+[0.12.0]: https://github.com/Enigmacker/mcp-authprobe/compare/v0.11.0...v0.12.0
 [0.11.0]: https://github.com/Enigmacker/mcp-authprobe/compare/v0.10.2...v0.11.0
 [0.10.2]: https://github.com/Enigmacker/mcp-authprobe/compare/v0.10.1...v0.10.2
 [0.10.1]: https://github.com/Enigmacker/mcp-authprobe/compare/v0.10.0...v0.10.1

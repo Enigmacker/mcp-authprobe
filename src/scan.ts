@@ -6,9 +6,9 @@ import { runRedirectUriChecks } from "./checks/redirect-uris.js";
 import { runRefreshTokenSequence, type GrantState } from "./checks/refresh-tokens.js";
 import { runThrottlingCheck } from "./checks/throttling.js";
 import { observationSource, type Observation, type TestGrant } from "./credentials.js";
-import { discover, type DiscoveryResult } from "./discovery.js";
+import { discover, scopesFor, type DiscoveryResult } from "./discovery.js";
 import { BlockedAddressError, HttpClient, InsecureTransportError, NetworkError, ScanInterruptedError } from "./net/http.js";
-import { FOREIGN_ORIGIN, initializeStatus, PROTOCOL_VERSION, type Credential } from "./oauth/mcp-call.js";
+import { FOREIGN_ORIGIN, helloName, initializeStatus, MODERN_VERSION, rpcMessage, versionOf, type Credential, type Era } from "./oauth/mcp-call.js";
 import { verifyOwnership, type OwnershipResult, type VerifyOptions } from "./ownership.js";
 import type { CheckSelector } from "./selection.js";
 import type { CheckStatus, DiscoverySummary, Finding, GrantReport, Leftover, ReasonCode, ScanReport } from "./types.js";
@@ -68,6 +68,17 @@ export interface ScanOptions {
   signal?: AbortSignal;
   /** Stop the scan after this many milliseconds, with a partial report. */
   deadlineMs?: number;
+  /** MCP era to speak instead of detecting it: "legacy" (2025-11-25, initialize) or "modern" (2026-07-28, stateless). */
+  protocol?: Era;
+  /** Examine this authorization server instead of the first one the resource announces. */
+  issuer?: string;
+  /**
+   * A client the operator supplies instead of dynamic registration (the
+   * first choice of the MCP specification): pre-registered, or the URL of a
+   * client ID metadata document. `redirectUri` is one of its registered
+   * redirect URIs, needed by the redirect URI checks.
+   */
+  client?: { clientId: string; clientSecret?: string; redirectUri?: string };
   /** Called at the start and end of the scan, of discovery and of every check. Must not throw. */
   onEvent?: (event: ScanEvent) => void;
   /** Test hooks. */
@@ -95,7 +106,10 @@ function dsc01(d: DiscoveryResult, staticKey: boolean): Finding {
     ...(d.as ? [`AS metadata: ${d.as.url}`] : []),
     ...d.notes,
   ];
-  if (missing.length === 0) return makeFinding("MAP-DSC01", d.mcpUrl, "pass", "Authorization endpoints discovered.", evidence);
+  if (missing.length === 0) {
+    const n = d.warnings?.length ?? 0;
+    return makeFinding("MAP-DSC01", d.mcpUrl, "pass", n > 0 ? `Authorization endpoints discovered, with ${n} metadata inconsistenc${n === 1 ? "y" : "ies"} a strict client would refuse: see the evidence.` : "Authorization endpoints discovered.", evidence);
+  }
   // A server authenticated by a static key publishes no OAuth metadata: that is expected,
   // but only when the operator says so (a plain 401 also looks like a broken OAuth setup).
   if (staticKey && !d.prm && !d.as && !d.challenge.resourceMetadataUrl) {
@@ -120,7 +134,7 @@ export function hostsToVerify(mcpUrl: string, d: DiscoveryResult | null): string
 }
 
 /** What discovery found, for the report: URLs and capabilities, no secret. */
-export function summarizeDiscovery(d: DiscoveryResult | null): DiscoverySummary {
+export function summarizeDiscovery(d: DiscoveryResult | null, era?: Era | null): DiscoverySummary {
   const meta = d?.as?.metadata;
   const str = (v: unknown): string | null => (typeof v === "string" ? v : null);
   const registration: DiscoverySummary["registration"] = [];
@@ -132,14 +146,19 @@ export function summarizeDiscovery(d: DiscoveryResult | null): DiscoverySummary 
     resourceMetadataUrl: d?.prm?.url ?? null,
     authorizationServerMetadataUrl: d?.as?.url ?? null,
     resource: str(d?.prm?.metadata.resource),
-    issuer: str(meta?.issuer),
+    issuer: str(meta?.issuer) ?? d?.issuer ?? null,
     authorizationServers: Array.isArray(servers) ? servers.filter((x): x is string => typeof x === "string") : [],
     authorizationEndpoint: str(meta?.authorization_endpoint),
     tokenEndpoint: str(meta?.token_endpoint),
     registrationEndpoint: str(meta?.registration_endpoint),
     registration,
     pkceMethods: Array.isArray(meta?.code_challenge_methods_supported) ? meta.code_challenge_methods_supported.filter((x): x is string => typeof x === "string") : null,
-    protocol: { era: d ? "legacy" : "unknown", version: d ? PROTOCOL_VERSION : null, supportedVersions: [] },
+    protocol: {
+      era: era ?? d?.protocol?.era ?? "unknown",
+      version: era ? versionOf(era) : (d?.protocol?.version ?? null),
+      supportedVersions: d?.protocol?.supportedVersions ?? [],
+      ...(d?.protocol?.transport ? { transport: d.protocol.transport } : {}),
+    },
     notes: d?.notes ?? [],
   };
 }
@@ -173,7 +192,7 @@ export function grantFor(target: string, tokenEndpoint: string, options: ScanOpt
  * MAP-COR01. Passive: a CORS preflight and an ordinary request, both with a
  * foreign Origin and no credentials; only the CORS response headers are read.
  */
-async function runCorsCheck(target: string, http: HttpClient): Promise<Finding> {
+async function runCorsCheck(target: string, http: HttpClient, era: Era): Promise<Finding> {
     const evidence: string[] = [];
   let worst: "credentials" | "reflected" | "wildcard" | "none" = "none";
   const judge = (label: string, headers: Record<string, string>, status: number): void => {
@@ -189,14 +208,19 @@ async function runCorsCheck(target: string, http: HttpClient): Promise<Finding> 
     const pre = await http.request({
       url: target,
       method: "OPTIONS",
-      headers: { origin: FOREIGN_ORIGIN, "access-control-request-method": "POST", "access-control-request-headers": "authorization, content-type, mcp-session-id" },
+      headers: { origin: FOREIGN_ORIGIN, "access-control-request-method": "POST", "access-control-request-headers": "authorization, content-type, mcp-protocol-version, mcp-method, mcp-name, mcp-session-id" },
     });
     judge("preflight (OPTIONS) from a foreign Origin", pre.headers, pre.status);
     const res = await http.request({
       url: target,
       method: "POST",
-      headers: { origin: FOREIGN_ORIGIN, "content-type": "application/json", accept: "application/json, text/event-stream" },
-      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "ping" }),
+      headers: {
+        origin: FOREIGN_ORIGIN,
+        "content-type": "application/json",
+        accept: "application/json, text/event-stream",
+        ...(era === "modern" ? { "mcp-protocol-version": MODERN_VERSION, "mcp-method": "server/discover" } : {}),
+      },
+      body: JSON.stringify(rpcMessage(era, "ping")),
     });
     judge("request from a foreign Origin", res.headers, res.status);
   } catch (err) {
@@ -223,13 +247,17 @@ interface Ctx {
   observations: Observation[];
   /** Whether `mcp-authprobe login` can work on this server (it needs a way to obtain a client). */
   loginPossible: boolean;
+  /** The era requests are sent in: known from discovery or the credentialed checks, otherwise the newest (what discovery sent first). */
+  era: Era;
+  /** Whether `era` was actually observed. */
+  eraKnown: boolean;
   leftovers: Leftover[];
   /** The grant as the scan leaves it. */
   grant: { latest: TestGrant | null; state: GrantState["state"] | "unused"; used: boolean; rotated: boolean };
 }
 
 const LOGIN_ADVICE = "Observed during login: run `mcp-authprobe login` with ownership proven, then scan with the grant file it writes.";
-const NO_LOGIN_ADVICE = "Observed during login, which is not possible on this server: `mcp-authprobe login` registers its client through dynamic client registration, and the authorization server offers none.";
+const NO_LOGIN_ADVICE = "Observed during login. This authorization server offers no dynamic client registration: give `mcp-authprobe login` a pre-registered client with --client-id (and --redirect-uri), then scan with the grant file it writes.";
 
 /**
  * Report a result observed during `login`. The observation comes from a
@@ -262,12 +290,12 @@ const hasObservation = (ctx: Ctx, checkId: string): boolean => ctx.observations.
 async function metadataWithoutCredential(ctx: Ctx): Promise<Finding> {
   const { target, http } = ctx;
   if (hasObservation(ctx, "MAP-INJ01")) return fromObservation(ctx, "MAP-INJ01");
-  const anonymous = await initializeStatus(http, target);
-  if (anonymous >= 200 && anonymous < 300) return runMetadataCheck(http, target);
+  const anonymous = await initializeStatus(http, target, { era: ctx.era });
+  if (anonymous >= 200 && anonymous < 300) return runMetadataCheck(http, target, undefined, ctx.era);
   const how = ctx.loginPossible
     ? "run `mcp-authprobe login` (ownership proven) and scan with the grant file it writes, or pass a static key with --bearer-file or an access token with --access-token-file"
-    : "pass a static key with --bearer-file or an access token with --access-token-file (`mcp-authprobe login` needs dynamic client registration, which this server does not offer)";
-  return makeFinding("MAP-INJ01", target, "skipped", `Needs a credential: ${how}.`, [`initialize without any credential: HTTP ${anonymous}`], "needs_credential");
+    : "pass a static key with --bearer-file or an access token with --access-token-file (or give `mcp-authprobe login` a client with --client-id: this server offers no dynamic client registration)";
+  return makeFinding("MAP-INJ01", target, "skipped", `Needs a credential: ${how}.`, [`${helloName(ctx.era)} without any credential: HTTP ${anonymous}`], "needs_credential");
 }
 
 /**
@@ -278,9 +306,9 @@ async function metadataWithoutCredential(ctx: Ctx): Promise<Finding> {
 async function runOriginCheck(ctx: Ctx): Promise<Finding> {
   const { target, http } = ctx;
   if (hasObservation(ctx, "MAP-ORG01")) return fromObservation(ctx, "MAP-ORG01");
-  const baseline = await initializeStatus(http, target);
-  const foreign = await initializeStatus(http, target, { origin: FOREIGN_ORIGIN });
-  const evidence = [`initialize without Origin: HTTP ${baseline}`, `initialize with Origin: ${FOREIGN_ORIGIN}: HTTP ${foreign}`];
+  const baseline = await initializeStatus(http, target, { era: ctx.era });
+  const foreign = await initializeStatus(http, target, { origin: FOREIGN_ORIGIN, era: ctx.era });
+  const evidence = [`${helloName(ctx.era)} without Origin: HTTP ${baseline}`, `${helloName(ctx.era)} with Origin: ${FOREIGN_ORIGIN}: HTTP ${foreign}`];
   if (foreign === 403 && baseline !== 403) return makeFinding("MAP-ORG01", target, "pass", "A request from a foreign Origin is refused with 403.", evidence);
   if (baseline >= 200 && baseline < 300 && foreign === baseline) {
     return makeFinding("MAP-ORG01", target, "fail", "A request from a foreign Origin is processed like any other: the Origin header is not validated.", evidence);
@@ -290,7 +318,7 @@ async function runOriginCheck(ctx: Ctx): Promise<Finding> {
       ? "Prove ownership of the target so the declared credential can be used, then scan again."
       : ctx.loginPossible
         ? "Run `mcp-authprobe login` (ownership proven) to observe it with a valid token, or pass a static key with --bearer-file or an access token with --access-token-file."
-        : "Pass a static key with --bearer-file or an access token with --access-token-file to observe it with a credential (`mcp-authprobe login` needs dynamic client registration, which this server does not offer).";
+        : "Pass a static key with --bearer-file or an access token with --access-token-file to observe it with a credential (or give `mcp-authprobe login` a client with --client-id: this server offers no dynamic client registration).";
     return makeFinding("MAP-ORG01", target, "error", `Inconclusive: the server asks for authentication before looking at Origin. ${next}`, evidence, "needs_credential");
   }
   const reason: ReasonCode = baseline === 429 || foreign === 429 ? "rate_limited" : baseline >= 500 || foreign >= 500 ? "server_error" : "unexpected_answer";
@@ -309,7 +337,9 @@ async function runRefreshFamily(ctx: Ctx): Promise<Finding[]> {
   }
   const { grant, reason } = grantFor(target, tokenEndpoint, options);
   if (!grant) return all("skipped", reason ?? "No usable test grant.", "needs_grant");
-  const r = await runRefreshTokenSequence({ http, target, tokenEndpoint, grant: { ...grant, refreshToken: ctx.grant.latest?.refreshToken ?? grant.refreshToken }, select: wanted });
+  // RFC 8707: the resource goes into every token request, refreshes included.
+  const resource = ctx.discovery?.prm?.metadata.resource ?? target;
+  const r = await runRefreshTokenSequence({ http, target, tokenEndpoint, grant: { ...grant, refreshToken: ctx.grant.latest?.refreshToken ?? grant.refreshToken }, select: wanted, resource });
   ctx.grant.used = ctx.grant.used || r.grant.requests > 0;
   ctx.grant.rotated = ctx.grant.rotated || r.grant.rotated;
   ctx.grant.state = r.grant.state;
@@ -327,6 +357,7 @@ async function runThrottleFamily(ctx: Ctx): Promise<Finding> {
     tokenEndpoint: meta.token_endpoint,
     registrationEndpoint: typeof meta.registration_endpoint === "string" ? meta.registration_endpoint : null,
     leftovers: ctx.leftovers,
+    ...(options.client ? { client: { clientId: options.client.clientId, ...(options.client.clientSecret ? { clientSecret: options.client.clientSecret } : {}) } } : {}),
   };
   const { grant } = grantFor(target, meta.token_endpoint, options);
   if (grant) c.grant = grant; // otherwise a temporary client is used
@@ -338,7 +369,8 @@ async function runRedirectFamily(ctx: Ctx, select: CheckSelector): Promise<Findi
   const { target, http } = ctx;
   const meta = ctx.discovery?.as?.metadata;
   if (!meta) return RDR_IDS.filter(select).map((id) => makeFinding(id, target, "skipped", "No authorization server metadata discovered.", [], "no_endpoint"));
-  const scopes = ctx.discovery?.prm?.metadata.scopes_supported;
+  // The same scope selection as `login`: the challenge first, then scopes_supported.
+  const scope = ctx.discovery ? scopesFor(ctx.discovery, false) : undefined;
   const c: Parameters<typeof runRedirectUriChecks>[0] = {
     http,
     target,
@@ -347,8 +379,9 @@ async function runRedirectFamily(ctx: Ctx, select: CheckSelector): Promise<Findi
     resource: ctx.discovery?.prm?.metadata.resource ?? target,
     select,
     leftovers: ctx.leftovers,
+    ...(ctx.options.client ? { client: { clientId: ctx.options.client.clientId, ...(ctx.options.client.redirectUri ? { redirectUri: ctx.options.client.redirectUri } : {}) } } : {}),
   };
-  if (Array.isArray(scopes) && scopes.length > 0) c.scope = scopes.join(" ");
+  if (scope) c.scope = scope;
   return runRedirectUriChecks(c);
 }
 
@@ -361,14 +394,14 @@ async function runAudienceDuringScan(ctx: Ctx, credential: Credential, tokenEndp
   const { target, http } = ctx;
   let control: number | null = null;
   try {
-    control = await initializeStatus(http, target, { auth: credential });
+    control = await initializeStatus(http, target, { auth: credential, era: ctx.era });
   } catch {
     control = null;
   }
   const working: TestGrant = { ...grant, refreshToken: ctx.grant.latest?.refreshToken ?? grant.refreshToken };
   const before = working.refreshToken;
   const resource = ctx.discovery?.prm?.metadata.resource;
-  const f = await runAudienceCheck({ http, target, tokenEndpoint, grant: working, control, ...(typeof resource === "string" ? { ownAudiences: [resource] } : {}) });
+  const f = await runAudienceCheck({ http, target, tokenEndpoint, grant: working, control, era: ctx.era, ...(typeof resource === "string" ? { ownAudiences: [resource] } : {}) });
   if (control !== null && control >= 200 && control < 300) ctx.grant.used = true;
   if (working.refreshToken !== before) {
     ctx.grant.rotated = true;
@@ -455,9 +488,18 @@ export async function runScan(mcpUrl: string, options: ScanOptions = {}): Promis
       ownership: extra.ownership,
       findings: kept,
       summary: summarize(kept),
-      discovery: summarizeDiscovery(ctx?.discovery ?? null),
+      discovery: summarizeDiscovery(ctx?.discovery ?? null, ctx?.eraKnown ? ctx.era : null),
       ...(options.credential ? { credential: { kind: options.credential.kind, header: options.credential.header } } : {}),
       ...(grantReport ? { grant: grantReport } : {}),
+      client: {
+        source: options.client
+          ? /^https:\/\/[^/]+\/.+/.test(options.client.clientId)
+            ? "metadata-document"
+            : "pre-registered"
+          : typeof ctx?.discovery?.as?.metadata.registration_endpoint === "string"
+            ? "dynamic-registration"
+            : "none",
+      },
       leftovers: ctx?.leftovers ?? [],
     };
     emit({ type: "scan_finished", complete, at: finishedAt });
@@ -498,7 +540,7 @@ export async function runScan(mcpUrl: string, options: ScanOptions = {}): Promis
   try {
     let discovery: DiscoveryResult | null = null;
     try {
-      discovery = await discover(target, http);
+      discovery = await discover(target, http, { ...(options.protocol ? { protocol: options.protocol } : {}), ...(options.issuer !== undefined ? { issuer: options.issuer } : {}) });
       findings.push(dsc01(discovery, options.credential?.kind === "static"));
     } catch (err) {
       // No HTTP answer at all (or a request the address policy refuses): nothing can be tested.
@@ -542,9 +584,11 @@ export async function runScan(mcpUrl: string, options: ScanOptions = {}): Promis
       options,
       discovery,
       observations: options.observations ?? [],
-      loginPossible: typeof discovery?.as?.metadata.registration_endpoint === "string" || !discovery?.as,
+      loginPossible: typeof discovery?.as?.metadata.registration_endpoint === "string" || !discovery?.as || options.client !== undefined,
       leftovers: [],
       grant: { latest: options.grant ?? null, state: "unused", used: false, rotated: false },
+      era: options.protocol ?? (discovery?.protocol?.era === "legacy" ? "legacy" : "modern"),
+      eraKnown: options.protocol !== undefined || (discovery?.protocol !== undefined && discovery.protocol.era !== "unknown"),
     };
     const credential = options.credential;
 
@@ -558,13 +602,20 @@ export async function runScan(mcpUrl: string, options: ScanOptions = {}): Promis
           checks: selected as EndpointCheckId[],
           ...(options.rateAttempts !== undefined ? { rateAttempts: options.rateAttempts } : {}),
           ...(options.waitOnRateLimitMs !== undefined ? { waitOnRateLimitMs: options.waitOnRateLimitMs } : {}),
+          // An anonymous answer may not show the era (401 comes first): then the checks detect it with the credential.
+          ...(ctx.eraKnown ? { era: ctx.era } : {}),
         });
+        if (ep.era) {
+          ctx.era = ep.era;
+          ctx.eraKnown = true;
+        }
+        if (ep.supportedVersions && discovery?.protocol) discovery.protocol.supportedVersions = ep.supportedVersions;
         return ep.findings;
       });
       for (const id of ids.filter(wanted)) handled.add(id);
     }
     if (!handled.has("MAP-ORG01")) await stage(["MAP-ORG01"], () => runOriginCheck(ctx));
-    await stage(["MAP-COR01"], () => runCorsCheck(target, http));
+    await stage(["MAP-COR01"], () => runCorsCheck(target, http, ctx.era));
 
     const active = CATALOGUE.filter((c) => c.active);
     if (!verified) {

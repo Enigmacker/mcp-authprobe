@@ -29,6 +29,8 @@ export interface HttpRequest {
   maxBodyBytes?: number;
   /** Timeout for this request only (large uploads). */
   timeoutMs?: number;
+  /** Return after the first chunk of the answer body (to look at the start of an event stream that never ends). */
+  firstChunkOnly?: boolean;
   /** A cleanup request (deleting a temporary client): sent even after the scan was aborted or its request budget spent. */
   cleanup?: boolean;
   /** Redirects are never followed automatically; callers inspect them. */
@@ -211,12 +213,14 @@ export class HttpClient {
       "accept-encoding": "identity",
       ...req.headers,
     };
+    // Lets a request that only reads the start of an endless stream drop its connection afterwards.
+    const local = new AbortController();
     const init: Parameters<typeof undiciFetch>[1] = {
       method: req.method ?? "GET",
       headers,
       redirect: "manual",
       dispatcher: this.dispatcher,
-      signal: this.signal && !req.cleanup ? AbortSignal.any([AbortSignal.timeout(req.timeoutMs ?? this.timeoutMs), this.signal]) : AbortSignal.timeout(req.timeoutMs ?? this.timeoutMs),
+      signal: AbortSignal.any([AbortSignal.timeout(req.timeoutMs ?? this.timeoutMs), local.signal, ...(this.signal && !req.cleanup ? [this.signal] : [])]),
     };
     if (typeof req.body === "string") init.body = req.body;
     else if (req.body !== undefined) {
@@ -237,11 +241,12 @@ export class HttpClient {
 
     let read: { body: string; truncated: boolean };
     try {
-      read = await this.readCapped(res.body, req.maxBodyBytes ?? this.maxBodyBytes);
+      read = await this.readCapped(res.body, req.maxBodyBytes ?? this.maxBodyBytes, req.firstChunkOnly === true);
     } catch (e) {
       throw describeNetworkError(e);
     }
     const { body, truncated } = read;
+    if (req.firstChunkOnly) local.abort();
     const outHeaders: Record<string, string> = {};
     res.headers.forEach((value, key) => {
       outHeaders[key] = value;
@@ -263,6 +268,7 @@ export class HttpClient {
   private async readCapped(
     stream: ReadableStream<Uint8Array> | null,
     max: number,
+    firstChunkOnly = false,
   ): Promise<{ body: string; truncated: boolean }> {
     if (!stream) return { body: "", truncated: false };
     const reader = stream.getReader();
@@ -280,11 +286,17 @@ export class HttpClient {
       }
       chunks.push(value);
       size += value.byteLength;
+      if (firstChunkOnly) {
+        truncated = true;
+        await reader.cancel();
+        break;
+      }
     }
     return { body: Buffer.concat(chunks).toString("utf8"), truncated };
   }
 
   async close(): Promise<void> {
-    await this.dispatcher.close();
+    // Nothing is in flight when a scan ends; destroy() also drops a connection a server keeps open.
+    await this.dispatcher.destroy();
   }
 }

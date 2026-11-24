@@ -37,21 +37,33 @@ export async function registerClient(
   http: HttpClient,
   registrationEndpoint: string,
   redirectUris: string[],
-  extra: { clientName?: string; grantTypes?: string[] } = {},
+  extra: { clientName?: string; grantTypes?: string[]; applicationType?: "native" | "web" } = {},
 ): Promise<RegistrationOutcome> {
-  const body = {
+  // MCP 2026-07-28: a client must say what it is. Under OpenID Connect a missing application_type means
+  // "web", which forbids a loopback redirect URI; "native" for loopback, "web" for an https one.
+  const loopback = redirectUris.some((u) => /^http:\/\/(127\.0\.0\.1|\[::1\]|localhost)[:/]/.test(u));
+  const body: Record<string, unknown> = {
     client_name: extra.clientName ?? CLIENT_NAME,
     redirect_uris: redirectUris,
     grant_types: extra.grantTypes ?? ["authorization_code"],
     response_types: ["code"],
     token_endpoint_auth_method: "none",
+    application_type: extra.applicationType ?? (loopback ? "native" : "web"),
   };
-  const res = await http.request({
-    url: registrationEndpoint,
-    method: "POST",
-    headers: { "content-type": "application/json", accept: "application/json" },
-    body: JSON.stringify(body),
-  });
+  const post = (): ReturnType<HttpClient["request"]> =>
+    http.request({
+      url: registrationEndpoint,
+      method: "POST",
+      headers: { "content-type": "application/json", accept: "application/json" },
+      body: JSON.stringify(body),
+    });
+  let res = await post();
+  // A server that rejects the field itself (it should ignore what it does not know) gets one try without it.
+  // Not on the unsafe redirect URIs of MAP-RDR04, where a refusal is the expected answer.
+  if (res.status === 400 && extra.applicationType !== undefined && /application_type|invalid_client_metadata/.test(res.body)) {
+    delete body["application_type"];
+    res = await post();
+  }
 
   let json: Record<string, unknown> = {};
   try {

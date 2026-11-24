@@ -4,16 +4,16 @@ import { createServer, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
 import { CATALOGUE, LOGIN_CHECK_IDS } from "./checks/catalogue.js";
 import type { Observation, TestGrant } from "./credentials.js";
-import type { DiscoveryResult } from "./discovery.js";
+import { scopesFor, type DiscoveryResult } from "./discovery.js";
 import type { ReasonCode } from "./types.js";
 import type { HttpClient } from "./net/http.js";
 import { jwtAudience, runAudienceCheck } from "./checks/audience.js";
 import { runEndpointChecks } from "./checks/endpoint.js";
 import { makeFinding } from "./checks/finding.js";
-import { bearerCredential, initializeStatus } from "./oauth/mcp-call.js";
+import { bearerCredential, initializeStatus, type Era } from "./oauth/mcp-call.js";
 import { describe as describeOutcome, exchangeCode, refresh, type CodeExchangeOutcome } from "./oauth/token-client.js";
-import { deleteClient, registerClient, SAFE_DOMAIN, type RegisteredClient } from "./oauth/registration.js";
-import { safeText } from "./redact.js";
+import { deleteClient, registerClient } from "./oauth/registration.js";
+import { registerSecret, safeErrorCode, safeText } from "./redact.js";
 
 /**
  * Interactive login to the user's own MCP server, producing a test grant.
@@ -31,24 +31,50 @@ import { safeText } from "./redact.js";
  * redirect_uri, which a compliant token endpoint must refuse.
  */
 
+/** A client the operator supplies instead of dynamic registration: pre-registered, or a client ID metadata document URL. */
+export interface ClientConfig {
+  clientId: string;
+  /** Confidential clients only. In memory; never reported. */
+  clientSecret?: string;
+  authMethod?: TestGrant["authMethod"];
+}
+
 export interface LoginOptions {
   http: HttpClient;
   mcpUrl: string;
   discovery: DiscoveryResult;
   /** Opens the authorization URL (a browser in the CLI, a scripted agent in tests). */
   openUrl: (url: string) => Promise<void>;
-  /** Run the login checks (PKC01, RDR03, AUD01, ORG01, COD01). Only set when ownership of every contacted host is proven. */
+  /** Run the login checks. Only set when ownership of every contacted host is proven. */
   probe: boolean;
   /** How long to wait for the user to finish in the browser. */
   timeoutMs?: number;
   /** Status lines for the user (stderr in the CLI). Never receives secrets. */
   log?: (line: string) => void;
+  /** Use this client instead of registering one (the first choice of the MCP specification when one exists). */
+  client?: ClientConfig;
+  /**
+   * Loopback redirect URI to listen on (http://127.0.0.1:<port>/<path>), for
+   * a pre-registered native client whose redirect URI is fixed. Default: a
+   * random port, which only dynamic registration can use.
+   */
+  redirectUri?: string;
+  /**
+   * Authorizations to run (default 1). With 2, when a probe spent the code
+   * before MAP-RDR03 could be observed, a second authorization gives it a
+   * code of its own. Each round opens the authorization page again.
+   */
+  rounds?: number;
 }
 
 export interface LoginResult {
   grant: TestGrant | null;
   observations: Observation[];
   notes: string[];
+  /** The access token of the exchange, for a caller that goes on with it. In memory only. */
+  accessToken?: string | null;
+  /** How the client was obtained. */
+  clientSource?: LoginState["clientSource"];
 }
 
 export class LoginError extends Error {
@@ -58,7 +84,37 @@ export class LoginError extends Error {
   }
 }
 
+/**
+ * Everything `completeLogin` needs to finish an authorization that
+ * `beginLogin` started, possibly in another process: the PKCE verifier, the
+ * state, the issuer recorded for the RFC 9207 check. It holds secrets: the
+ * CLI writes it with mode 600.
+ */
+export interface LoginState {
+  version: 1;
+  target: string;
+  /** Issuer of the validated authorization server metadata, recorded before the user is redirected. */
+  issuer: string | null;
+  issParameterSupported: boolean;
+  authorizationEndpoint: string;
+  tokenEndpoint: string;
+  registrationEndpoint: string | null;
+  clientId: string;
+  clientSecret?: string;
+  authMethod: TestGrant["authMethod"];
+  clientSource: "pre-registered" | "metadata-document" | "dynamic-registration";
+  /** RFC 7592 handle of a client registered by `beginLogin`, to delete it when no grant is kept. */
+  registered?: { registrationClientUri: string | null; registrationAccessToken: string | null };
+  redirectUri: string;
+  state: string;
+  codeVerifier: string;
+  resource: string;
+  scope?: string;
+  createdAt: string;
+}
+
 interface CallbackParams {
+  state: string | null;
   code: string | null;
   error: string | null;
   iss: string | null;
@@ -70,33 +126,60 @@ function equalStrings(a: string, b: string): boolean {
   return ba.length === bb.length && timingSafeEqual(ba, bb);
 }
 
-/** Loopback listener that resolves with the first callback carrying the right state. */
-async function startCallbackListener(expectedState: string): Promise<{ redirectUri: string; mismatchUri: string; result: Promise<CallbackParams>; close: () => Promise<void> }> {
-  let resolveResult!: (p: CallbackParams) => void;
-  const result = new Promise<CallbackParams>((resolve) => {
-    resolveResult = resolve;
-  });
-  let done = false;
+interface Listener {
+  redirectUri: string;
+  /** Resolves with the first callback carrying this state. */
+  expect: (state: string) => Promise<CallbackParams>;
+  close: () => Promise<void>;
+}
 
+/** Loopback listener: accepts one GET on its path per expected state, and echoes nothing back. */
+async function startCallbackListener(fixed?: string): Promise<Listener> {
+  let port = 0;
+  let path = "/callback";
+  let host = "127.0.0.1";
+  if (fixed !== undefined) {
+    let u: URL;
+    try {
+      u = new URL(fixed);
+    } catch {
+      throw new LoginError("--redirect-uri is not a valid URL.");
+    }
+    host = u.hostname.replace(/^\[|\]$/g, "");
+    if (u.protocol !== "http:" || !["127.0.0.1", "::1", "localhost"].includes(host)) {
+      throw new LoginError("login can only listen on a loopback redirect URI (http://127.0.0.1:<port>/…). For a web redirect URI, use `login begin` and `login complete`.");
+    }
+    if (!u.port) throw new LoginError("A loopback redirect URI needs an explicit port to listen on.");
+    port = Number(u.port);
+    path = u.pathname;
+    if (host === "localhost") host = "127.0.0.1";
+  }
+  let waiting: { state: string; resolve: (p: CallbackParams) => void } | null = null;
   const server: Server = createServer((req, res) => {
     const url = new URL(req.url ?? "/", "http://127.0.0.1");
     const state = url.searchParams.get("state") ?? "";
-    if (req.method !== "GET" || url.pathname !== "/callback" || done || !equalStrings(state, expectedState)) {
+    if (req.method !== "GET" || url.pathname !== path || !waiting || !equalStrings(state, waiting.state)) {
       res.writeHead(400, { "content-type": "text/plain; charset=utf-8" });
       res.end("Unexpected request.");
       return;
     }
-    done = true;
+    const { resolve } = waiting;
+    waiting = null;
     res.writeHead(200, { "content-type": "text/plain; charset=utf-8", "cache-control": "no-store" });
     res.end("mcp-authprobe: authorization received. You can close this tab.");
-    resolveResult({ code: url.searchParams.get("code"), error: url.searchParams.get("error"), iss: url.searchParams.get("iss") });
+    resolve({ state, code: url.searchParams.get("code"), error: url.searchParams.get("error"), iss: url.searchParams.get("iss") });
   });
-  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
-  const { port } = server.address() as AddressInfo;
+  await new Promise<void>((resolve, reject) => {
+    server.once("error", (e) => reject(new LoginError(`Cannot listen on ${fixed ?? "a loopback port"}: ${(e as NodeJS.ErrnoException).code ?? "error"}.`)));
+    server.listen(port, host, resolve);
+  });
+  const bound = (server.address() as AddressInfo).port;
   return {
-    redirectUri: `http://127.0.0.1:${port}/callback`,
-    mismatchUri: `http://127.0.0.1:${port}/callback-mismatch`,
-    result,
+    redirectUri: fixed ?? `http://127.0.0.1:${bound}/callback`,
+    expect: (state) =>
+      new Promise<CallbackParams>((resolve) => {
+        waiting = { state, resolve };
+      }),
     close: () =>
       new Promise<void>((resolve) => {
         server.closeAllConnections();
@@ -121,76 +204,203 @@ function observation(checkId: string, target: string, status: Observation["statu
   return { ...makeFinding(checkId, target, status, message, evidence, inferred), source: "login", observedAt: new Date().toISOString() };
 }
 
-function scopesFor(d: DiscoveryResult): string | undefined {
-  const fromChallenge = /scope="([^"]+)"/i.exec(d.challenge.wwwAuthenticate ?? "")?.[1];
-  const scopes = new Set((fromChallenge ?? d.prm?.metadata.scopes_supported?.join(" ") ?? "").split(/\s+/).filter(Boolean));
-  // Ask for a refresh token where the server models it as a scope.
-  const asScopes = d.as?.metadata["scopes_supported"];
-  if (Array.isArray(asScopes) && asScopes.includes("offline_access")) scopes.add("offline_access");
-  return scopes.size > 0 ? [...scopes].join(" ") : undefined;
+const isLoopbackRedirect = (uri: string): boolean => {
+  try {
+    const u = new URL(uri);
+    return u.protocol === "http:" && ["127.0.0.1", "[::1]", "localhost"].includes(u.hostname);
+  } catch {
+    return false;
+  }
+};
+
+export interface BeginLoginOptions {
+  http: HttpClient;
+  mcpUrl: string;
+  discovery: DiscoveryResult;
+  /** Where the authorization server sends the user back. The caller serves it (a web application), or `login` listens on it. */
+  redirectUri: string;
+  client?: ClientConfig;
+  log?: (line: string) => void;
 }
 
-export async function login(opts: LoginOptions): Promise<LoginResult> {
-  const { http, discovery: d } = opts;
-  const log = opts.log ?? (() => undefined);
+/**
+ * First half of a login, without any listener: obtain a client, record what
+ * the second half must check, and build the authorization URL. The client is
+ * chosen in the order the MCP specification gives: the one supplied
+ * (pre-registered, or a client ID metadata document URL), otherwise dynamic
+ * client registration when the server still offers it.
+ */
+export async function beginLogin(o: BeginLoginOptions): Promise<{ authorizationUrl: string; state: LoginState; notes: string[] }> {
+  const { http, discovery: d } = o;
+  const log = o.log ?? (() => undefined);
+  const notes: string[] = [];
   const meta = d.as?.metadata;
-  const target = opts.mcpUrl;
+  const target = new URL(o.mcpUrl).toString();
   const issuer = typeof meta?.issuer === "string" ? meta.issuer : null;
   const authorizationEndpoint = typeof meta?.authorization_endpoint === "string" ? meta.authorization_endpoint : null;
   const tokenEndpoint = typeof meta?.token_endpoint === "string" ? meta.token_endpoint : null;
   const registrationEndpoint = typeof meta?.registration_endpoint === "string" ? meta.registration_endpoint : null;
   if (!authorizationEndpoint || !tokenEndpoint) throw new LoginError("The authorization server does not advertise authorization and token endpoints.");
-  if (!registrationEndpoint) throw new LoginError("The authorization server does not offer dynamic client registration; pre-registered clients are not supported yet.");
 
   const authUrl = new URL(authorizationEndpoint);
   if (authUrl.protocol !== "https:" && !http.allowPrivate) throw new LoginError("Refusing to open a non-https authorization endpoint.");
   const methods = meta?.code_challenge_methods_supported;
   if (Array.isArray(methods) && !methods.includes("S256")) throw new LoginError("The authorization server does not support PKCE S256.");
+  if (!Array.isArray(methods)) notes.push("The authorization server does not announce code_challenge_methods_supported. The MCP specification tells clients to refuse to proceed; the login goes on with S256, to observe what the server enforces.");
+  try {
+    new URL(o.redirectUri);
+  } catch {
+    throw new LoginError("The redirect URI is not a valid URL.");
+  }
+
+  let clientId: string;
+  let clientSecret: string | undefined;
+  let clientSource: LoginState["clientSource"];
+  let registered: LoginState["registered"];
+  if (o.client) {
+    clientId = o.client.clientId;
+    clientSecret = o.client.clientSecret;
+    const isUrl = /^https:\/\/[^/]+\/.+/.test(clientId);
+    clientSource = isUrl ? "metadata-document" : "pre-registered";
+    if (isUrl && meta?.client_id_metadata_document_supported !== true) {
+      notes.push("The client ID is a URL (a client ID metadata document), but the authorization server does not announce client_id_metadata_document_supported: it may refuse it.");
+    }
+    log(`Using the supplied client ${safeText(clientId, 120)} (${isUrl ? "client ID metadata document" : "pre-registered"}).`);
+  } else if (registrationEndpoint) {
+    // Dynamic registration is deprecated by MCP 2026-07-28 but still the only way on many servers.
+    const grantTypes = ["authorization_code", "refresh_token"];
+    const applicationType = isLoopbackRedirect(o.redirectUri) ? "native" : "web";
+    const reg = await registerClient(http, registrationEndpoint, [o.redirectUri], { clientName: "mcp-authprobe test login", grantTypes, applicationType });
+    if (!reg.client) throw new LoginError(`Dynamic client registration failed (HTTP ${reg.status}${reg.error ? `, error=${safeText(reg.error, 80)}` : ""}).`);
+    clientId = reg.client.clientId;
+    clientSecret = reg.client.clientSecret ?? undefined;
+    clientSource = "dynamic-registration";
+    registered = { registrationClientUri: reg.client.registrationClientUri, registrationAccessToken: reg.client.registrationAccessToken };
+    log(`Registered test client ${safeText(clientId, 120)}.`);
+  } else {
+    throw new LoginError(
+      meta?.client_id_metadata_document_supported === true
+        ? "The authorization server offers no dynamic client registration. It accepts client ID metadata documents: pass the URL of yours with --client-id (and its redirect URI with --redirect-uri), or a pre-registered client."
+        : "The authorization server offers no dynamic client registration: pass a pre-registered client with --client-id (and --client-secret-file for a confidential client, --redirect-uri for its redirect URI).",
+    );
+  }
 
   const state = randomBytes(24).toString("base64url");
-  const verifier = randomBytes(32).toString("base64url");
-  const challenge = createHash("sha256").update(verifier).digest("base64url");
-  const listener = await startCallbackListener(state);
+  const codeVerifier = randomBytes(32).toString("base64url");
+  registerSecret(codeVerifier);
+  registerSecret(clientSecret);
+  const resource = d.prm?.metadata.resource ?? target;
+  const scope = scopesFor(d);
+  authUrl.searchParams.set("response_type", "code");
+  authUrl.searchParams.set("client_id", clientId);
+  authUrl.searchParams.set("redirect_uri", o.redirectUri);
+  authUrl.searchParams.set("state", state);
+  authUrl.searchParams.set("code_challenge", createHash("sha256").update(codeVerifier).digest("base64url"));
+  authUrl.searchParams.set("code_challenge_method", "S256");
+  authUrl.searchParams.set("resource", resource);
+  if (scope) authUrl.searchParams.set("scope", scope);
+
+  const loginState: LoginState = {
+    version: 1,
+    target,
+    issuer,
+    issParameterSupported: meta?.["authorization_response_iss_parameter_supported"] === true,
+    authorizationEndpoint,
+    tokenEndpoint,
+    registrationEndpoint,
+    clientId,
+    authMethod: o.client?.authMethod ?? (clientSecret ? "client_secret_post" : "none"),
+    clientSource,
+    redirectUri: o.redirectUri,
+    state,
+    codeVerifier,
+    resource,
+    createdAt: new Date().toISOString(),
+  };
+  if (clientSecret) loginState.clientSecret = clientSecret;
+  if (registered) loginState.registered = registered;
+  if (scope) loginState.scope = scope;
+  return { authorizationUrl: authUrl.toString(), state: loginState, notes };
+}
+
+/** Check that an object read from a state file is a login state (it comes from disk: nothing is trusted). */
+export function parseLoginState(raw: unknown): LoginState {
+  const o = raw as Partial<LoginState> | null;
+  const str = (k: keyof LoginState): boolean => typeof o?.[k] === "string" && (o[k] as string).length > 0;
+  if (!o || typeof o !== "object" || o.version !== 1 || !["target", "authorizationEndpoint", "tokenEndpoint", "clientId", "redirectUri", "state", "codeVerifier", "resource"].every((k) => str(k as keyof LoginState))) {
+    throw new LoginError("The state file is not a login state written by `login begin`.");
+  }
+  for (const k of ["target", "authorizationEndpoint", "tokenEndpoint", "redirectUri"] as const) {
+    try {
+      new URL(o[k] as string);
+    } catch {
+      throw new LoginError(`The state file holds an invalid ${k}.`);
+    }
+  }
+  registerSecret(o.codeVerifier);
+  registerSecret(o.clientSecret);
+  registerSecret(o.registered?.registrationAccessToken);
+  return o as LoginState;
+}
+
+function callbackParams(callback: string | URLSearchParams): CallbackParams {
+  let q: URLSearchParams;
+  if (typeof callback === "string") {
+    try {
+      q = new URL(callback).searchParams;
+    } catch {
+      // A bare query string ("code=…&state=…") is accepted too.
+      q = new URLSearchParams(callback.replace(/^\?/, ""));
+    }
+  } else {
+    q = callback;
+  }
+  return { state: q.get("state"), code: q.get("code"), error: q.get("error"), iss: q.get("iss") };
+}
+
+export interface CompleteLoginOptions {
+  http: HttpClient;
+  state: LoginState;
+  /** The URL the authorization server sent the user back to (or its query string, or its parameters). */
+  callback: string | URLSearchParams;
+  /** Run the login checks. Only set when ownership of every contacted host is proven. */
+  probe: boolean;
+  /** Pre-exchange checks to run (default MAP-PKC01 then MAP-RDR03). */
+  preProbes?: readonly string[];
+  /** Run the checks that follow the exchange (endpoint checks, MAP-AUD01, MAP-COD01). Default true. */
+  postProbes?: boolean;
+  /** MCP era to speak to the endpoint instead of detecting it. */
+  era?: Era;
+  log?: (line: string) => void;
+}
+
+/**
+ * Second half of a login: validate the authorization response (state, then
+ * the RFC 9207 issuer, before anything else is read from it), run the login
+ * checks when asked, exchange the code and return the grant.
+ */
+export async function completeLogin(o: CompleteLoginOptions): Promise<LoginResult> {
+  const { http, state: st } = o;
+  const target = st.target;
+  const tokenEndpoint = st.tokenEndpoint;
   const notes: string[] = [];
   const observations: Observation[] = [];
-  let registered: RegisteredClient | null = null;
-  let keepClient = false;
+  let keepClient = st.clientSource !== "dynamic-registration"; // only a client this login registered is ever deleted
+  const cb = callbackParams(o.callback);
 
   try {
-    const reg = await registerClient(http, registrationEndpoint, [listener.redirectUri], {
-      clientName: "mcp-authprobe test login",
-      grantTypes: ["authorization_code", "refresh_token"],
-    });
-    if (!reg.client) throw new LoginError(`Dynamic client registration failed (HTTP ${reg.status}${reg.error ? `, error=${safeText(reg.error, 80)}` : ""}).`);
-    const client = reg.client;
-    registered = client;
-    log(`Registered test client ${safeText(client.clientId, 120)}.`);
-
-    authUrl.searchParams.set("response_type", "code");
-    authUrl.searchParams.set("client_id", client.clientId);
-    authUrl.searchParams.set("redirect_uri", listener.redirectUri);
-    authUrl.searchParams.set("state", state);
-    authUrl.searchParams.set("code_challenge", challenge);
-    authUrl.searchParams.set("code_challenge_method", "S256");
-    const resource = d.prm?.metadata.resource ?? target;
-    authUrl.searchParams.set("resource", resource);
-    const scope = scopesFor(d);
-    if (scope) authUrl.searchParams.set("scope", scope);
-
-    log("Opening the authorization page. Log in with your dedicated TEST account.");
-    await opts.openUrl(authUrl.toString());
-    const cb = await withTimeout(listener.result, opts.timeoutMs ?? 5 * 60_000, "Timed out waiting for the authorization response.");
-
-    if (cb.error) throw new LoginError(`The authorization server returned error=${safeText(cb.error, 80)}.`);
+    if (cb.state === null || !equalStrings(cb.state, st.state)) throw new LoginError("The authorization response does not carry the expected state; it was not used.");
+    // RFC 9207, as the MCP specification applies it: the issuer is checked before the code is sent anywhere,
+    // and before an error is acted on or shown (an attacker's server must not get its message displayed).
+    if (cb.iss !== null && st.issuer !== null && cb.iss !== st.issuer) throw new LoginError("The iss parameter does not match the discovered issuer; aborting.");
+    if (cb.iss === null && st.issParameterSupported) throw new LoginError("The server announces the iss parameter but the response has none; aborting.");
+    if (cb.error) throw new LoginError(`The authorization server returned error=${safeText(safeErrorCode(cb.error) ?? "", 80)}.`);
     if (!cb.code) throw new LoginError("The authorization response carried no code.");
-    // RFC 9207: reject a response from another issuer (mix-up attacks).
-    if (cb.iss !== null && issuer !== null && cb.iss !== issuer) throw new LoginError("The iss parameter does not match the discovered issuer; aborting.");
-    if (cb.iss === null && meta?.["authorization_response_iss_parameter_supported"] === true) {
-      throw new LoginError("The server announces the iss parameter but the response has none; aborting.");
-    }
 
-    const exchangeParams = { clientId: client.clientId, clientSecret: client.clientSecret, code: cb.code, resource };
-    const correct = { ...exchangeParams, codeVerifier: verifier, redirectUri: listener.redirectUri };
+    const exchangeParams = { clientId: st.clientId, clientSecret: st.clientSecret ?? null, code: cb.code, resource: st.resource };
+    const correct = { ...exchangeParams, codeVerifier: st.codeVerifier, redirectUri: st.redirectUri };
+    const mismatch = new URL(st.redirectUri);
+    mismatch.pathname = `${mismatch.pathname.replace(/\/$/, "")}-mismatch`;
     let tokens: CodeExchangeOutcome | null = null;
     let tokensFromProbe = false;
 
@@ -198,25 +408,27 @@ export async function login(opts: LoginOptions): Promise<LoginResult> {
     type Verdict = "accepted" | "refused" | "inconclusive" | "not_run";
     interface ProbeResult { checkId: string; label: string; verdict: Verdict; line: string }
     const results: ProbeResult[] = [];
-    const classify = (o: CodeExchangeOutcome): Verdict =>
-      o.accessTokenIssued ? "accepted" : o.status >= 400 && o.status < 500 && !o.throttled ? "refused" : "inconclusive";
+    const classify = (r: CodeExchangeOutcome): Verdict =>
+      r.accessTokenIssued ? "accepted" : r.status >= 400 && r.status < 500 && !r.throttled ? "refused" : "inconclusive";
 
-    if (opts.probe) {
-      const preProbes: Array<{ checkId: string; label: string; params: Parameters<typeof exchangeCode>[2] }> = [
-        { checkId: "MAP-PKC01", label: "code presented without a code_verifier (PKCE)", params: { ...exchangeParams, redirectUri: listener.redirectUri } },
+    if (o.probe) {
+      const all: Array<{ checkId: string; label: string; params: Parameters<typeof exchangeCode>[2] }> = [
+        { checkId: "MAP-PKC01", label: "code presented without a code_verifier (PKCE)", params: { ...exchangeParams, redirectUri: st.redirectUri } },
         { checkId: "MAP-PKC01", label: "code presented with a wrong code_verifier (PKCE)", params: { ...correct, codeVerifier: randomBytes(32).toString("base64url") } },
-        { checkId: "MAP-RDR03", label: "code presented with a different redirect_uri", params: { ...correct, redirectUri: listener.mismatchUri } },
+        { checkId: "MAP-RDR03", label: "code presented with a different redirect_uri", params: { ...correct, redirectUri: mismatch.toString() } },
       ];
+      const order = o.preProbes ?? ["MAP-PKC01", "MAP-RDR03"];
+      const preProbes = order.flatMap((id) => all.filter((p) => p.checkId === id));
       for (const p of preProbes) {
         if (tokens) {
           results.push({ checkId: p.checkId, label: p.label, verdict: "not_run", line: `${p.label}: not run, the code was already exchanged` });
           continue;
         }
-        const o = await exchangeCode(http, tokenEndpoint, p.params);
-        const verdict = classify(o);
-        results.push({ checkId: p.checkId, label: p.label, verdict, line: `${p.label}: ${describeOutcome(o)}` });
+        const r = await exchangeCode(http, tokenEndpoint, p.params);
+        const verdict = classify(r);
+        results.push({ checkId: p.checkId, label: p.label, verdict, line: `${p.label}: ${describeOutcome(r)}` });
         if (verdict === "accepted") {
-          tokens = o; // the code is spent; keep these tokens as the grant
+          tokens = r; // the code is spent; keep these tokens as the grant
           tokensFromProbe = true;
         }
       }
@@ -230,9 +442,9 @@ export async function login(opts: LoginOptions): Promise<LoginResult> {
     if (!tokens) {
       tokens = await exchangeCode(http, tokenEndpoint, correct);
       if (!tokens.accessTokenIssued) {
-        if (opts.probe && tokens.error === "invalid_grant") {
+        if (o.probe && tokens.error === "invalid_grant" && results.length > 0) {
           codeBurnt = true;
-        } else if (opts.probe && results.some((r) => r.verdict !== "not_run")) {
+        } else if (o.probe && results.some((r) => r.verdict !== "not_run")) {
           // Keep what the probes observed; only the first refusal is trusted.
           codeBurnt = true;
           exchangeFailure = safeText(describeOutcome(tokens), 200);
@@ -267,7 +479,7 @@ export async function login(opts: LoginOptions): Promise<LoginResult> {
       const rs = results.filter((r) => r.checkId === checkId && r.verdict !== "not_run");
       const lines = results.filter((r) => r.checkId === checkId).map((r) => r.line);
       if (rs.length === 0) {
-        if (lines.length > 0) observations.push(observation(checkId, target, "skipped", "Not observed: an earlier probe already obtained tokens with this code (see the other login checks).", lines));
+        if (lines.length > 0) observations.push(observation(checkId, target, "skipped", "Not observed: an earlier probe already obtained tokens with this code (see the other login checks). `login --rounds 2` gives this check a code of its own.", lines));
         continue;
       }
       const msg = PRE_MESSAGES[checkId] as { pass: string; fail: string };
@@ -282,34 +494,89 @@ export async function login(opts: LoginOptions): Promise<LoginResult> {
           ? `The code exchange failed after the probes (${exchangeFailure}); only the first refusal is trusted. The results are saved; run login again with --no-probe --force --out <same file> to obtain a test grant.`
           : "The server invalidated the code after the first refused attempt (a strict, acceptable behaviour). The results are saved; run login again with --no-probe --force --out <same file> to obtain a test grant.",
       );
-      return { grant: null, observations, notes };
+      return { grant: null, observations, notes, clientSource: st.clientSource };
     }
     // Without a refresh token there is no grant, but the checks that only need
     // the access token (ORG01, COD01) still run.
     const grant: TestGrant | null = tokens.refreshToken ? {
-      clientId: client.clientId,
+      clientId: st.clientId,
       refreshToken: tokens.refreshToken,
-      authMethod: client.clientSecret ? "client_secret_post" : "none",
+      authMethod: st.authMethod,
       // Bind the grant to where it came from: scans of other targets will not use it.
       target: new URL(target).toString(),
       tokenEndpoint: new URL(tokenEndpoint).toString(),
     } : null;
-    if (grant && client.clientSecret) grant.clientSecret = client.clientSecret;
+    if (grant && st.clientSecret) grant.clientSecret = st.clientSecret;
 
-    if (opts.probe) {
-      await postExchangeProbes({ http, target, tokenEndpoint, grant, tokens, correct, tokensFromProbe, observations, notes, results, resource });
-      if (notes.some((n) => n.startsWith(REVOKED_NOTE))) return { grant: null, observations, notes };
+    if (o.probe && o.postProbes !== false) {
+      await postExchangeProbes({ http, target, tokenEndpoint, grant, tokens, correct, tokensFromProbe, observations, notes, results, resource: st.resource, ...(o.era ? { era: o.era } : {}) });
+      if (notes.some((n) => n.startsWith(REVOKED_NOTE))) return { grant: null, observations, notes, clientSource: st.clientSource };
     }
     if (!grant) {
       notes.push("Login succeeded but no refresh token was issued; the refresh token checks cannot run with this server configuration.");
-      return { grant: null, observations, notes };
+      return { grant: null, observations, notes, accessToken: tokens.accessToken, clientSource: st.clientSource };
     }
     keepClient = true; // the grant belongs to this client
-    return { grant, observations, notes };
+    return { grant, observations, notes, accessToken: tokens.accessToken, clientSource: st.clientSource };
+  } finally {
+    // Without a usable grant, a client this login registered is useless: remove it when possible.
+    if (!keepClient && st.registered && st.registrationEndpoint) {
+      await deleteClient(http, { clientId: st.clientId, clientSecret: null, redirectUris: [st.redirectUri], ...st.registered }, st.registrationEndpoint);
+    }
+  }
+}
+
+/**
+ * Interactive login of a native client: a loopback listener, `beginLogin`,
+ * the user's browser, then `completeLogin`.
+ */
+export async function login(opts: LoginOptions): Promise<LoginResult> {
+  const log = opts.log ?? (() => undefined);
+  const listener = await startCallbackListener(opts.redirectUri);
+  const base = { http: opts.http, mcpUrl: opts.mcpUrl, discovery: opts.discovery, redirectUri: listener.redirectUri, log };
+  const wait = opts.timeoutMs ?? 5 * 60_000;
+  let begun: Awaited<ReturnType<typeof beginLogin>> | null = null;
+  let finished = false;
+  try {
+    begun = await beginLogin({ ...base, ...(opts.client ? { client: opts.client } : {}) });
+    log("Opening the authorization page. Log in with your dedicated TEST account.");
+    const first = listener.expect(begun.state.state);
+    await opts.openUrl(begun.authorizationUrl);
+    const cb = await withTimeout(first, wait, "Timed out waiting for the authorization response.");
+    finished = true; // from here on, completeLogin owns the cleanup of the client
+    const params = new URLSearchParams();
+    for (const [k, v] of Object.entries(cb)) if (v !== null) params.set(k, v);
+    const result = await completeLogin({ http: opts.http, state: begun.state, callback: params, probe: opts.probe, log });
+    result.notes.unshift(...begun.notes);
+
+    // A probe that obtained tokens spent the code before MAP-RDR03 could be observed: a second code settles it.
+    const unobserved = result.observations.find((x) => x.checkId === "MAP-RDR03" && x.status === "skipped");
+    if (opts.probe && unobserved && (opts.rounds ?? 1) >= 2) {
+      log("Second authorization, to observe MAP-RDR03 with a code of its own.");
+      // The same client: the redirect URI is the one it was registered with.
+      const client: ClientConfig = { clientId: begun.state.clientId, authMethod: begun.state.authMethod, ...(begun.state.clientSecret ? { clientSecret: begun.state.clientSecret } : {}) };
+      const second = await beginLogin({ ...base, client });
+      const again = listener.expect(second.state.state);
+      await opts.openUrl(second.authorizationUrl);
+      const cb2 = await withTimeout(again, wait, "Timed out waiting for the second authorization response.");
+      const params2 = new URLSearchParams();
+      for (const [k, v] of Object.entries(cb2)) if (v !== null) params2.set(k, v);
+      const round2 = await completeLogin({ http: opts.http, state: second.state, callback: params2, probe: true, preProbes: ["MAP-RDR03"], postProbes: false, log });
+      const rdr03 = round2.observations.find((x) => x.checkId === "MAP-RDR03");
+      if (rdr03) {
+        rdr03.evidence.push("observed with a second authorization code (--rounds 2)");
+        result.observations.splice(result.observations.indexOf(unobserved), 1, rdr03);
+      }
+      // The newest tokens are the grant, unless the first round already lost it on purpose (revoked after a code reuse).
+      if (round2.grant && result.grant) result.grant = round2.grant;
+    }
+    return result;
   } finally {
     await listener.close();
-    // Without a usable grant the client is useless: remove it when possible.
-    if (registered && !keepClient) await deleteClient(http, registered, registrationEndpoint);
+    // The user never came back: the client registered for this login is of no use.
+    if (begun && !finished && begun.state.registered && begun.state.registrationEndpoint) {
+      await deleteClient(opts.http, { clientId: begun.state.clientId, clientSecret: null, redirectUris: [begun.state.redirectUri], ...begun.state.registered }, begun.state.registrationEndpoint);
+    }
   }
 }
 
@@ -352,6 +619,7 @@ interface PostExchange {
   results: Array<{ checkId: string }>;
   /** The RFC 8707 resource the tokens were requested for. */
   resource?: string;
+  era?: Era;
 }
 
 const is2xx = (s: number | null): s is number => s !== null && s >= 200 && s < 300;
@@ -376,10 +644,12 @@ async function postExchangeProbes(c: PostExchange): Promise<void> {
   // Checks of the MCP endpoint with the access token, before any refresh
   // (a refresh may invalidate it): ORG01, TOK01, SES01, BAT01, BOD01, INJ01.
   let control: number | null = null;
+  let era: Era | undefined = c.era;
   const accessToken = tokens.accessToken;
   if (accessToken) {
-    const ep = await runEndpointChecks(http, target, bearerCredential(accessToken));
+    const ep = await runEndpointChecks(http, target, bearerCredential(accessToken), c.era ? { era: c.era } : {});
     control = ep.control;
+    if (ep.era) era = ep.era;
     for (const f of ep.findings) observations.push({ ...f, source: "login", observedAt: new Date().toISOString() });
   } else {
     for (const id of ["MAP-ORG01", "MAP-TOK01", "MAP-SES01", "MAP-BAT01", "MAP-BOD01", "MAP-INJ01"]) {
@@ -388,7 +658,7 @@ async function postExchangeProbes(c: PostExchange): Promise<void> {
   }
 
   await guard("MAP-AUD01", async () => {
-    const f = await runAudienceCheck({ http, target, tokenEndpoint, grant, control, ...(c.resource ? { ownAudiences: [c.resource] } : {}) });
+    const f = await runAudienceCheck({ http, target, tokenEndpoint, grant, control, ...(era ? { era } : {}), ...(c.resource ? { ownAudiences: [c.resource] } : {}) });
     observations.push({ ...f, source: "login", observedAt: new Date().toISOString() });
   });
 
@@ -419,7 +689,7 @@ async function postExchangeProbes(c: PostExchange): Promise<void> {
     // Were the tokens issued from that code revoked? (recommended)
     if (!grant) {
       // No refresh token: look at the access token instead.
-      const st = accessToken ? await initializeStatus(http, target, { token: accessToken }) : null;
+      const st = accessToken ? await initializeStatus(http, target, { token: accessToken, ...(era ? { era } : {}) }) : null;
       lines.push(`access token after the reuse attempt: ${st === null ? "not available" : `HTTP ${st}`}`);
       const message =
         st !== null && (st === 401 || st === 403) && is2xx(control)
@@ -430,7 +700,7 @@ async function postExchangeProbes(c: PostExchange): Promise<void> {
       observations.push(observation("MAP-COD01", target, "pass", message, lines));
       return;
     }
-    const after = await refresh(http, tokenEndpoint, grant, grant.refreshToken);
+    const after = await refresh(http, tokenEndpoint, grant, grant.refreshToken, c.resource);
     if (after.accessTokenIssued) {
       if (after.refreshToken) grant.refreshToken = after.refreshToken;
       lines.push("newest refresh token after the reuse attempt: still valid");

@@ -11,7 +11,7 @@ export function checksTable(): string {
   return [
     "| ID | Severity | Mode | Runs with | Check |",
     "| --- | --- | --- | --- | --- |",
-    ...CATALOGUE.map((c) => `| \`${c.id}\` | ${c.severity} | ${c.active ? "active" : "passive"} | ${c.runsWith} | ${c.title} |`),
+    ...CATALOGUE.map((c) => `| \`${c.id}\` | ${c.severity} | ${c.active ? "active" : "passive"} | ${c.runsWith} | ${c.title}${c.appliesTo.length === 1 ? ` (MCP ${c.appliesTo[0]} only)` : ""} |`),
   ].join("\n");
 }
 

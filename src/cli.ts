@@ -17,7 +17,7 @@ import { toMarkdown } from "./report/markdown.js";
 import { toSarif } from "./report/sarif.js";
 import { colorWanted, toTable } from "./report/table.js";
 import { runScan, type ScanEvent } from "./scan.js";
-import { readSecretLine, SecretFileError } from "./secret-file.js";
+import { readSecretFile, readSecretLine, SecretFileError } from "./secret-file.js";
 import { parseSelection, resolveChecks } from "./selection.js";
 import { loadAccessTokenFile, loadBearerFile } from "./static-key.js";
 import { loadPostureReport, postureSection, type LoadedPosture } from "./posture.js";
@@ -43,6 +43,10 @@ Usage:
   ${TOOL_NAME} capabilities [--json]       What this version supports (for programs)
   ${TOOL_NAME} checks show <id>            Explain one check
   ${TOOL_NAME} login <mcp-url> --out <file> Log in with a test account and save a test grant
+  ${TOOL_NAME} login begin <mcp-url> --state-file <file> --redirect-uri <uri>
+  ${TOOL_NAME} login complete --state-file <file> --callback-file <file> --out <file>
+                                           The same login in two steps, for an application
+                                           that receives the redirect itself (no listener)
   ${TOOL_NAME} consent-check <mcp-url>     MAP-CSR01: consent CSRF, in a real browser
   ${TOOL_NAME} mcp                         Run as an MCP server over stdio
   ${TOOL_NAME} lab [--profile <name>] [--port 8787]
@@ -92,6 +96,16 @@ Scan options:
   --rate-attempts <n>   Requests sent by MAP-THR02 with the key (10-100, default 30)
   --fail-on-inconclusive <true|false>
                         Exit 3 when a check is inconclusive (default: true)
+  --protocol <era>      MCP revision to speak: auto (default: 2026-07-28 first, then
+                        the initialize handshake of 2025-11-25), modern or legacy
+  --client-id <id>      Use this OAuth client instead of dynamic registration: a
+                        pre-registered client, or the https URL of a client ID
+                        metadata document
+  --client-secret-file <file>
+                        Its secret, for a confidential client (one line, mode 600)
+  --redirect-uri <uri>  One of its registered redirect URIs (MAP-RDR01, MAP-RDR02)
+  --issuer <url>        Examine this authorization server when the resource
+                        announces several (default: the first one)
   --wait-on-rate-limit <seconds>
                         When the credential is rate limited and the server gives a
                         Retry-After of at most this long, wait once and go on
@@ -102,6 +116,9 @@ Scan options:
                         end) to this file; "-" writes them to standard error
 
 Consent check options (needs the optional playwright-core package and Chrome or Edge):
+  --client-id, --redirect-uri
+                        A pre-registered client and its loopback redirect URI,
+                        instead of dynamic registration
   --browser <channel>   chrome (default), msedge or chromium
   --browser-path <exe>  Use this browser executable instead
   --json, --sarif, --markdown, --fail-on, --allow-private, --secret-file  as for scan
@@ -114,6 +131,20 @@ Login options:
                         ${LOGIN_CHECK_IDS.slice(5).map((id) => id.slice(4)).join(", ")})
   --no-browser          Print the authorization URL instead of opening a browser
   --json <file>         Write the login results as a report, without any token
+  --client-id, --client-secret-file
+                        A pre-registered client (or client ID metadata document URL)
+                        instead of dynamic registration
+  --redirect-uri <uri>  Loopback redirect URI to listen on, for a client whose
+                        redirect URI is fixed (http://127.0.0.1:<port>/callback);
+                        with "login begin", the redirect URI of your application
+  --rounds <n>          1 (default) or 2: a second authorization gives MAP-RDR03 a
+                        code of its own when a probe spent the first one
+  --state-file <file>   login begin writes it (mode 600), login complete reads it
+  --callback-file <file>
+                        File holding the URL the user was sent back to (or its query
+                        string). --callback-url <url> takes it from the command
+                        line, where other local users can see the code
+  --protocol, --issuer  as for scan
   --allow-private, --secret-file, --timeout  as for scan
 
 Lab options:
@@ -154,6 +185,38 @@ function readSecret(secretFile: string | undefined): string | undefined {
   return value;
 }
 
+/** --client-id, --client-secret-file and --redirect-uri, or a message for a usage error. */
+function clientOptions(values: Values): { client?: { clientId: string; clientSecret?: string; redirectUri?: string }; error?: string } {
+  const id = values["client-id"];
+  const redirectUri = values["redirect-uri"];
+  if (values["client-secret-file"] && !id) return { error: "--client-secret-file needs --client-id" };
+  if (redirectUri !== undefined) {
+    try {
+      const u = new URL(redirectUri);
+      if (u.hash) return { error: "--redirect-uri must not contain a fragment" };
+    } catch {
+      return { error: "--redirect-uri is not a valid URL" };
+    }
+  }
+  if (!id) return {};
+  if (/[\s\u0000-\u001f]/.test(id) || id.length > 2048) return { error: "--client-id is not a valid client identifier" };
+  const client: { clientId: string; clientSecret?: string; redirectUri?: string } = { clientId: id };
+  if (values["client-secret-file"]) {
+    const loaded = readSecretLine(values["client-secret-file"], { label: "client secret file", maxBytes: 8 * 1024 });
+    for (const w of loaded.warnings) err(`warning: ${w}\n`);
+    registerSecret(loaded.value);
+    client.clientSecret = loaded.value;
+  }
+  if (redirectUri !== undefined) client.redirectUri = redirectUri;
+  return { client };
+}
+
+/** --protocol as an era, undefined for auto, or null when invalid. */
+function parseProtocol(value: string | undefined): "legacy" | "modern" | undefined | null {
+  if (value === undefined || value === "auto") return undefined;
+  return value === "legacy" || value === "modern" ? value : null;
+}
+
 /** A non-negative number option, undefined when absent, or null when invalid. */
 function parseNumber(value: string | undefined, o: { min?: number; max?: number; integer?: boolean } = {}): number | undefined | null {
   if (value === undefined) return undefined;
@@ -168,12 +231,14 @@ export function capabilities(): Record<string, unknown> {
     tool: TOOL_NAME,
     version: TOOL_VERSION,
     reportSchema: REPORT_SCHEMA,
-    mcpProtocol: { eras: ["legacy"], versions: ["2025-11-25"] },
+    mcpProtocol: { eras: ["modern", "legacy"], versions: ["2026-07-28", "2025-11-25"], detection: "auto" },
+    clientRegistration: ["pre-registered", "metadata-document", "dynamic-registration"],
     checks: CATALOGUE.map((c) => c.id),
     reasonCodes: REASON_CODES,
     exitCodes: EXIT,
     labProfiles: Object.keys(LAB_PROFILES),
-    credentials: ["bearer-file", "access-token-file", "credentials-file"],
+    credentials: ["bearer-file", "access-token-file", "credentials-file", "client-id", "client-secret-file"],
+    login: ["interactive", "begin", "complete"],
     reports: ["json", "sarif", "markdown", "events"],
   };
 }
@@ -235,6 +300,16 @@ const CLI_OPTIONS = {
       json: { type: "string" },
       quiet: { type: "boolean", default: false },
       "auto-approve": { type: "boolean", default: false },
+      "client-id": { type: "string" },
+      "client-secret-file": { type: "string" },
+      "redirect-uri": { type: "string" },
+      protocol: { type: "string" },
+      issuer: { type: "string" },
+      rounds: { type: "string" },
+      "state-file": { type: "string" },
+      "callback-url": { type: "string" },
+      "callback-file": { type: "string" },
+      "keep-state": { type: "boolean", default: false },
       "credentials-out": { type: "string" },
       rtk: { type: "string" },
       "max-observation-age": { type: "string" },
@@ -355,7 +430,7 @@ async function dispatch(command: string, sub: string | undefined, arg: string | 
         return EXIT.usage;
       }
       out(
-        `${c.id}: ${c.title}\nSeverity: ${c.severity}  Mode: ${c.active ? "active" : "passive"}  Status: ${c.availability}\n\nWhy:\n  ${c.rationale}\n\nFix:\n  ${c.remediation}\n\nReferences:\n${c.references.map((r) => `  - ${r.title}: ${r.url}`).join("\n")}\n`,
+        `${c.id}: ${c.title}\nSeverity: ${c.severity}  Mode: ${c.active ? "active" : "passive"}  Status: ${c.availability}\nApplies to: MCP ${c.appliesTo.join(", ")}\nRuns with: ${c.runsWith.replace(/`/g, "")}\n\nWhy:\n  ${c.rationale}\n\nFix:\n  ${c.remediation}\n\nReferences:\n${c.references.map((r) => `  - ${r.title}: ${r.url}`).join("\n")}\n`,
       );
       return EXIT.ok;
     }
@@ -444,6 +519,12 @@ async function dispatch(command: string, sub: string | undefined, arg: string | 
       failOn,
     };
     if (timeoutMs !== undefined) o.requestTimeoutMs = timeoutMs;
+    const supplied = clientOptions(values);
+    if (supplied.error) {
+      err(`${supplied.error}\n`);
+      return EXIT.usage;
+    }
+    if (supplied.client) o.client = supplied.client;
     if (values.browser) o.browser = values.browser;
     if (values["browser-path"]) o.browserPath = values["browser-path"];
     if (values.json) o.json = values.json;
@@ -453,34 +534,100 @@ async function dispatch(command: string, sub: string | undefined, arg: string | 
   }
 
   if (command === "login" && sub) {
+    const protocol = parseProtocol(values.protocol);
+    const timeoutMs = parseTimeout(values.timeout);
+    if (protocol === null || timeoutMs === null) {
+      err(`${protocol === null ? "--protocol must be auto, legacy or modern" : "--timeout must be a positive number of milliseconds"}\n`);
+      return EXIT.usage;
+    }
+    const supplied = clientOptions(values);
+    if (supplied.error) {
+      err(`${supplied.error}\n`);
+      return EXIT.usage;
+    }
+    const client = supplied.client ? { clientId: supplied.client.clientId, ...(supplied.client.clientSecret ? { clientSecret: supplied.client.clientSecret } : {}) } : undefined;
+    const common = {
+      allowPrivate: values["allow-private"],
+      ...(timeoutMs !== undefined ? { requestTimeoutMs: timeoutMs } : {}),
+      ...(protocol ? { protocol } : {}),
+    };
+    const { runLoginBegin, runLoginCommand, runLoginComplete } = await import("./login-command.js");
+
+    if (sub === "complete") {
+      if (!values["state-file"] || !values.out) {
+        err("login complete needs --state-file <file> and --out <file>.\n");
+        return EXIT.usage;
+      }
+      if ((values["callback-url"] === undefined) === (values["callback-file"] === undefined)) {
+        err("login complete needs the URL the user was sent back to: --callback-file <file> (preferred) or --callback-url <url>.\n");
+        return EXIT.usage;
+      }
+      // The callback carries the authorization code: read from a file, it never shows in process listings.
+      const callback = values["callback-file"] ? readSecretFile(values["callback-file"], { label: "callback file", maxBytes: 16 * 1024, followLinks: true }).text.trim() : (values["callback-url"] as string);
+      return runLoginComplete({
+        ...common,
+        stateFile: values["state-file"],
+        callback,
+        out: values.out,
+        force: values.force,
+        probe: !values["no-probe"],
+        secret: readSecret(values["secret-file"]),
+        keepState: values["keep-state"],
+        ...(values.json ? { json: values.json } : {}),
+      });
+    }
+
+    const target = sub === "begin" ? arg : sub;
+    let url: URL;
+    try {
+      url = new URL(target ?? "");
+    } catch {
+      err(`Not a URL: ${target ?? "(missing)"}\n`);
+      return EXIT.usage;
+    }
+    const problem = targetProblem(url, values["allow-private"]);
+    if (problem) {
+      err(`${problem}\n`);
+      return EXIT.usage;
+    }
+    if (sub === "begin") {
+      if (!values["state-file"] || !values["redirect-uri"]) {
+        err("login begin needs --state-file <file> and --redirect-uri <uri> (the redirect URI of your application).\n");
+        return EXIT.usage;
+      }
+      return runLoginBegin({
+        ...common,
+        mcpUrl: url.toString(),
+        stateFile: values["state-file"],
+        redirectUri: values["redirect-uri"],
+        force: values.force,
+        ...(client ? { client } : {}),
+        ...(values.issuer !== undefined ? { issuer: values.issuer } : {}),
+        print: (line) => out(`${line}\n`),
+      });
+    }
     if (!values.out) {
       err("login needs --out <file> for the test grant.\n");
       return EXIT.usage;
     }
-    let url: URL;
-    try {
-      url = new URL(sub);
-    } catch {
-      err(`Not a URL: ${sub}\n`);
+    const rounds = parseNumber(values.rounds, { min: 1, max: 2, integer: true });
+    if (rounds === null) {
+      err("--rounds must be 1 or 2\n");
       return EXIT.usage;
     }
-    const problem = targetProblem(url, values["allow-private"]);
-    const timeoutMs = parseTimeout(values.timeout);
-    if (problem || timeoutMs === null) {
-      err(`${problem ?? "--timeout must be a positive number of milliseconds"}\n`);
-      return EXIT.usage;
-    }
-    const { runLoginCommand } = await import("./login-command.js");
     return runLoginCommand({
-      ...(timeoutMs !== undefined ? { requestTimeoutMs: timeoutMs } : {}),
+      ...common,
       mcpUrl: url.toString(),
       out: values.out,
       ...(values.json ? { json: values.json } : {}),
       force: values.force,
       probe: !values["no-probe"],
       browser: !values["no-browser"],
-      allowPrivate: values["allow-private"],
       secret: readSecret(values["secret-file"]),
+      ...(client ? { client } : {}),
+      ...(values["redirect-uri"] ? { redirectUri: values["redirect-uri"] } : {}),
+      ...(rounds !== undefined ? { rounds } : {}),
+      ...(values.issuer !== undefined ? { issuer: values.issuer } : {}),
     });
   }
 
@@ -525,6 +672,19 @@ async function dispatch(command: string, sub: string | undefined, arg: string | 
       err(`${(e as Error).message}\n`);
       return EXIT.usage;
     }
+    const protocol = parseProtocol(values.protocol);
+    if (protocol === null) {
+      err("--protocol must be auto, legacy or modern\n");
+      return EXIT.usage;
+    }
+    if (protocol) options.protocol = protocol;
+    if (values.issuer !== undefined) options.issuer = values.issuer;
+    const supplied = clientOptions(values);
+    if (supplied.error) {
+      err(`${supplied.error}\n`);
+      return EXIT.usage;
+    }
+    if (supplied.client) options.client = supplied.client;
     const rtk = values.rtk ?? "destructive";
     if (!["destructive", "rotate-only", "off"].includes(rtk)) {
       err("--rtk must be destructive, rotate-only or off\n");

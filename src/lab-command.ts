@@ -58,9 +58,10 @@ Client ID: ${LAB_CLIENT.clientId}
 Redirect URIs: ${LAB_CLIENT.redirectUris.join(", ")}
 
 Try it, in another terminal:
-  npx mcp-authprobe scan ${url} --allow-private --client-id ${LAB_CLIENT.clientId}
   npx mcp-authprobe login ${url} --allow-private --client-id ${LAB_CLIENT.clientId} --redirect-uri ${LAB_CLIENT.redirectUris[2]} --out lab-grant.json
-  npx mcp-authprobe scan ${url} --allow-private --client-id ${LAB_CLIENT.clientId} --credentials-file lab-grant.json
+  npx mcp-authprobe scan ${url} --allow-private --client-id ${LAB_CLIENT.clientId} --redirect-uri ${LAB_CLIENT.redirectUris[0]} --credentials-file lab-grant.json
+
+Log in before scanning: MAP-THR01 gets this one client throttled for a minute, as it should.
 
 Loopback targets need no ownership proof with --allow-private.
 Everything is in memory and lost when the lab stops. Press Ctrl-C to stop.

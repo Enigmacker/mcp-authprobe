@@ -190,6 +190,11 @@ export interface Fixture {
   issueRefreshToken(clientId?: string): string;
   /** Number of token requests received so far. */
   tokenRequests(): number;
+  /** Parameter names of each token request received, and bodies of registration requests (to test what a client sends). */
+  tokenRequestParams(): string[][];
+  registrationBodies(): Array<Record<string, unknown>>;
+  /** JSON-RPC methods received by the MCP endpoint from authenticated or anonymous-allowed requests. */
+  mcpMethods(): string[];
   /** Client IDs currently registered through dynamic registration. */
   registeredClients(): string[];
   /** Create a logged-in session and return its cookie value (consent mode). */
@@ -364,6 +369,9 @@ export async function startFixture(options: FixtureOptions = {}): Promise<Fixtur
   const refreshTokens = new Map<string, RefreshRecord>();
   const revokedFamilies = new Set<string>();
   let tokenCount = 0;
+  const tokenParams: string[][] = [];
+  const registrations: Array<Record<string, unknown>> = [];
+  const methodsSeen: string[] = [];
   let refreshCount = 0;
   let base = "";
 
@@ -372,6 +380,7 @@ export async function startFixture(options: FixtureOptions = {}): Promise<Fixtur
     if (tok.throttle) return json(res, 429, { error: "slow_down" }, { "retry-after": "30" });
     if (tok.outage) return json(res, 503, { error: "temporarily_down" }, { "retry-after": "30" });
     const form = new URLSearchParams(body);
+    if (tokenParams.length < 1000) tokenParams.push([...form.keys()]);
     let clientId = form.get("client_id");
     let secret = form.get("client_secret");
     const basic = /^Basic\s+(.+)$/i.exec(req.headers.authorization ?? "");
@@ -485,6 +494,7 @@ export async function startFixture(options: FixtureOptions = {}): Promise<Fixtur
     } catch {
       return json(res, 400, { error: "invalid_client_metadata" });
     }
+    if (registrations.length < 1000) registrations.push(meta as Record<string, unknown>);
     const uris = Array.isArray(meta.redirect_uris) ? meta.redirect_uris.filter((u): u is string => typeof u === "string") : [];
     if (uris.length === 0) return json(res, 400, { error: "invalid_redirect_uri" });
     if (authz.registration === "strict" && !uris.every(safeRedirect)) return json(res, 400, { error: "invalid_redirect_uri" });
@@ -791,6 +801,7 @@ ${formTag}${hidden}${token}${challenge}${checkbox}
           } catch {
             /* not JSON-RPC */
           }
+          if (methodsSeen.length < 10_000) methodsSeen.push(Array.isArray(parsed) ? "(batch)" : (rpc.method ?? "(none)"));
           // Which revision does this request speak? Modern requests carry Mcp-Method and per-request _meta.
           const meta = (rpc as { params?: { _meta?: Record<string, unknown> } }).params?._meta;
           const first = Array.isArray(parsed) ? (parsed[0] as { method?: string; params?: { _meta?: Record<string, unknown> } } | undefined) : undefined;
@@ -918,6 +929,9 @@ ${formTag}${hidden}${token}${challenge}${checkbox}
       return token;
     },
     tokenRequests: () => tokenCount,
+    tokenRequestParams: () => tokenParams,
+    registrationBodies: () => registrations,
+    mcpMethods: () => methodsSeen,
     registeredClients: () => [...clients.keys()].filter((id) => !fixedClientIds.has(id)),
     issueSession: () => newSession(),
     consentsGranted: () => granted,

@@ -26,6 +26,8 @@ export interface CheckDefinition {
   family: string;
   /** "available" checks run today; "planned" ones are documented ahead of time. */
   availability: "available" | "planned";
+  /** MCP revisions whose requirements the check tests. A check does not apply to a server that speaks none of them. */
+  appliesTo: readonly string[];
   /** What a run needs for this check to execute, in a few words (Markdown), for the documentation. */
   runsWith: string;
   rationale: string;
@@ -119,7 +121,7 @@ export interface DiscoverySummary {
   registration: Array<"dcr" | "cimd">;
   pkceMethods: string[] | null;
   /** MCP protocol era and version the endpoint was spoken to with. */
-  protocol: { era: "legacy" | "modern" | "unknown"; version: string | null; supportedVersions: string[] };
+  protocol: { era: "legacy" | "modern" | "unknown"; version: string | null; supportedVersions: string[]; transport?: "streamable-http" | "http+sse" };
   notes: string[];
 }
 
@@ -173,6 +175,8 @@ export interface ScanReport {
   /** The credential used for the MCP endpoint checks: its kind and header, never its value. */
   credential?: { kind: "static" | "oauth"; header: string };
   grant?: GrantReport;
+  /** How the checks that need an OAuth client obtain one. */
+  client?: { source: "pre-registered" | "metadata-document" | "dynamic-registration" | "none" };
   leftovers?: Leftover[];
   /** Imported mcp-posture results and how they relate to these findings (--posture-report). */
   posture?: import("./posture.js").PostureSection;

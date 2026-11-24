@@ -32,6 +32,9 @@ import { TOOL_NAME, TOOL_VERSION } from "./version.js";
  *   MCP_AUTHPROBE_BEARER_HEADER                        header for the key (default Authorization)
  *   MCP_AUTHPROBE_ACCESS_TOKEN_FILE + MCP_AUTHPROBE_BEARER_TARGET
  *                                                      OAuth access token, used only for that exact URL
+ *   MCP_AUTHPROBE_CLIENT_ID, MCP_AUTHPROBE_CLIENT_SECRET_FILE, MCP_AUTHPROBE_REDIRECT_URI
+ *                                                      a pre-registered client, for servers without dynamic registration
+ *   MCP_AUTHPROBE_PROTOCOL                             legacy or modern, instead of detecting the MCP revision
  *   MCP_AUTHPROBE_ALLOW_PRIVATE=1                      local labs only
  *   MCP_AUTHPROBE_LAB_ORIGINS                          comma-separated lab origins exempt from proof
  *   MCP_AUTHPROBE_TIMEOUT_MS                           per-request timeout
@@ -49,6 +52,9 @@ export interface ServerConfig {
   /** Static key, bound to one MCP URL by the human. */
   staticKey?: { credential: Credential; target: string };
   allowPrivate: boolean;
+  /** A client supplied by the human instead of dynamic registration. */
+  client?: NonNullable<ScanOptions["client"]>;
+  protocol?: NonNullable<ScanOptions["protocol"]>;
   timeoutMs?: number;
   /** Test hook. */
   resolveTxtRecords?: ScanOptions["resolveTxtRecords"];
@@ -93,6 +99,20 @@ export function configFromEnv(env: NodeJS.ProcessEnv = process.env): ServerConfi
     for (const w of loaded.warnings) process.stderr.write(`mcp-authprobe: warning: ${w}\n`);
     config.staticKey = { credential: loaded.credential, target: new URL(target).toString() };
   }
+  const clientId = env["MCP_AUTHPROBE_CLIENT_ID"]?.trim();
+  if (clientId) {
+    config.client = { clientId };
+    const secretPath = env["MCP_AUTHPROBE_CLIENT_SECRET_FILE"];
+    if (secretPath) {
+      const loaded = readSecretLine(secretPath, { label: "client secret file", maxBytes: 8 * 1024 });
+      registerSecret(loaded.value);
+      config.client.clientSecret = loaded.value;
+    }
+    const redirectUri = env["MCP_AUTHPROBE_REDIRECT_URI"]?.trim();
+    if (redirectUri) config.client.redirectUri = redirectUri;
+  }
+  const protocol = env["MCP_AUTHPROBE_PROTOCOL"]?.trim();
+  if (protocol === "legacy" || protocol === "modern") config.protocol = protocol;
   const timeout = Number(env["MCP_AUTHPROBE_TIMEOUT_MS"]);
   if (Number.isFinite(timeout) && timeout > 0) config.timeoutMs = timeout;
   return config;
@@ -163,7 +183,7 @@ export function createAuthprobeServer(config: ServerConfig): McpServer {
       const c = getCheck(id);
       if (!c) return errorResult(`Unknown check: ${id}`);
       return text(
-        `${c.id}: ${c.title}\nSeverity: ${c.severity}. Mode: ${c.active ? "active" : "passive"}. Status: ${c.availability}.\n\nWhy: ${c.rationale}\n\nFix: ${c.remediation}\n\nReferences:\n${c.references.map((r) => `- ${r.title}: ${r.url}`).join("\n")}`,
+        `${c.id}: ${c.title}\nSeverity: ${c.severity}. Mode: ${c.active ? "active" : "passive"}. Status: ${c.availability}. Applies to MCP ${c.appliesTo.join(", ")}.\n\nWhy: ${c.rationale}\n\nFix: ${c.remediation}\n\nReferences:\n${c.references.map((r) => `- ${r.title}: ${r.url}`).join("\n")}`,
       );
     },
   );
@@ -257,6 +277,8 @@ export function createAuthprobeServer(config: ServerConfig): McpServer {
         if (config.secret) options.secret = config.secret;
         if (config.timeoutMs !== undefined) options.timeoutMs = config.timeoutMs;
         if (config.resolveTxtRecords) options.resolveTxtRecords = config.resolveTxtRecords;
+        if (config.client) options.client = config.client;
+        if (config.protocol) options.protocol = config.protocol;
         const notes: string[] = [];
         if (config.staticKey) {
           if (config.staticKey.target === parsed.toString()) options.credential = config.staticKey.credential;

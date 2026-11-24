@@ -41,6 +41,8 @@ export interface ThrottleCheckContext {
   attempts?: number;
   /** Receives the temporary client when it could not be deleted. */
   leftovers?: Leftover[];
+  /** A client the operator supplies: used, like the grant's client, instead of registering a temporary one. */
+  client?: { clientId: string; clientSecret?: string; authMethod?: TestGrant["authMethod"] };
 }
 
 export function clampAttempts(n: number | undefined): number {
@@ -78,6 +80,9 @@ export async function runThrottlingCheck(ctx: ThrottleCheckContext): Promise<Fin
     let grant: TestGrant;
     if (ctx.grant) {
       grant = { ...ctx.grant };
+    } else if (ctx.client) {
+      grant = { clientId: ctx.client.clientId, refreshToken: "", authMethod: ctx.client.authMethod ?? (ctx.client.clientSecret ? "client_secret_post" : "none") };
+      if (ctx.client.clientSecret) grant.clientSecret = ctx.client.clientSecret;
     } else if (ctx.registrationEndpoint) {
       const reg = await registerClient(http, ctx.registrationEndpoint, [REGISTERED_REDIRECT], { grantTypes: ["authorization_code", "refresh_token"] });
       if (!reg.client) {
@@ -88,7 +93,7 @@ export async function runThrottlingCheck(ctx: ThrottleCheckContext): Promise<Fin
       grant = { clientId: reg.client.clientId, refreshToken: "", authMethod: reg.client.clientSecret ? "client_secret_post" : "none" };
       if (reg.client.clientSecret) grant.clientSecret = reg.client.clientSecret;
     } else {
-      return result("skipped", target, "Needs a client: pass a test grant with --credentials-file, or offer dynamic client registration.");
+      return result("skipped", target, "Needs a client: this authorization server offers no dynamic client registration. Pass a pre-registered client with --client-id, or a test grant with --credentials-file.");
     }
 
     const random = (): string => `invalid-${randomBytes(24).toString("base64url")}`;

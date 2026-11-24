@@ -1,4 +1,4 @@
-import type { HttpClient } from "../net/http.js";
+import { ScanInterruptedError, type HttpClient } from "../net/http.js";
 import { describeAnswer, probeAuthorize, signature, type AuthorizeAnswer, type AuthorizeParams } from "../oauth/authorize.js";
 import { deleteClient, REGISTERED_REDIRECT, registerClient, SAFE_DOMAIN, type RegisteredClient } from "../oauth/registration.js";
 import { safeText } from "../redact.js";
@@ -36,6 +36,34 @@ export const NEAR_MISS_VARIANTS: ReadonlyArray<{ label: string; uri: string }> =
   { label: "scheme downgrade", uri: `http://client.${SAFE_DOMAIN}/callback` },
 ];
 
+/**
+ * The same near misses for any registered redirect URI (a pre-registered
+ * client has its own). A loopback URI gets no "different port" variant:
+ * native clients may use any port there (RFC 8252), so accepting it is right.
+ */
+export function nearMissVariants(registered: string): Array<{ label: string; uri: string }> {
+  if (registered === REGISTERED_REDIRECT) return [...NEAR_MISS_VARIANTS];
+  const u = new URL(registered);
+  const loopback = ["127.0.0.1", "[::1]", "localhost"].includes(u.hostname);
+  const edit = (f: (x: URL) => void): string => {
+    const x = new URL(registered);
+    f(x);
+    return x.toString();
+  };
+  const out = [
+    { label: "extra path segment", uri: edit((x) => (x.pathname = `${x.pathname.replace(/\/$/, "")}/extra`)) },
+    { label: "trailing slash", uri: edit((x) => (x.pathname = x.pathname.endsWith("/") ? x.pathname.replace(/\/+$/, "") || "/x" : `${x.pathname}/`)) },
+    { label: "added query", uri: edit((x) => x.searchParams.set("next", "1")) },
+  ];
+  if (!loopback) {
+    out.push({ label: "different port", uri: edit((x) => (x.port = x.port === "8443" ? "9443" : "8443")) });
+    if (!/^[\d.]+$|^\[/.test(u.hostname)) out.push({ label: "subdomain", uri: edit((x) => (x.hostname = `other.${x.hostname}`)) });
+  }
+  out.push({ label: "userinfo", uri: `${u.protocol}//${u.host}@other.${SAFE_DOMAIN}${u.pathname}${u.search}` });
+  if (u.protocol === "https:") out.push({ label: "scheme downgrade", uri: edit((x) => (x.protocol = "http:")) });
+  return out;
+}
+
 /** Redirect URIs a registration endpoint should refuse for an MCP client. */
 export const UNSAFE_REGISTRATIONS: ReadonlyArray<{ label: string; uri: string }> = [
   { label: "plain HTTP on a non-loopback host", uri: `http://client.${SAFE_DOMAIN}/callback` },
@@ -56,6 +84,12 @@ export interface RedirectCheckContext {
   scope?: string;
   /** Receives the temporary clients that could not be deleted (also noted in the evidence). */
   leftovers?: Leftover[];
+  /**
+   * A client the operator supplies (pre-registered, or a client ID metadata
+   * document), with one redirect URI registered for it: used for MAP-RDR01
+   * and MAP-RDR02 instead of registering a temporary client.
+   */
+  client?: { clientId: string; redirectUri?: string };
 }
 
 /** Reason codes for this file's inconclusive and skipped messages (first match wins; the default is "unexpected_answer"). */
@@ -102,12 +136,12 @@ function summarize(id: string, target: string, rows: Array<{ label: string; verd
   return result(id, target, "pass", passMsg, evidence);
 }
 
-async function authorizationChecks(ctx: RedirectCheckContext, client: RegisteredClient): Promise<Finding[]> {
+async function authorizationChecks(ctx: RedirectCheckContext, client: Pick<RegisteredClient, "clientId">, registered: string = REGISTERED_REDIRECT): Promise<Finding[]> {
   const { http, target } = ctx;
   const base: Omit<AuthorizeParams, "redirectUri"> = { authorizationEndpoint: ctx.authorizationEndpoint as string, clientId: client.clientId, resource: ctx.resource };
   if (ctx.scope) base.scope = ctx.scope;
 
-  const baseline = await probeAuthorize(http, { ...base, redirectUri: REGISTERED_REDIRECT });
+  const baseline = await probeAuthorize(http, { ...base, redirectUri: registered });
   const baselineLine = `baseline with the registered URI: ${describeAnswer(baseline)}`;
   if (baseline.kind === "unavailable" || (baseline.kind === "page" && baseline.status >= 400)) {
     const msg = "The baseline request with the registered redirect URI was itself rejected, so variants cannot be compared.";
@@ -130,7 +164,7 @@ async function authorizationChecks(ctx: RedirectCheckContext, client: Registered
   if (!wanted("MAP-RDR02")) return out;
 
   const rows: Array<{ label: string; verdict: VariantVerdict; detail: string }> = [];
-  for (const v of NEAR_MISS_VARIANTS) {
+  for (const v of nearMissVariants(registered)) {
     const answer = await probeAuthorize(http, { ...base, redirectUri: v.uri });
     rows.push({ label: v.label, verdict: judge(baseline, answer), detail: describeAnswer(answer) });
   }
@@ -174,17 +208,40 @@ export async function runRedirectUriChecks(ctx: RedirectCheckContext): Promise<F
   const created: RegisteredClient[] = [];
 
   try {
-    // MAP-RDR04 and the client for RDR01/02 both need dynamic registration.
+    const wanted = ctx.select ?? (() => true);
+    const wants12 = wanted("MAP-RDR01") || wanted("MAP-RDR02");
+    const both = (status: Finding["status"], msg: string, reason?: ReasonCode): void => {
+      if (wanted("MAP-RDR01")) findings.push(result("MAP-RDR01", target, status, msg, [], reason));
+      if (wanted("MAP-RDR02")) findings.push(result("MAP-RDR02", target, status, msg, [], reason));
+    };
+    // A supplied client comes first, as in the MCP specification: nothing is registered for RDR01/02.
+    if (ctx.client && wants12) {
+      if (!ctx.client.redirectUri) {
+        both("skipped", "The supplied client needs one of its registered redirect URIs to compare against: pass it with --redirect-uri.", "no_client");
+      } else if (!ctx.authorizationEndpoint) {
+        both("skipped", "No authorization endpoint discovered.", "no_endpoint");
+      } else {
+        try {
+          const out = await authorizationChecks(ctx, { clientId: ctx.client.clientId }, ctx.client.redirectUri);
+          for (const f of out) f.evidence.push("client: supplied by the operator (--client-id), nothing was registered");
+          findings.push(...out);
+        } catch (err) {
+          if (err instanceof ScanInterruptedError) throw err;
+          both("error", `Authorization endpoint unreachable: ${(err as Error).message}`);
+        }
+      }
+    }
+    // MAP-RDR04, and the client for RDR01/02 when none is supplied, need dynamic registration.
     if (!ctx.registrationEndpoint) {
-      const msg = "No registration endpoint: these checks need dynamic client registration to create a test client.";
-      findings.push(result("MAP-RDR01", target, "skipped", msg), result("MAP-RDR02", target, "skipped", msg));
-      findings.push(result("MAP-RDR04", target, "not_applicable", "The authorization server does not offer dynamic client registration."));
+      if (!ctx.client && wants12) {
+        both("skipped", "Needs a client: this authorization server offers no dynamic client registration (deprecated by MCP 2026-07-28). Pass a pre-registered client, or a client ID metadata document URL, with --client-id and one of its redirect URIs with --redirect-uri.", "no_client");
+      }
+      if (wanted("MAP-RDR04")) findings.push(result("MAP-RDR04", target, "not_applicable", "The authorization server does not offer dynamic client registration, which this check is about (a mechanism MCP 2026-07-28 deprecates)."));
       return findings;
     }
 
-    const wanted = ctx.select ?? (() => true);
     let client: RegisteredClient | null = null;
-    if (wanted("MAP-RDR01") || wanted("MAP-RDR02")) {
+    if (wants12 && !ctx.client) {
       try {
         const reg = await registerClient(http, ctx.registrationEndpoint, [REGISTERED_REDIRECT]);
         if (reg.client) {

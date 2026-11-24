@@ -13,6 +13,8 @@ Passive scanners read what a remote [Model Context Protocol](https://modelcontex
 
 > **<!-- generated:checks-count -->21 checks<!-- /generated -->**, field-tested against a certified OpenID provider: OAuth discovery, refresh token rotation and replay, redirect URI strictness, PKCE enforcement, single-use codes, token audience, `Origin` validation, tokens in URLs, session IDs used as credentials, CORS, throttling and consent CSRF (in a real browser). It works as a CLI with an interactive `login`, as an MCP server so an AI assistant can run the audit, and as a GitHub Action. A deliberately vulnerable [lab](#try-it-in-a-minute-the-lab) lets you try everything in a minute.
 
+> **MCP revisions:** the scanner speaks **2026-07-28** (stateless: `server/discover`, the `MCP-Protocol-Version` and `Mcp-Method` headers, no session) and **2025-11-25** (the `initialize` handshake), and finds out which one a server speaks. See [Compatibility](#compatibility).
+
 > **Only test servers you own or are explicitly authorized to test.** Active checks change state on the target. The tool enforces an ownership proof before running them, but responsibility stays with the operator.
 
 ![mcp-authprobe against its vulnerable lab: login, then a scan with 10 failing checks](https://raw.githubusercontent.com/Enigmacker/mcp-authprobe/main/docs/demo/demo.gif)
@@ -22,6 +24,7 @@ Passive scanners read what a remote [Model Context Protocol](https://modelcontex
 - [Field-tested](#field-tested)
 - [Why another scanner?](#why-another-scanner)
 - [Install](#install)
+- [Compatibility](#compatibility)
 - [Try it in a minute: the lab](#try-it-in-a-minute-the-lab)
 - [Quick start](#quick-start)
 - [Ownership proof](#ownership-proof)
@@ -87,6 +90,20 @@ npm ci
 npm run build
 node dist/cli.js --help
 ```
+
+## Compatibility
+
+| | Supported |
+| --- | --- |
+| MCP revisions | **2026-07-28** and **2025-11-25** over Streamable HTTP. The tool sends a 2026-07-28 request first (`server/discover`); a server that answers it, or answers with one of the errors only that revision defines, is spoken to statelessly. Otherwise the `initialize` handshake of the earlier revisions is used. `--protocol modern|legacy` skips the detection. The era is in the report (`discovery.protocol`) |
+| What differs between the two | In 2026-07-28 there is neither `initialize`, nor `ping`, nor session: `server/discover` is the harmless request the checks send, `MAP-SES01` is not applicable, and nothing is ended with DELETE. Everything else is checked in both |
+| Transports not spoken | The HTTP+SSE transport of 2024-11-05 (deprecated) is recognised and named in `MAP-DSC01`; it is not tested. stdio servers have no authorization to test |
+| Client registration | In the order of the 2026-07-28 specification: a client you supply with `--client-id` (pre-registered, or the URL of a client ID metadata document), otherwise dynamic client registration (deprecated by that revision, still used when it is all the server offers) |
+| Authorization servers tried | node-oidc-provider, the MCP TypeScript SDK's OAuth example server ([Field-tested](#field-tested)), and the lab profiles. Others should work as far as they follow OAuth 2.1; reports of trouble are welcome |
+| Node.js | 22.19 or later |
+| Report | Schema `mcp-authprobe/report/v1`: fields are only added. See [Integrating mcp-authprobe](docs/integration.md) |
+
+An anonymous request cannot always tell the revision (a server that asks for a token first answers 401 either way): the checks that hold a credential settle it, and a scan without one reports the era as `unknown`.
 
 ## Try it in a minute: the lab
 
@@ -219,10 +236,10 @@ mcp-authprobe login https://mcp.example.com/mcp --out ./test-grant.json
 
 `login` behaves like a careful native MCP client ([RFC 8252](https://www.rfc-editor.org/rfc/rfc8252)):
 
-- It registers a client through dynamic client registration, with a loopback redirect URI on `127.0.0.1` and a random port.
+- It obtains a client in the order the MCP specification gives: the one you supply with `--client-id` (see [Without dynamic client registration](#without-dynamic-client-registration)), otherwise dynamic client registration, with `application_type: native`, a loopback redirect URI on `127.0.0.1` and a random port.
 - It opens your browser on the **discovered authorization endpoint only** (or prints the URL with `--no-browser`). Log in with your **test account**.
 - The loopback listener accepts a single `GET /callback` carrying the expected `state`, and echoes nothing back.
-- It uses PKCE S256, a random `state`, the RFC 8707 `resource`, and checks the RFC 9207 `iss` parameter against the discovered issuer.
+- It uses PKCE S256, a random `state`, the RFC 8707 `resource`, and checks the RFC 9207 `iss` parameter against the issuer of the validated metadata, before anything else is read from the response: an error from another issuer is neither acted on nor shown.
 - It writes the grant with mode 600, never through a symbolic link, and never over an existing file unless you pass `--force`. Tokens are never printed.
 - The grant records the **target and token endpoint** it belongs to. A scan of any other target, or a server announcing another token endpoint, will not use it.
 - `login` itself does not require an ownership proof: it only does what any MCP client does when you connect it (one registration, your own browser login, one code exchange). Only the extra login checks below require the proof.
@@ -245,13 +262,47 @@ mcp-authprobe login https://mcp.example.com/mcp --out ./test-grant.json
 
 The results are stored in the grant file and reported by the next scan of the same target. The refresh token kept in the grant is always the newest one, so rotation during these probes does not break the scan. A network failure during a probe makes that check inconclusive; it never loses the grant or the other results.
 
-If a probe obtains tokens (the check fails), the code is spent: the following pre-exchange probes are reported as not observed, the tokens obtained are kept as the grant, and `MAP-COD01` still runs (presenting the code again is its second use).
+If a probe obtains tokens (the check fails), the code is spent: the following pre-exchange probes are reported as not observed, the tokens obtained are kept as the grant, and `MAP-COD01` still runs (presenting the code again is its second use). `--rounds 2` then runs a second authorization, so that `MAP-RDR03` gets a code of its own: on a server that does not enforce PKCE, it is otherwise never observed.
 
 Some strict servers invalidate a code after any failed attempt. That is acceptable behaviour: only the first refusal is trusted and the following probes are reported as inconclusive. Likewise, a server that revokes the tokens after a code reuse (recommended) passes `MAP-COD01`. In both cases `login` writes the results without a grant; log in again with `--no-probe --force --out <same file>` to add a grant: the earlier results of the same target are kept.
 
+### Without dynamic client registration
+
+MCP 2026-07-28 deprecates dynamic client registration; many authorization servers never offered it. Supply the client yourself:
+
+```sh
+# a pre-registered native client, whose loopback redirect URI is fixed
+mcp-authprobe login https://mcp.example.com/mcp --client-id my-test-client \
+  --redirect-uri http://127.0.0.1:8765/callback --out ./test-grant.json
+
+# a confidential client
+mcp-authprobe login … --client-id my-test-client --client-secret-file ./client-secret
+
+# a client ID metadata document, when the server announces client_id_metadata_document_supported
+mcp-authprobe login … --client-id https://app.example.com/oauth/client-metadata.json --redirect-uri http://127.0.0.1:8765/callback
+```
+
+The same options give `scan` a client for `MAP-RDR01`, `MAP-RDR02` (with `--redirect-uri`, one of the client's registered redirect URIs: the near misses are derived from it) and `MAP-THR01`, and `consent-check` a client (with its loopback redirect URI). Nothing is registered, so nothing is left behind. `MAP-RDR04` is about dynamic registration itself and is not applicable without it.
+
+### Login in two steps, for a web application
+
+An application with its own redirect URI cannot use a loopback listener. `login begin` and `login complete` are the same login without one:
+
+```sh
+# 1. Prints the authorization URL; writes the PKCE verifier, the state and the expected issuer (mode 600)
+mcp-authprobe login begin https://mcp.example.com/mcp --client-id my-web-client \
+  --redirect-uri https://app.example.com/oauth/callback --state-file ./login-state.json
+
+# 2. Send the user to that URL. Your application receives the redirect; hand the full URL over in a file
+mcp-authprobe login complete --state-file ./login-state.json --callback-file ./callback-url \
+  --out ./test-grant.json --json ./login-report.json
+```
+
+`login complete` validates `state` and `iss`, runs the login checks when ownership is proven, exchanges the code and writes the grant; the state file is deleted. `--callback-url <url>` is accepted too, but an authorization code on a command line is visible to other local users. The library exports the same two functions (`beginLogin`, `completeLogin`).
+
 ## Redirect URI checks
 
-If an authorization server redirects to a URI the client never registered, authorization codes can end up with an attacker. OAuth 2.1 requires exact string matching. These checks need **dynamic client registration** on your server; no test grant and no login are required.
+If an authorization server redirects to a URI the client never registered, authorization codes can end up with an attacker. OAuth 2.1 requires exact string matching. These checks need a client: a temporary one from **dynamic client registration**, or [one you supply](#without-dynamic-client-registration) with `--client-id` and `--redirect-uri`. No test grant and no login are required.
 
 How they work:
 
@@ -358,6 +409,8 @@ The server is built so that the assistant, or a prompt injection reaching it, ca
 | `MCP_AUTHPROBE_BEARER_FILE` and `MCP_AUTHPROBE_BEARER_TARGET` | Static API key, and the exact MCP URL it may be used for (both required) |
 | `MCP_AUTHPROBE_BEARER_HEADER` | Header for the key (default `Authorization`, sent as `Bearer`) |
 | `MCP_AUTHPROBE_ACCESS_TOKEN_FILE` and `MCP_AUTHPROBE_BEARER_TARGET` | OAuth access token instead of a static key, and the exact MCP URL it may be used for |
+| `MCP_AUTHPROBE_CLIENT_ID`, `MCP_AUTHPROBE_CLIENT_SECRET_FILE`, `MCP_AUTHPROBE_REDIRECT_URI` | A pre-registered client (or client ID metadata document URL), for a server without dynamic client registration |
+| `MCP_AUTHPROBE_PROTOCOL` | `legacy` or `modern`, instead of detecting the MCP revision |
 
 
 ### With Docker
@@ -382,24 +435,26 @@ In a container, `--allow-private` labs on your machine are not reachable as `127
 | `MAP-RTK01` | high | active | a test grant (`--credentials-file`) | Refresh tokens for public clients are rotated |
 | `MAP-RTK02` | critical | active | a test grant (`--credentials-file`) | A rotated refresh token cannot be replayed |
 | `MAP-RTK03` | high | active | a test grant (`--credentials-file`) | Refresh token replay revokes the token family |
-| `MAP-RDR01` | critical | active | every scan with ownership proven | Unregistered redirect_uri is refused at the authorization endpoint |
-| `MAP-RDR02` | high | active | every scan with ownership proven | redirect_uri matching is exact, not prefix or pattern based |
+| `MAP-RDR01` | critical | active | every scan with ownership proven (dynamic registration, or `--client-id`) | Unregistered redirect_uri is refused at the authorization endpoint |
+| `MAP-RDR02` | high | active | every scan with ownership proven (dynamic registration, or `--client-id`) | redirect_uri matching is exact, not prefix or pattern based |
 | `MAP-RDR03` | medium | active | `login` | Token endpoint enforces the redirect_uri used at authorization |
-| `MAP-RDR04` | high | active | every scan with ownership proven | Dynamic client registration refuses unsafe redirect URIs |
+| `MAP-RDR04` | high | active | every scan with ownership proven, on a server with dynamic registration | Dynamic client registration refuses unsafe redirect URIs |
 | `MAP-PKC01` | high | active | `login` | Token endpoint enforces PKCE |
 | `MAP-COD01` | high | active | `login` | An authorization code cannot be used twice |
-| `MAP-AUD01` | high | active | `login` | Tokens are bound to their audience |
-| `MAP-ORG01` | medium | passive | every scan; with a credential through `login` or a static key | MCP endpoint rejects requests from a foreign Origin |
-| `MAP-TOK01` | medium | active | `login` or a static key | MCP endpoint refuses access tokens and keys in the URL |
-| `MAP-SES01` | high | active | `login` or a static key | An MCP session ID is not accepted instead of a token |
+| `MAP-AUD01` | high | active | `login`, or an access token with a test grant | Tokens are bound to their audience |
+| `MAP-ORG01` | medium | passive | every scan; with a credential through `login`, a static key or an access token | MCP endpoint rejects requests from a foreign Origin |
+| `MAP-TOK01` | medium | active | `login`, a static key or an access token | MCP endpoint refuses access tokens and keys in the URL |
+| `MAP-SES01` | high | active | `login`, a static key or an access token | An MCP session ID is not accepted instead of a token (MCP 2025-11-25 only) |
 | `MAP-COR01` | medium | passive | every scan | MCP endpoint does not allow credentialed requests from any origin |
-| `MAP-BAT01` | medium | active | `login` or a static key | MCP endpoint refuses JSON-RPC batches |
-| `MAP-BOD01` | low | active | `login` or a static key | MCP endpoint limits the request body size |
-| `MAP-INJ01` | high | active | `login`, a static key, or an anonymous server | Tool, prompt and resource metadata carry no hidden instructions |
-| `MAP-THR02` | low | active | a static key (`--bearer-file`) | MCP endpoint rate-limits each credential |
-| `MAP-THR01` | medium | active | every scan with ownership proven | Repeated failed token requests are throttled |
+| `MAP-BAT01` | medium | active | `login`, a static key or an access token | MCP endpoint refuses JSON-RPC batches |
+| `MAP-BOD01` | low | active | `login`, a static key or an access token | MCP endpoint limits the request body size |
+| `MAP-INJ01` | high | active | `login`, a static key, an access token, or an anonymous server | Tool, prompt and resource metadata carry no hidden instructions |
+| `MAP-THR02` | low | active | a static key (`--bearer-file`); an access token with `--only THR02` | MCP endpoint rate-limits each credential |
+| `MAP-THR01` | medium | active | every scan with ownership proven (dynamic registration, or `--client-id`) | Repeated failed token requests are throttled |
 | `MAP-CSR01` | high | active | `consent-check` | Consent decision is protected against cross-site request forgery |
 <!-- /generated -->
+
+`MAP-DSC01` also reports what a strict client would refuse: authorization server metadata whose `issuer` is not the one it was fetched for is **not used** (RFC 8414, and a MUST of the MCP specification), a `resource` that is not the scanned URL is remarked and not sent as the `resource` parameter, missing `code_challenge_methods_supported` is noted, and when the resource announces several authorization servers the others are listed (`--issuer <url>` examines another one).
 
 Families: **DSC** discovery, **RTK** refresh tokens, **RDR** redirect URIs, **THR** throttling, **CSR** consent CSRF, **PKC** PKCE, **COD** authorization codes, **AUD** token audience, **ORG** Origin validation, **TOK** token transport, **SES** sessions, **COR** CORS, **BAT** batches, **BOD** body size, **INJ** prompt injection.
 
@@ -438,6 +493,8 @@ With the key, and only once ownership of the target is proven, the checks of the
 | `MAP-BOD01` | Two 6 MiB `ping` requests, one with `Content-Length` and one chunked, must be refused (ideally 413) |
 | `MAP-INJ01` | Tool, prompt and resource metadata, read with the key, must carry no hidden instructions (see [Tool poisoning check](#tool-poisoning-check)) |
 | `MAP-THR02` | Up to 30 `ping` requests (`--rate-attempts`, 10 to 100) must meet a rate limit (429 or `Retry-After`). Runs last, since a limited key may be refused for a while |
+
+The table describes a server that speaks MCP 2025-11-25. On a 2026-07-28 server the harmless request is `server/discover` instead of `initialize` and `ping`, and `MAP-SES01` is not applicable (that revision has no session).
 
 `MAP-DSC01` becomes *not applicable*, and so do the authorization server checks, when no OAuth metadata is published. This only happens when you declare a key: a bare 401 without metadata also looks like a broken OAuth setup, which must stay visible.
 
@@ -544,7 +601,7 @@ jobs:
   scan:
     runs-on: ubuntu-latest
     steps:
-      - uses: Enigmacker/mcp-authprobe@v0.11.0
+      - uses: Enigmacker/mcp-authprobe@v0.12.0
         with:
           url: https://staging.example.com/mcp
           secret: ${{ secrets.MCP_AUTHPROBE_SECRET }}
@@ -568,7 +625,7 @@ The results table is added to the job summary. The step fails when a check fails
 | `upload-sarif` | `false` | Upload the SARIF report to code scanning (needs `security-events: write`) |
 | `allow-private` | `false` | For a lab started in the same job only |
 | `node-version` | `22` | Node.js used to run the scanner |
-| `package` | this release | npm package spec to run, e.g. `mcp-authprobe@0.11.0` |
+| `package` | this release | npm package spec to run, e.g. `mcp-authprobe@0.12.0` |
 
 Both tools have an Action, so the passive and active views fit in one job:
 
@@ -578,7 +635,7 @@ Both tools have an Action, so the passive and active views fit in one job:
           targets: https://staging.example.com/mcp
           args: --json posture.json
           fail: false   # let the active scan run too; each tool reports its own findings
-      - uses: Enigmacker/mcp-authprobe@v0.11.0
+      - uses: Enigmacker/mcp-authprobe@v0.12.0
         with:
           url: https://staging.example.com/mcp
           secret: ${{ secrets.MCP_AUTHPROBE_SECRET }}
@@ -658,6 +715,15 @@ The scanner talks to servers that may be hostile, and it may be driven by an AI 
 
 **0.10.0**
 - ~~Tool poisoning check (INJ01) on tool, prompt and resource metadata, with poisoned lab profiles~~ done.
+
+**0.10.2**
+- ~~Corrections: false passes on a rate limit and on unread metadata, selectable refresh token steps, unreachable targets~~ done.
+
+**0.11.0**
+- ~~Integration contract: reason codes, summary and discovery in the report, JSON Schema, exit codes 4 and 5, access tokens, events, library exports~~ done.
+
+**0.12.0**
+- ~~MCP 2026-07-28 next to 2025-11-25; clients without dynamic registration; login in two steps~~ done.
 
 **Next**
 - Ideas welcome in the issues.
