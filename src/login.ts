@@ -2,7 +2,7 @@ import { spawn } from "node:child_process";
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 import { createServer, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
-import { CATALOGUE } from "./checks/catalogue.js";
+import { CATALOGUE, LOGIN_CHECK_IDS } from "./checks/catalogue.js";
 import type { Observation, TestGrant } from "./credentials.js";
 import type { DiscoveryResult } from "./discovery.js";
 import type { HttpClient } from "./net/http.js";
@@ -227,7 +227,7 @@ export async function login(opts: LoginOptions): Promise<LoginResult> {
         }
       }
     } else {
-      notes.push("MAP-PKC01, MAP-RDR03, MAP-COD01, MAP-AUD01, MAP-ORG01, MAP-TOK01, MAP-SES01, MAP-BAT01, MAP-BOD01 and MAP-INJ01 were not observed: ownership of the contacted hosts is not proven, or --no-probe was used.");
+      notes.push(`${LOGIN_CHECK_IDS.join(", ")} were not observed: ownership of the contacted hosts is not proven, or --no-probe was used.`);
     }
 
     // --- The real exchange ---

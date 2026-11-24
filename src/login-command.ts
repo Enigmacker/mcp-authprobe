@@ -1,4 +1,5 @@
 import { existsSync } from "node:fs";
+import { LOGIN_CHECK_IDS } from "./checks/catalogue.js";
 import { loadGrant, writeGrantFile, type Observation } from "./credentials.js";
 import { discover } from "./discovery.js";
 import { login, LoginError, openInBrowser } from "./login.js";
@@ -18,6 +19,8 @@ export interface LoginCommandOptions {
   /** Replaces the browser (tests). */
   openUrl?: (url: string) => Promise<void>;
   timeoutMs?: number;
+  /** Per-request timeout in milliseconds (--timeout). */
+  requestTimeoutMs?: number;
 }
 
 // Everything printed here may contain server-controlled text: neutralize it.
@@ -27,7 +30,7 @@ const err = (t: string): void => {
 
 /** `mcp-authprobe login`: everything goes to stderr; tokens are only written to the grant file. */
 export async function runLoginCommand(o: LoginCommandOptions): Promise<number> {
-  const http = new HttpClient({ allowPrivate: o.allowPrivate });
+  const http = new HttpClient({ allowPrivate: o.allowPrivate, ...(o.requestTimeoutMs !== undefined ? { timeoutMs: o.requestTimeoutMs } : {}) });
   try {
     const discovery = await discover(o.mcpUrl, http);
     let probe = false;
@@ -35,7 +38,7 @@ export async function runLoginCommand(o: LoginCommandOptions): Promise<number> {
       const results = [];
       for (const host of hostsToVerify(o.mcpUrl, discovery)) results.push(await verifyOwnership(host, o.secret, { http }));
       probe = results.every((r) => r.verified);
-      if (!probe) err("Ownership not proven for every host: the login checks (MAP-PKC01, MAP-RDR03, MAP-COD01, MAP-AUD01, MAP-ORG01, MAP-TOK01, MAP-SES01) will not be observed.");
+      if (!probe) err(`Ownership not proven for every host: the login checks (${LOGIN_CHECK_IDS.join(", ")}) will not be observed.`);
     }
 
     const result = await login({

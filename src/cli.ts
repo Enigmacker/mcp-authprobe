@@ -1,10 +1,15 @@
 #!/usr/bin/env node
-import { readFileSync, realpathSync, writeFileSync } from "node:fs";
+import { accessSync, constants as fsConstants, readFileSync, realpathSync, statSync, writeFileSync } from "node:fs";
+import { isIP } from "node:net";
+import { dirname, resolve as resolvePath } from "node:path";
 import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
-import { CATALOGUE, getCheck } from "./checks/catalogue.js";
+import { CATALOGUE, getCheck, LOGIN_CHECK_IDS } from "./checks/catalogue.js";
+import { LAB_PROFILES } from "./lab/profiles.js";
+import { isBlockedAddress } from "./net/address-policy.js";
 import { loadGrant } from "./credentials.js";
-import { HttpClient } from "./net/http.js";
+import { HttpClient, plainHttpAllowed } from "./net/http.js";
+import { registerSecret } from "./redact.js";
 import { DNS_LABEL, generateSecret, proofFor, verifyOwnership, WELL_KNOWN_PATH } from "./ownership.js";
 import { toJson } from "./report/json.js";
 import { toMarkdown } from "./report/markdown.js";
@@ -36,7 +41,7 @@ Usage:
   ${TOOL_NAME} login <mcp-url> --out <file> Log in with a test account and save a test grant
   ${TOOL_NAME} consent-check <mcp-url>     MAP-CSR01: consent CSRF, in a real browser
   ${TOOL_NAME} mcp                         Run as an MCP server over stdio
-  ${TOOL_NAME} lab [--profile vulnerable|secure] [--port 8787]
+  ${TOOL_NAME} lab [--profile <name>] [--port 8787]
                                            Run a local practice server (loopback only)
 
 Scan options:
@@ -77,14 +82,15 @@ Consent check options (needs the optional playwright-core package and Chrome or 
 Login options:
   --out <file>          Where to write the test grant (mode 600, never overwritten without --force)
   --force               Overwrite an existing grant file
-  --no-probe            Do not observe the login checks (PKC01, RDR03, COD01, AUD01, ORG01, TOK01, SES01)
+  --no-probe            Do not observe the login checks
+                        (${LOGIN_CHECK_IDS.slice(0, 5).map((id) => id.slice(4)).join(", ")},
+                        ${LOGIN_CHECK_IDS.slice(5).map((id) => id.slice(4)).join(", ")})
   --no-browser          Print the authorization URL instead of opening a browser
   --allow-private, --secret-file, --timeout  as for scan
 
 Lab options:
-  --profile <name>      vulnerable (default): most checks fail; secure: a compliant server;
-                        static-bearer / static-bearer-secure: a server with a static API
-                        key and no OAuth (the key is printed when the lab starts)
+  --profile <name>      One of (default: vulnerable):
+${Object.entries(LAB_PROFILES).map(([name, p]) => `                        ${name}: ${p.description}`).join("\n")}
   --port <n>            Port on 127.0.0.1 (default: 8787; 0 picks a free port)
   --host <address>      127.0.0.1 (default) or ::1; nothing else is accepted
 
@@ -99,9 +105,55 @@ Only scan servers you own or are explicitly authorized to test.
 `;
 
 function readSecret(secretFile: string | undefined): string | undefined {
-  if (secretFile) return readFileSync(secretFile, "utf8").trim();
-  const value = process.env[SECRET_ENV]?.trim();
-  return value ? value : undefined;
+  const value = secretFile ? readFileSync(secretFile, "utf8").trim() : process.env[SECRET_ENV]?.trim();
+  if (!value) return undefined;
+  registerSecret(value);
+  return value;
+}
+
+/**
+ * Why a target cannot be scanned with these options, or null. Checked before
+ * any request, so a configuration mistake is a usage error (exit 2) and not a
+ * list of inconclusive results.
+ */
+export function targetProblem(url: URL, allowPrivate: boolean): string | null {
+  if (url.protocol !== "https:" && url.protocol !== "http:") return `Unsupported URL scheme ${url.protocol} (use https).`;
+  if (url.username || url.password) return "URLs with embedded credentials are refused.";
+  const host = url.hostname.replace(/^\[|\]$/g, "");
+  if (url.protocol === "http:" && !plainHttpAllowed(url, allowPrivate)) {
+    return allowPrivate
+      ? `Plain http is only accepted for a loopback or private-address lab; ${url.host} is neither. Use https.`
+      : `Plain http is refused: secrets could travel in cleartext. Use https, or --allow-private for a lab on a loopback or private address.`;
+  }
+  if (!allowPrivate && (isIP(host) !== 0 ? isBlockedAddress(host) : host === "localhost" || host.endsWith(".localhost"))) {
+    return `${url.host} is a loopback, private or reserved address: pass --allow-private to scan a local lab.`;
+  }
+  return null;
+}
+
+/** Why a report file could not be written, or null: found before the scan, not after it consumed a test grant. */
+function outputProblem(option: string, file: string): string | null {
+  if (file === "-") return null;
+  const dir = dirname(resolvePath(file));
+  try {
+    if (!statSync(dir).isDirectory()) return `--${option}: ${dir} is not a directory.`;
+    accessSync(dir, fsConstants.W_OK);
+  } catch (e) {
+    return `--${option}: cannot write to ${dir} (${(e as NodeJS.ErrnoException).code ?? "error"}).`;
+  }
+  try {
+    if (statSync(resolvePath(file)).isDirectory()) return `--${option}: ${file} is a directory.`;
+  } catch {
+    /* does not exist yet: fine */
+  }
+  return null;
+}
+
+/** --timeout as milliseconds, undefined when absent, or null when invalid. */
+function parseTimeout(value: string | undefined): number | undefined | null {
+  if (value === undefined) return undefined;
+  const n = Number(value);
+  return Number.isFinite(n) && n > 0 ? n : null;
 }
 
 function out(text: string): void {
@@ -237,7 +289,12 @@ export async function main(argv: string[]): Promise<number> {
       return EXIT.ok;
     }
     if (sub === "verify") {
-      const http = new HttpClient({ allowPrivate: values["allow-private"] });
+      const t = parseTimeout(values.timeout);
+      if (t === null) {
+        err(`--timeout must be a positive number of milliseconds\n`);
+        return EXIT.usage;
+      }
+      const http = new HttpClient({ allowPrivate: values["allow-private"], ...(t !== undefined ? { timeoutMs: t } : {}) });
       try {
         const result = await verifyOwnership(arg, secret, { http });
         out(`${result.verified ? "verified" : "NOT verified"}: ${result.detail}\n`);
@@ -261,6 +318,19 @@ export async function main(argv: string[]): Promise<number> {
       err(`--fail-on must be one of ${SEVERITIES.join(", ")}\n`);
       return EXIT.usage;
     }
+    const problem = targetProblem(url, values["allow-private"]);
+    const timeoutMs = parseTimeout(values.timeout);
+    if (problem || timeoutMs === null) {
+      err(`${problem ?? "--timeout must be a positive number of milliseconds"}\n`);
+      return EXIT.usage;
+    }
+    for (const [option, file] of [["json", values.json], ["sarif", values.sarif], ["markdown", values.markdown]] as const) {
+      const p = file ? outputProblem(option, file) : null;
+      if (p) {
+        err(`${p}\n`);
+        return EXIT.usage;
+      }
+    }
     const { runConsentCommand } = await import("./consent-command.js");
     const o: Parameters<typeof runConsentCommand>[0] = {
       mcpUrl: url.toString(),
@@ -268,6 +338,7 @@ export async function main(argv: string[]): Promise<number> {
       secret: readSecret(values["secret-file"]),
       failOn,
     };
+    if (timeoutMs !== undefined) o.requestTimeoutMs = timeoutMs;
     if (values.browser) o.browser = values.browser;
     if (values["browser-path"]) o.browserPath = values["browser-path"];
     if (values.json) o.json = values.json;
@@ -288,8 +359,15 @@ export async function main(argv: string[]): Promise<number> {
       err(`Not a URL: ${sub}\n`);
       return EXIT.usage;
     }
+    const problem = targetProblem(url, values["allow-private"]);
+    const timeoutMs = parseTimeout(values.timeout);
+    if (problem || timeoutMs === null) {
+      err(`${problem ?? "--timeout must be a positive number of milliseconds"}\n`);
+      return EXIT.usage;
+    }
     const { runLoginCommand } = await import("./login-command.js");
     return runLoginCommand({
+      ...(timeoutMs !== undefined ? { requestTimeoutMs: timeoutMs } : {}),
       mcpUrl: url.toString(),
       out: values.out,
       force: values.force,
@@ -313,10 +391,22 @@ export async function main(argv: string[]): Promise<number> {
       err(`Not a URL: ${sub}\n`);
       return EXIT.usage;
     }
-    const timeoutMs = values.timeout ? Number(values.timeout) : undefined;
-    if (timeoutMs !== undefined && (!Number.isFinite(timeoutMs) || timeoutMs <= 0)) {
+    const timeoutMs = parseTimeout(values.timeout);
+    if (timeoutMs === null) {
       err(`--timeout must be a positive number of milliseconds\n`);
       return EXIT.usage;
+    }
+    const problem = targetProblem(url, values["allow-private"]);
+    if (problem) {
+      err(`${problem}\n`);
+      return EXIT.usage;
+    }
+    for (const [option, file] of [["json", values.json], ["sarif", values.sarif], ["markdown", values.markdown]] as const) {
+      const p = file ? outputProblem(option, file) : null;
+      if (p) {
+        err(`${p}\n`);
+        return EXIT.usage;
+      }
     }
 
     const options: Parameters<typeof scan>[1] = { allowPrivate: values["allow-private"] };
@@ -406,6 +496,8 @@ export async function main(argv: string[]): Promise<number> {
     if (values.sarif) writeFileSync(values.sarif, toSarif(report));
     if (values.markdown) writeFileSync(values.markdown, toMarkdown(report));
 
+    // A scan that could not run is an error whatever --fail-on-inconclusive says: it must never look like a clean scan.
+    if (report.reachable === false) return EXIT.error;
     if (report.findings.some((f) => f.status === "fail" && severityAtLeast(f.severity, failOn))) return EXIT.findings;
     if (failOnInconclusive && report.findings.some((f) => f.status === "error")) return EXIT.error;
     return EXIT.ok;

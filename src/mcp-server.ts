@@ -146,7 +146,7 @@ export function createAuthprobeServer(config: ServerConfig): McpServer {
       annotations: { readOnlyHint: true, openWorldHint: false },
     },
     async ({ id }) => {
-      const c = getCheck(/^MAP-/i.test(id) ? id : `MAP-${id}`);
+      const c = getCheck(id);
       if (!c) return errorResult(`Unknown check: ${id}`);
       return text(
         `${c.id}: ${c.title}\nSeverity: ${c.severity}. Mode: ${c.active ? "active" : "passive"}. Status: ${c.availability}.\n\nWhy: ${c.rationale}\n\nFix: ${c.remediation}\n\nReferences:\n${c.references.map((r) => `- ${r.title}: ${r.url}`).join("\n")}`,

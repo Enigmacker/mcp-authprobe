@@ -37,6 +37,7 @@ const RFC8414: Reference = { title: "RFC 8414 - OAuth 2.0 Authorization Server M
 export const CATALOGUE: readonly CheckDefinition[] = [
   {
     id: "MAP-DSC01",
+    runsWith: "every scan",
     family: "DSC",
     title: "Authorization endpoints are discoverable",
     severity: "info",
@@ -50,6 +51,7 @@ export const CATALOGUE: readonly CheckDefinition[] = [
   },
   {
     id: "MAP-RTK01",
+    runsWith: "a test grant (`--credentials-file`)",
     family: "RTK",
     title: "Refresh tokens for public clients are rotated",
     severity: "high",
@@ -63,6 +65,7 @@ export const CATALOGUE: readonly CheckDefinition[] = [
   },
   {
     id: "MAP-RTK02",
+    runsWith: "a test grant (`--credentials-file`)",
     family: "RTK",
     title: "A rotated refresh token cannot be replayed",
     severity: "critical",
@@ -75,6 +78,7 @@ export const CATALOGUE: readonly CheckDefinition[] = [
   },
   {
     id: "MAP-RTK03",
+    runsWith: "a test grant (`--credentials-file`)",
     family: "RTK",
     title: "Refresh token replay revokes the token family",
     severity: "high",
@@ -87,6 +91,7 @@ export const CATALOGUE: readonly CheckDefinition[] = [
   },
   {
     id: "MAP-RDR01",
+    runsWith: "every scan with ownership proven",
     family: "RDR",
     title: "Unregistered redirect_uri is refused at the authorization endpoint",
     severity: "critical",
@@ -100,6 +105,7 @@ export const CATALOGUE: readonly CheckDefinition[] = [
   },
   {
     id: "MAP-RDR02",
+    runsWith: "every scan with ownership proven",
     family: "RDR",
     title: "redirect_uri matching is exact, not prefix or pattern based",
     severity: "high",
@@ -112,6 +118,7 @@ export const CATALOGUE: readonly CheckDefinition[] = [
   },
   {
     id: "MAP-RDR03",
+    runsWith: "`login`",
     family: "RDR",
     title: "Token endpoint enforces the redirect_uri used at authorization",
     severity: "medium",
@@ -124,6 +131,7 @@ export const CATALOGUE: readonly CheckDefinition[] = [
   },
   {
     id: "MAP-RDR04",
+    runsWith: "every scan with ownership proven",
     family: "RDR",
     title: "Dynamic client registration refuses unsafe redirect URIs",
     severity: "high",
@@ -136,6 +144,7 @@ export const CATALOGUE: readonly CheckDefinition[] = [
   },
   {
     id: "MAP-PKC01",
+    runsWith: "`login`",
     family: "PKC",
     title: "Token endpoint enforces PKCE",
     severity: "high",
@@ -148,6 +157,7 @@ export const CATALOGUE: readonly CheckDefinition[] = [
   },
   {
     id: "MAP-COD01",
+    runsWith: "`login`",
     family: "COD",
     title: "An authorization code cannot be used twice",
     severity: "high",
@@ -160,6 +170,7 @@ export const CATALOGUE: readonly CheckDefinition[] = [
   },
   {
     id: "MAP-AUD01",
+    runsWith: "`login`",
     family: "AUD",
     title: "Tokens are bound to their audience",
     severity: "high",
@@ -172,6 +183,7 @@ export const CATALOGUE: readonly CheckDefinition[] = [
   },
   {
     id: "MAP-ORG01",
+    runsWith: "every scan; with a credential through `login` or a static key",
     family: "ORG",
     title: "MCP endpoint rejects requests from a foreign Origin",
     severity: "medium",
@@ -184,6 +196,7 @@ export const CATALOGUE: readonly CheckDefinition[] = [
   },
   {
     id: "MAP-TOK01",
+    runsWith: "`login` or a static key",
     family: "TOK",
     title: "MCP endpoint refuses access tokens and keys in the URL",
     severity: "medium",
@@ -196,6 +209,7 @@ export const CATALOGUE: readonly CheckDefinition[] = [
   },
   {
     id: "MAP-SES01",
+    runsWith: "`login` or a static key",
     family: "SES",
     title: "An MCP session ID is not accepted instead of a token",
     severity: "high",
@@ -208,6 +222,7 @@ export const CATALOGUE: readonly CheckDefinition[] = [
   },
   {
     id: "MAP-COR01",
+    runsWith: "every scan",
     family: "COR",
     title: "MCP endpoint does not allow credentialed requests from any origin",
     severity: "medium",
@@ -220,6 +235,7 @@ export const CATALOGUE: readonly CheckDefinition[] = [
   },
   {
     id: "MAP-BAT01",
+    runsWith: "`login` or a static key",
     family: "BAT",
     title: "MCP endpoint refuses JSON-RPC batches",
     severity: "medium",
@@ -235,6 +251,7 @@ export const CATALOGUE: readonly CheckDefinition[] = [
   },
   {
     id: "MAP-BOD01",
+    runsWith: "`login` or a static key",
     family: "BOD",
     title: "MCP endpoint limits the request body size",
     severity: "low",
@@ -247,6 +264,7 @@ export const CATALOGUE: readonly CheckDefinition[] = [
   },
   {
     id: "MAP-INJ01",
+    runsWith: "`login`, a static key, or an anonymous server",
     family: "INJ",
     title: "Tool, prompt and resource metadata carry no hidden instructions",
     severity: "high",
@@ -264,6 +282,7 @@ export const CATALOGUE: readonly CheckDefinition[] = [
   },
   {
     id: "MAP-THR02",
+    runsWith: "a static key (`--bearer-file`)",
     family: "THR",
     title: "MCP endpoint rate-limits each credential",
     severity: "low",
@@ -276,6 +295,7 @@ export const CATALOGUE: readonly CheckDefinition[] = [
   },
   {
     id: "MAP-THR01",
+    runsWith: "every scan with ownership proven",
     family: "THR",
     title: "Repeated failed token requests are throttled",
     severity: "medium",
@@ -288,6 +308,7 @@ export const CATALOGUE: readonly CheckDefinition[] = [
   },
   {
     id: "MAP-CSR01",
+    runsWith: "`consent-check`",
     family: "CSR",
     title: "Consent decision is protected against cross-site request forgery",
     severity: "high",
@@ -300,6 +321,12 @@ export const CATALOGUE: readonly CheckDefinition[] = [
   },
 ];
 
+/** A check by ID, case-insensitive, with or without the MAP- prefix (MAP-RTK02, rtk02). */
 export function getCheck(id: string): CheckDefinition | undefined {
-  return CATALOGUE.find((c) => c.id.toUpperCase() === id.toUpperCase());
+  const name = id.trim().toUpperCase();
+  const full = name.startsWith("MAP-") ? name : `MAP-${name}`;
+  return CATALOGUE.find((c) => c.id === full);
 }
+
+/** Checks `login` observes, in the order it runs them. */
+export const LOGIN_CHECK_IDS = ["MAP-PKC01", "MAP-RDR03", "MAP-ORG01", "MAP-TOK01", "MAP-SES01", "MAP-BAT01", "MAP-BOD01", "MAP-INJ01", "MAP-AUD01", "MAP-COD01"] as const;

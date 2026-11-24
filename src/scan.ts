@@ -1,12 +1,12 @@
 import { CATALOGUE } from "./checks/catalogue.js";
 import { runRedirectUriChecks } from "./checks/redirect-uris.js";
-import { runRefreshTokenChecks } from "./checks/refresh-tokens.js";
+import { runRefreshTokenSequence } from "./checks/refresh-tokens.js";
 import { runThrottlingCheck } from "./checks/throttling.js";
 import type { Observation, TestGrant } from "./credentials.js";
 import { discover, type DiscoveryResult } from "./discovery.js";
 import { runEndpointChecks, runMetadataCheck } from "./checks/endpoint.js";
 import { FOREIGN_ORIGIN, initializeStatus, type Credential } from "./oauth/mcp-call.js";
-import { HttpClient } from "./net/http.js";
+import { BlockedAddressError, HttpClient, InsecureTransportError, NetworkError } from "./net/http.js";
 import { verifyOwnership, type OwnershipResult, type VerifyOptions } from "./ownership.js";
 import { safeText } from "./redact.js";
 import type { CheckSelector } from "./selection.js";
@@ -109,8 +109,13 @@ async function runRefreshFamily(target: string, d: DiscoveryResult | null, http:
   }
   const { grant, reason } = grantFor(target, tokenEndpoint, options);
   if (!grant) return all("skipped", reason ?? "No usable test grant.");
-  return runRefreshTokenChecks({ http, target, tokenEndpoint, grant });
+  return (await runRefreshTokenSequence({ http, target, tokenEndpoint, grant, ...(options.select ? { select: options.select } : {}) })).findings;
 }
+
+const LOGIN_ADVICE = "Observed during login: run `mcp-authprobe login` with ownership proven, then scan with the grant file it writes.";
+const NO_LOGIN_ADVICE = "Observed during login, which is not possible on this server: `mcp-authprobe login` registers its client through dynamic client registration, and the authorization server offers none.";
+/** The advice given for a check that needs `login`: adapted to what discovery found, so it never points at a command that cannot work. */
+const loginAdvice = { current: LOGIN_ADVICE };
 
 /**
  * Report a result observed during `login`. The observation comes from a
@@ -120,7 +125,7 @@ async function runRefreshFamily(target: string, d: DiscoveryResult | null, http:
 function fromObservation(checkId: string, target: string, observations: Observation[]): Finding {
   const def = CATALOGUE.find((c) => c.id === checkId) as CheckDefinition;
   const obs = observations.filter((o) => o.checkId === checkId && o.target === target).at(-1);
-  if (!obs) return finding(def, target, "skipped", "Observed during login: run `mcp-authprobe login` with ownership proven, then scan with the grant file it writes.");
+  if (!obs) return finding(def, target, "skipped", loginAdvice.current);
   return finding(def, target, obs.status, obs.message, [...obs.evidence, `observed during login at ${obs.observedAt}`]);
 }
 
@@ -138,7 +143,8 @@ async function metadataWithoutCredential(target: string, http: HttpClient, obser
     return finding(def, target, "error", `Request failed: ${(err as Error).message}`);
   }
   if (anonymous >= 200 && anonymous < 300) return runMetadataCheck(http, target);
-  return finding(def, target, "skipped", "Needs a credential: run `mcp-authprobe login` (ownership proven) and scan with the grant file it writes, or pass a static key with --bearer-file.", [`initialize without any credential: HTTP ${anonymous}`]);
+  const how = loginAdvice.current === LOGIN_ADVICE ? "run `mcp-authprobe login` (ownership proven) and scan with the grant file it writes, or pass a static key with --bearer-file" : "pass a static key with --bearer-file (`mcp-authprobe login` needs dynamic client registration, which this server does not offer)";
+  return finding(def, target, "skipped", `Needs a credential: ${how}.`, [`initialize without any credential: HTTP ${anonymous}`]);
 }
 
 /**
@@ -269,7 +275,9 @@ async function runOriginCheck(target: string, http: HttpClient, observations: Ob
   if (baseline === 401 && foreign === 401) {
     const next = staticKey
       ? "Prove ownership of the target so the declared key can be used, then scan again."
-      : "Run `mcp-authprobe login` (ownership proven) to observe it with a valid token, or pass a static key with --bearer-file.";
+      : loginAdvice.current === LOGIN_ADVICE
+        ? "Run `mcp-authprobe login` (ownership proven) to observe it with a valid token, or pass a static key with --bearer-file."
+        : "Pass a static key with --bearer-file to observe it with a credential (`mcp-authprobe login` needs dynamic client registration, which this server does not offer).";
     return finding(def, target, "error", `Inconclusive: the server asks for authentication before looking at Origin. ${next}`, evidence);
   }
   return finding(def, target, "error", "Unexpected answers; inconclusive.", evidence);
@@ -290,8 +298,27 @@ export async function scan(mcpUrl: string, options: ScanOptions = {}): Promise<S
       discovery = await discover(target, http);
       if (dscDef) findings.push(dsc01(dscDef, discovery, options.credential?.kind === "static"));
     } catch (err) {
+      // No HTTP answer at all (or a request the address policy refuses): nothing can be tested.
+      // One finding says so; a scan that could not run is never reported like a clean one.
+      if (err instanceof NetworkError || err instanceof BlockedAddressError || err instanceof InsecureTransportError) {
+        const why = err instanceof NetworkError ? `Target unreachable: ${err.message}.` : err.message;
+        for (const def of CATALOGUE) {
+          findings.push(def.id === "MAP-DSC01" ? finding(def, target, "error", `${why} No check was run.`) : finding(def, target, "skipped", "Target unreachable: not run."));
+        }
+        return {
+          tool: { name: TOOL_NAME, version: TOOL_VERSION },
+          startedAt,
+          finishedAt: new Date().toISOString(),
+          target,
+          reachable: false,
+          ownership: { verified: false, method: null, detail: "Not checked: the target is unreachable." },
+          findings,
+        };
+      }
       if (dscDef) findings.push(finding(dscDef, target, "error", `Discovery failed: ${(err as Error).message}`));
     }
+    const offersLogin = typeof discovery?.as?.metadata.registration_endpoint === "string" || !discovery?.as;
+    loginAdvice.current = offersLogin ? LOGIN_ADVICE : NO_LOGIN_ADVICE;
 
     // Every host an active check would touch must be proven.
     const verifyOpts: VerifyOptions = { http, loopbackExempt: options.loopbackExempt ?? true };
@@ -362,7 +389,8 @@ export async function scan(mcpUrl: string, options: ScanOptions = {}): Promise<S
       for (const f of findings) {
         if (seen.has(f.checkId)) continue;
         seen.add(f.checkId);
-        kept.push(wanted(f.checkId) ? f : notSelected(f.checkId, target));
+        // An unselected refresh token step whose request was shared with a selected one says so itself.
+        kept.push(wanted(f.checkId) || f.message.startsWith("Not selected") ? f : notSelected(f.checkId, target));
       }
       for (const def of CATALOGUE) if (!seen.has(def.id)) kept.push(notSelected(def.id, target));
       findings.splice(0, findings.length, ...kept);
@@ -373,6 +401,7 @@ export async function scan(mcpUrl: string, options: ScanOptions = {}): Promise<S
       startedAt,
       finishedAt: new Date().toISOString(),
       target,
+      reachable: true,
       ownership,
       findings,
     };

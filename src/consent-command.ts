@@ -29,6 +29,8 @@ export interface ConsentCommandOptions {
   json?: string;
   sarif?: string;
   markdown?: string;
+  /** Per-request timeout in milliseconds (--timeout). */
+  requestTimeoutMs?: number;
 }
 
 const err = (t: string): void => {
@@ -66,7 +68,7 @@ export function waitForEnter(
 
 /** `mcp-authprobe consent-check`: MAP-CSR01 with a real browser session. Returns an exit code. */
 export async function runConsentCommand(o: ConsentCommandOptions): Promise<number> {
-  const http = new HttpClient({ allowPrivate: o.allowPrivate });
+  const http = new HttpClient({ allowPrivate: o.allowPrivate, ...(o.requestTimeoutMs !== undefined ? { timeoutMs: o.requestTimeoutMs } : {}) });
   const startedAt = new Date().toISOString();
   const target = new URL(o.mcpUrl).toString();
   let client: RegisteredClient | null = null;

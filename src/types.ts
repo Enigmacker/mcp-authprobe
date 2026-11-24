@@ -26,6 +26,8 @@ export interface CheckDefinition {
   family: string;
   /** "available" checks run today; "planned" ones are documented ahead of time. */
   availability: "available" | "planned";
+  /** What a run needs for this check to execute, in a few words (Markdown), for the documentation. */
+  runsWith: string;
   rationale: string;
   remediation: string;
   references: readonly Reference[];
@@ -48,6 +50,8 @@ export interface ScanReport {
   startedAt: string;
   finishedAt: string;
   target: string;
+  /** False when the target gave no HTTP answer at all: no check ran, and the CLI exits with an error whatever --fail-on-inconclusive says. */
+  reachable?: boolean;
   ownership: { verified: boolean; method: string | null; detail: string };
   findings: Finding[];
   /** Imported mcp-posture results and how they relate to these findings (--posture-report). */
