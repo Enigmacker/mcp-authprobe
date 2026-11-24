@@ -27,7 +27,10 @@ export { HttpClient, BlockedAddressError, InsecureTransportError, NetworkError, 
 export type { HttpOptions } from "./net/http.js";
 export { bearerCredential, detectEra, LEGACY_VERSION, MODERN_VERSION } from "./oauth/mcp-call.js";
 export type { Credential, Dialect, Era, EraProbe } from "./oauth/mcp-call.js";
-export { generateSecret, proofFor, verifyOwnership } from "./ownership.js";
+export { generateSecret, matchProof, proofFor, proofV2For, verifyOwnership, weakSecretWarning } from "./ownership.js";
+export { planScan, planToText } from "./plan.js";
+export type { PlanEntry, ScanPlan } from "./plan.js";
+export { pendingClients, setClientJournal } from "./oauth/registration.js";
 export type { OwnershipResult } from "./ownership.js";
 export { forgetSecrets, registerSecret, safeText } from "./redact.js";
 export { REPORT_SCHEMA, toJson } from "./report/json.js";

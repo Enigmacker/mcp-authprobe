@@ -9,7 +9,7 @@ import { observationSource, type Observation, type TestGrant } from "./credentia
 import { discover, scopesFor, type DiscoveryResult } from "./discovery.js";
 import { BlockedAddressError, HttpClient, InsecureTransportError, NetworkError, ScanInterruptedError } from "./net/http.js";
 import { FOREIGN_ORIGIN, helloName, initializeStatus, MODERN_VERSION, rpcMessage, versionOf, type Credential, type Era } from "./oauth/mcp-call.js";
-import { verifyOwnership, type OwnershipResult, type VerifyOptions } from "./ownership.js";
+import { normalizeHost, verifyOwnership, type OwnershipResult, type VerifyOptions } from "./ownership.js";
 import type { CheckSelector } from "./selection.js";
 import type { CheckStatus, DiscoverySummary, Finding, GrantReport, Leftover, ReasonCode, ScanReport } from "./types.js";
 import { TOOL_NAME, TOOL_VERSION } from "./version.js";
@@ -38,6 +38,18 @@ export interface ScanOptions {
   requireGrantBinding?: boolean;
   /** Exempt loopback labs from the ownership proof (default true; see VerifyOptions). */
   loopbackExempt?: boolean;
+  /**
+   * Exempt only these exact origins (MCP mode: the labs the human listed).
+   * A loopback host is then exempt only if every URL the scan would contact
+   * on it has one of these origins: another port of the same machine is not.
+   */
+  exemptOrigins?: readonly string[];
+  /** With `allowPrivate`, other hosts than the target for which a private address is accepted (--allow-host). */
+  allowHosts?: readonly string[];
+  /** Headers sent with every request to the target origin, and nowhere else (--header-file). */
+  extraHeaders?: Record<string, string>;
+  /** Name of the preset the selection comes from, recorded in the report. */
+  preset?: string;
   /** Failed token requests sent by MAP-THR01 (clamped to 5-20, default 10). */
   throttleAttempts?: number;
   /** Results observed during `login`, read from the grant file. */
@@ -432,7 +444,13 @@ export async function runScan(mcpUrl: string, options: ScanOptions = {}): Promis
   const timer = options.deadlineMs !== undefined && options.deadlineMs > 0 ? setTimeout(() => stop.abort(), options.deadlineMs) : undefined;
   timer?.unref?.();
 
-  const httpOptions: ConstructorParameters<typeof HttpClient>[0] = { allowPrivate: options.allowPrivate ?? false, signal: stop.signal };
+  const httpOptions: ConstructorParameters<typeof HttpClient>[0] = {
+    allowPrivate: options.allowPrivate ?? false,
+    signal: stop.signal,
+    // Private addresses are for the target (and the hosts the operator named), not for wherever the server's metadata points.
+    privateHosts: [new URL(target).hostname, ...(options.allowHosts ?? [])],
+    ...(options.extraHeaders ? { extraHeaders: { origin: new URL(target).origin, headers: options.extraHeaders } } : {}),
+  };
   if (options.timeoutMs !== undefined) httpOptions.timeoutMs = options.timeoutMs;
   if (options.delayMs !== undefined) httpOptions.delayMs = options.delayMs;
   if (options.maxRequests !== undefined) httpOptions.maxRequests = options.maxRequests;
@@ -501,6 +519,7 @@ export async function runScan(mcpUrl: string, options: ScanOptions = {}): Promis
             : "none",
       },
       leftovers: ctx?.leftovers ?? [],
+      ...(options.preset ? { preset: options.preset } : {}),
     };
     emit({ type: "scan_finished", complete, at: finishedAt });
     return { report, grant: { latest: ctx?.grant.used ? ctx.grant.latest : (options.grant ?? null), state: ctx?.grant.used ? ctx.grant.state : "unused" } };
@@ -561,8 +580,20 @@ export async function runScan(mcpUrl: string, options: ScanOptions = {}): Promis
     if (options.resolveTxtRecords) verifyOpts.resolveTxtRecords = options.resolveTxtRecords;
     const results: OwnershipResult[] = [];
     try {
+      const contacted = [target, discovery?.as?.metadata.authorization_endpoint, discovery?.as?.metadata.token_endpoint, discovery?.as?.metadata.registration_endpoint].filter((u): u is string => typeof u === "string");
       for (const host of hostsToVerify(target, discovery)) {
         const perHost = { ...verifyOpts };
+        if (options.exemptOrigins) {
+          const origins = contacted.flatMap((u) => {
+            try {
+              const parsed = new URL(u);
+              return parsed.hostname === host ? [parsed.origin] : [];
+            } catch {
+              return [];
+            }
+          });
+          perHost.loopbackExempt = origins.length > 0 && origins.every((o) => (options.exemptOrigins as readonly string[]).includes(o));
+        }
         if (options.wellKnownBaseUrl && host === new URL(target).hostname) perHost.wellKnownBaseUrl = options.wellKnownBaseUrl;
         results.push(await verifyOwnership(host, options.secret, perHost));
       }
@@ -577,6 +608,19 @@ export async function runScan(mcpUrl: string, options: ScanOptions = {}): Promis
       detail: results.map((r) => `${r.host}: ${r.detail}`).join(" "),
       hosts: results.map((r) => ({ host: r.host, verified: r.verified, method: r.method, detail: r.detail })),
     };
+    // The proof is judged host by host: a check runs when the hosts it sends requests to are proven.
+    const provenHosts = new Set(results.filter((r) => r.verified).map((r) => r.host));
+    const hostOf = (u: unknown): string | null => {
+      try {
+        return typeof u === "string" ? normalizeHost(new URL(u).hostname) : null;
+      } catch {
+        return null;
+      }
+    };
+    const mcpProven = complete && provenHosts.has(hostOf(target) ?? "");
+    const asEndpoints = [discovery?.as?.metadata.authorization_endpoint, discovery?.as?.metadata.token_endpoint, discovery?.as?.metadata.registration_endpoint];
+    const unprovenAsHosts = [...new Set(asEndpoints.map(hostOf).filter((h): h is string => h !== null && !provenHosts.has(h)))];
+    const asProven = mcpProven && unprovenAsHosts.length === 0;
 
     const ctx: Ctx = {
       target,
@@ -594,7 +638,7 @@ export async function runScan(mcpUrl: string, options: ScanOptions = {}): Promis
 
     // With a credential and ownership proven, the MCP endpoint checks run with it.
     const handled = new Set<string>();
-    if (credential && verified) {
+    if (credential && mcpProven) {
       // MAP-THR02 may get the credential limited for a while: with an OAuth token it only runs on request.
       const ids = ENDPOINT_IDS.filter((id) => id !== "MAP-THR02" || credential.kind === "static" || options.rateLimitWithToken === true);
       await stage(ids, async (selected) => {
@@ -618,9 +662,9 @@ export async function runScan(mcpUrl: string, options: ScanOptions = {}): Promis
     await stage(["MAP-COR01"], () => runCorsCheck(target, http, ctx.era));
 
     const active = CATALOGUE.filter((c) => c.active);
-    if (!verified) {
+    if (!mcpProven) {
       for (const def of active) {
-        findings.push(makeFinding(def.id, target, "skipped", "Ownership of every contacted host is not proven; active check not run.", [], "ownership_unproven"));
+        findings.push(makeFinding(def.id, target, "skipped", `Ownership of ${hostOf(target) ?? "the target"} is not proven; active check not run.`, [], "ownership_unproven"));
       }
     } else if (credential?.kind === "static" && discovery !== null && !discovery.prm && !discovery.as && !discovery.challenge.resourceMetadataUrl) {
       // No OAuth on this server: the authorization server checks do not apply.
@@ -631,20 +675,27 @@ export async function runScan(mcpUrl: string, options: ScanOptions = {}): Promis
       // MAP-AUD01 can be judged in the scan itself given an access token (the control) and a grant.
       const tokenEndpoint = discovery?.as?.metadata.token_endpoint;
       const usable = typeof tokenEndpoint === "string" ? grantFor(target, tokenEndpoint, options).grant : null;
-      if (credential?.kind === "oauth" && usable && typeof tokenEndpoint === "string") {
+      // Checks that send requests to the authorization server need its host proven too; the others do not.
+      const AS_IDS = [...RTK_IDS, ...RDR_IDS, "MAP-THR01"];
+      if (!asProven) {
+        for (const id of AS_IDS) {
+          findings.push(makeFinding(id, target, "skipped", `Ownership of ${unprovenAsHosts.join(", ")} (the authorization server) is not proven: this check sends requests there and was not run. The checks of the MCP endpoint do not need that proof.`, [], "ownership_unproven"));
+        }
+      }
+      if (asProven && credential?.kind === "oauth" && usable && typeof tokenEndpoint === "string") {
         await stage(["MAP-AUD01"], () => runAudienceDuringScan(ctx, credential, tokenEndpoint, usable));
         if (wanted("MAP-AUD01")) handled.add("MAP-AUD01");
       }
       // The refresh token checks are one sequence: only the steps the selected ones need are sent.
-      await stage(RTK_IDS, () => runRefreshFamily(ctx));
-      await stage(RDR_IDS, () => runRedirectFamily(ctx, wanted));
+      if (asProven) await stage(RTK_IDS, () => runRefreshFamily(ctx));
+      if (asProven) await stage(RDR_IDS, () => runRedirectFamily(ctx, wanted));
       for (const id of LOGIN_ONLY_IDS) {
         if (!handled.has(id)) findings.push(fromObservation(ctx, id));
       }
       if (!handled.has("MAP-INJ01")) await stage(["MAP-INJ01"], () => metadataWithoutCredential(ctx));
       findings.push(makeFinding("MAP-CSR01", target, "skipped", "Needs a logged-in browser session: run `mcp-authprobe consent-check` separately.", [], "needs_browser"));
       // Last on purpose: once throttled, the token endpoint may refuse other checks.
-      await stage(["MAP-THR01"], () => runThrottleFamily(ctx));
+      if (asProven) await stage(["MAP-THR01"], () => runThrottleFamily(ctx));
       if (!handled.has("MAP-THR02")) {
         findings.push(
           credential?.kind === "oauth"
@@ -657,6 +708,14 @@ export async function runScan(mcpUrl: string, options: ScanOptions = {}): Promis
       }
     }
     if (http.interrupted) complete = false;
+    // Context for a failing MAP-ORG01 on a public server: the requirement is about DNS rebinding and browsers.
+    const org = findings.find((f) => f.checkId === "MAP-ORG01" && f.status === "fail");
+    const cors = findings.find((f) => f.checkId === "MAP-COR01");
+    if (org && credential && new URL(target).protocol === "https:" && cors?.status === "pass") {
+      org.evidence.push(
+        "context: this endpoint is reached over https and authenticated by a header that a browser never adds by itself, and MAP-COR01 found no credentialed CORS access: a web page cannot use a visitor's rights here. The specification still requires 403 for an invalid Origin; the risk is highest for servers on a local network or using cookies.",
+      );
+    }
     return finish({ ownership }, ctx);
   } finally {
     if (timer) clearTimeout(timer);

@@ -6,6 +6,29 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.13.0] - 2026-11-24
+
+### Changed (read this before upgrading)
+
+- **`--allow-private` is for the scanned host.** It used to lift the address filter for every host, so the metadata of a server could send the scanner to other internal addresses. Private addresses are now only accepted for the scanned host and the other names of the loopback; an authorization server on another private address needs `--allow-host <host>` (repeatable; `MCP_AUTHPROBE_ALLOW_HOSTS` in MCP mode). Library callers of `HttpClient` keep the old behaviour unless they pass `privateHosts`; `scan()` applies the new rule.
+- **The ownership proof is judged host by host.** With the MCP host proven and the authorization server's not, the checks of the MCP endpoint (with a key or a token), and the endpoint checks of `login`, now run; they were all skipped. The checks that send requests to the authorization server stay skipped, with the reason `ownership_unproven` and the host named. No active request goes to a host without a proof. `ownership.verified` keeps its meaning (every host proven).
+- In MCP mode, a lab listed in `MCP_AUTHPROBE_LAB_ORIGINS` is exempt from the proof by its exact origin; the exemption used to cover every port of the loopback once the target was listed.
+- `ownership init` and `ownership proof` print the version 2 proof (below). Version 1 proofs already published keep working; versions before 0.13 only verify version 1, which both commands still show.
+- The Docker image's entry point is the CLI (`docker run … mcp-authprobe scan …`); without arguments it still runs the MCP server, so existing `docker run -i` configurations are unchanged. An explicit `--entrypoint node … dist/cli.js` is no longer needed.
+
+### Added
+
+- `mcp-authprobe plan <url>`: what a scan with these options would run, why not the rest, how many requests and what effect, after discovery only. A test keeps it in agreement with `scan`.
+- `--preset passive|standard|intrusive`. `intrusive` is the default and equals the previous behaviour; `standard` leaves out `MAP-BOD01` and `MAP-THR02`; `passive` uses no credential and sends nothing active.
+- Ownership proof version 2: HMAC-SHA256 keyed by the secret, with an optional expiry (`ownership proof <host> --expires YYYY-MM-DD`). A warning for a secret that does not look random.
+- `--journal <file>` and `mcp-authprobe cleanup --journal <file>`: delete the test clients a killed scan left on the server.
+- `--header-file <file>`: extra headers for the scanned origin only.
+- `MCP_AUTHPROBE_ALLOWED_HOSTS` in MCP mode: the only hosts the `scan` tool accepts.
+- SARIF results carry `partialFingerprints`, stable for a check and a target.
+- GitHub Action: inputs `access-token`, `client-id`, `redirect-uri`, `preset`, `protocol`; output `coverage`.
+- A `Docker image` workflow: amd64 and arm64, build provenance and SBOM, on each release and weekly on a fresh base image.
+- `MAP-ORG01`: when it fails on a server reached over https with header authentication and no credentialed CORS access, the evidence gives that context. The severity is unchanged.
+
 ## [0.12.0] - 2026-11-24
 
 MCP 2026-07-28. Until now the scanner only spoke the `initialize` handshake of 2025-11-25: against a server that only speaks the stateless revision, every check of the MCP endpoint was inconclusive, with a message that blamed the credential.
@@ -228,7 +251,8 @@ First release.
 - Hardening from an independent review before release: HTTPS is required for every request outside loopback/private labs; rate limits and server errors make redirect URI, registration and throttling checks inconclusive instead of passing; test grants record their target and token endpoint and are never used elsewhere (and must name their target in MCP mode); loopback targets need a proof in MCP mode unless listed in `MCP_AUTHPROBE_LAB_ORIGINS`; `login` output is neutralized; more IPv6 transition ranges are refused; a malformed issuer no longer aborts discovery.
 - Local fixture server with a stateful token endpoint, dynamic registration and an authorization endpoint and test suite; GitHub Actions CI.
 
-[Unreleased]: https://github.com/Enigmacker/mcp-authprobe/compare/v0.12.0...HEAD
+[Unreleased]: https://github.com/Enigmacker/mcp-authprobe/compare/v0.13.0...HEAD
+[0.13.0]: https://github.com/Enigmacker/mcp-authprobe/compare/v0.12.0...v0.13.0
 [0.12.0]: https://github.com/Enigmacker/mcp-authprobe/compare/v0.11.0...v0.12.0
 [0.11.0]: https://github.com/Enigmacker/mcp-authprobe/compare/v0.10.2...v0.11.0
 [0.10.2]: https://github.com/Enigmacker/mcp-authprobe/compare/v0.10.1...v0.10.2

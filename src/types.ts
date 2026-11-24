@@ -178,6 +178,8 @@ export interface ScanReport {
   /** How the checks that need an OAuth client obtain one. */
   client?: { source: "pre-registered" | "metadata-document" | "dynamic-registration" | "none" };
   leftovers?: Leftover[];
+  /** The preset the selection came from (--preset), when one was used. */
+  preset?: string;
   /** Imported mcp-posture results and how they relate to these findings (--posture-report). */
   posture?: import("./posture.js").PostureSection;
 }

@@ -36,6 +36,7 @@ jobs:
         run: |
           node dist/cli.js --version
           node dist/cli.js checks list
+          node dist/cli.js capabilities --json > /dev/null
 
   audit:
     name: Dependency audit
@@ -123,6 +124,11 @@ jobs:
         with:
           persist-credentials: false
       - run: docker build -t mcp-authprobe .
+      - name: The CLI is the entry point
+        run: |
+          test "$(docker run --rm mcp-authprobe --version)" = "$(node -p "require('./package.json').version")"
+          docker run --rm mcp-authprobe checks list | grep -q MAP-DSC01
+          docker run --rm mcp-authprobe capabilities --json | node -e 'const c=JSON.parse(require("fs").readFileSync(0,"utf8")); if(c.reportSchema!=="mcp-authprobe/report/v1") process.exit(1)'
       - name: initialize and tools/list over stdio
         run: |
           printf '%s\n' \

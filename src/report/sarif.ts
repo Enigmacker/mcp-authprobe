@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { CATALOGUE } from "../checks/catalogue.js";
 import type { ScanReport, Severity } from "../types.js";
 
@@ -42,6 +43,8 @@ export function toSarif(report: ScanReport): string {
       ruleId: f.checkId,
       level: LEVEL[f.severity],
       message: { text: [f.message, ...f.evidence].join("\n") },
+      // Stable across runs: the same check failing on the same target is the same alert.
+      partialFingerprints: { "mcpAuthprobe/v1": createHash("sha256").update(`${f.checkId}\n${f.target}`).digest("hex").slice(0, 32) },
       locations: [
         {
           physicalLocation: { artifactLocation: { uri: f.target } },

@@ -31,6 +31,8 @@ export interface ConsentCommandOptions {
   markdown?: string;
   /** Per-request timeout in milliseconds (--timeout). */
   requestTimeoutMs?: number;
+  /** With allowPrivate, other hosts that may be on a private address (--allow-host). */
+  allowHosts?: readonly string[];
   /** A supplied client and its loopback redirect URI, instead of dynamic registration. */
   client?: { clientId: string; redirectUri?: string };
 }
@@ -70,7 +72,7 @@ export function waitForEnter(
 
 /** `mcp-authprobe consent-check`: MAP-CSR01 with a real browser session. Returns an exit code. */
 export async function runConsentCommand(o: ConsentCommandOptions): Promise<number> {
-  const http = new HttpClient({ allowPrivate: o.allowPrivate, ...(o.requestTimeoutMs !== undefined ? { timeoutMs: o.requestTimeoutMs } : {}) });
+  const http = new HttpClient({ allowPrivate: o.allowPrivate, privateHosts: [new URL(o.mcpUrl).hostname, ...(o.allowHosts ?? [])], ...(o.requestTimeoutMs !== undefined ? { timeoutMs: o.requestTimeoutMs } : {}) });
   const startedAt = new Date().toISOString();
   const target = new URL(o.mcpUrl).toString();
   let client: RegisteredClient | null = null;

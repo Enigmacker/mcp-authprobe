@@ -8,12 +8,12 @@
     "source": "github"
   },
   "websiteUrl": "https://github.com/Enigmacker/mcp-authprobe#readme",
-  "version": "0.12.0",
+  "version": "0.13.0",
   "packages": [
     {
       "registryType": "npm",
       "identifier": "mcp-authprobe",
-      "version": "0.12.0",
+      "version": "0.13.0",
       "transport": {
         "type": "stdio"
       },
@@ -44,12 +44,12 @@
         },
         {
           "name": "MCP_AUTHPROBE_ALLOW_PRIVATE",
-          "description": "Set to 1 to allow loopback and private targets (local labs only).",
+          "description": "Set to 1 to allow a loopback or private address for the scanned host (local labs only).",
           "isRequired": false
         },
         {
           "name": "MCP_AUTHPROBE_LAB_ORIGINS",
-          "description": "Comma-separated lab origins exempt from the ownership proof, e.g. http://127.0.0.1:8080.",
+          "description": "Comma-separated lab origins exempt from the ownership proof, e.g. http://127.0.0.1:8080 (the exact origin, not the whole loopback).",
           "isRequired": false
         },
         {
@@ -99,6 +99,16 @@
         {
           "name": "MCP_AUTHPROBE_PROTOCOL",
           "description": "legacy (MCP 2025-11-25) or modern (2026-07-28), instead of detecting the revision.",
+          "isRequired": false
+        },
+        {
+          "name": "MCP_AUTHPROBE_ALLOWED_HOSTS",
+          "description": "Optional comma-separated list of the only hosts the scan tool accepts.",
+          "isRequired": false
+        },
+        {
+          "name": "MCP_AUTHPROBE_ALLOW_HOSTS",
+          "description": "With MCP_AUTHPROBE_ALLOW_PRIVATE=1, other hosts that may be on a private address (an authorization server of a lab).",
           "isRequired": false
         }
       ]

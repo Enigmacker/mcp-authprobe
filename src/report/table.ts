@@ -98,7 +98,7 @@ export function toTable(report: ScanReport, options: TableOptions = {}): string 
   else if (report.complete === false) out.push(paint(COLOR.error, "  The scan was interrupted: this report is partial."));
   const judged = count("pass") + count("fail");
   if (report.reachable !== false && judged * 2 < report.findings.length) {
-    out.push(paint(DIM, `  Only ${judged} of ${report.findings.length} checks could be judged; the skipped lines above say what the others need.`));
+    out.push(paint(DIM, `  Only ${judged} of ${report.findings.length} checks could be judged; the skipped lines above, and \`mcp-authprobe plan\`, say what the others need.`));
   }
   for (const l of report.leftovers ?? []) out.push(paint(COLOR.error, `  Left on the server: test client ${l.clientId} (${l.reason}); it is named "mcp-authprobe test client (safe to delete)".`));
   if (report.grant?.consumed) out.push(paint(DIM, "  The test grant was revoked by the server during the refresh token checks, as expected: log in again for a new one."));

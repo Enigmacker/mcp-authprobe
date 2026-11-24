@@ -37,6 +37,8 @@ import { TOOL_NAME, TOOL_VERSION } from "./version.js";
  *   MCP_AUTHPROBE_PROTOCOL                             legacy or modern, instead of detecting the MCP revision
  *   MCP_AUTHPROBE_ALLOW_PRIVATE=1                      local labs only
  *   MCP_AUTHPROBE_LAB_ORIGINS                          comma-separated lab origins exempt from proof
+ *   MCP_AUTHPROBE_ALLOWED_HOSTS                        optional: the only hosts the scan tool accepts
+ *   MCP_AUTHPROBE_ALLOW_HOSTS                          with ALLOW_PRIVATE: other hosts that may be on a private address
  *   MCP_AUTHPROBE_TIMEOUT_MS                           per-request timeout
  */
 
@@ -52,6 +54,10 @@ export interface ServerConfig {
   /** Static key, bound to one MCP URL by the human. */
   staticKey?: { credential: Credential; target: string };
   allowPrivate: boolean;
+  /** When set, the only hosts the scan tool accepts (MCP_AUTHPROBE_ALLOWED_HOSTS). */
+  allowedHosts?: string[];
+  /** With allowPrivate, hosts other than the target for which private addresses are accepted (MCP_AUTHPROBE_ALLOW_HOSTS). */
+  allowHosts?: string[];
   /** A client supplied by the human instead of dynamic registration. */
   client?: NonNullable<ScanOptions["client"]>;
   protocol?: NonNullable<ScanOptions["protocol"]>;
@@ -99,6 +105,14 @@ export function configFromEnv(env: NodeJS.ProcessEnv = process.env): ServerConfi
     for (const w of loaded.warnings) process.stderr.write(`mcp-authprobe: warning: ${w}\n`);
     config.staticKey = { credential: loaded.credential, target: new URL(target).toString() };
   }
+  const list = (v: string | undefined): string[] | undefined => {
+    const items = (v ?? "").split(",").map((x) => x.trim().toLowerCase()).filter(Boolean);
+    return items.length > 0 ? items : undefined;
+  };
+  const allowedHosts = list(env["MCP_AUTHPROBE_ALLOWED_HOSTS"]);
+  if (allowedHosts) config.allowedHosts = allowedHosts;
+  const allowHosts = list(env["MCP_AUTHPROBE_ALLOW_HOSTS"]);
+  if (allowHosts) config.allowHosts = allowHosts;
   const clientId = env["MCP_AUTHPROBE_CLIENT_ID"]?.trim();
   if (clientId) {
     config.client = { clientId };
@@ -264,6 +278,9 @@ export function createAuthprobeServer(config: ServerConfig): McpServer {
         return errorResult("Only https URLs can be scanned (plain http is allowed for loopback or private labs with MCP_AUTHPROBE_ALLOW_PRIVATE=1).");
       }
       if (parsed.username || parsed.password) return errorResult("URLs with embedded credentials are refused.");
+      if (config.allowedHosts && !config.allowedHosts.includes(parsed.hostname.toLowerCase())) {
+        return errorResult("This host is not in MCP_AUTHPROBE_ALLOWED_HOSTS: the user limited which servers may be scanned from here.");
+      }
       if (scanning) return errorResult("A scan is already running; wait for it to finish.");
 
       scanning = true;
@@ -271,7 +288,10 @@ export function createAuthprobeServer(config: ServerConfig): McpServer {
         const options: ScanOptions = {
           allowPrivate: config.allowPrivate,
           requireGrantBinding: true,
+          // A lab is exempt from the proof by its exact origin: another port of the same machine is not.
           loopbackExempt: (config.labOrigins ?? []).includes(parsed.origin),
+          exemptOrigins: config.labOrigins ?? [],
+          ...(config.allowHosts ? { allowHosts: config.allowHosts } : {}),
         };
         if (select) options.select = select;
         if (config.secret) options.secret = config.secret;

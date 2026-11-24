@@ -21,6 +21,26 @@ inputs:
     description: Header for the key (default Authorization, sent as Bearer; any other header gets the key as is, e.g. X-API-Key).
     required: false
     default: ""
+  access-token:
+    description: OAuth access token for the MCP endpoint checks, instead of a static key (pass it from a repository secret, or from an earlier step that obtained one). Used only once ownership of the target is proven.
+    required: false
+    default: ""
+  client-id:
+    description: Pre-registered OAuth client (or client ID metadata document URL), for a server without dynamic client registration.
+    required: false
+    default: ""
+  redirect-uri:
+    description: One of that client's registered redirect URIs, for the redirect URI checks.
+    required: false
+    default: ""
+  preset:
+    description: "passive (discovery, anonymous Origin and CORS only), standard (everything but the 12 MiB uploads and the request burst) or intrusive (everything, the default)."
+    required: false
+    default: ""
+  protocol:
+    description: MCP revision to speak, auto (default), modern (2026-07-28) or legacy (2025-11-25).
+    required: false
+    default: ""
   rate-attempts:
     description: Requests sent by MAP-THR02 with the key (10 to 100).
     required: false
@@ -71,6 +91,9 @@ inputs:
     default: ""
 
 outputs:
+  coverage:
+    description: Share of the checks that could be judged (pass or fail), between 0 and 1. A scan can succeed with most checks skipped.
+    value: ${{ steps.scan.outputs.coverage }}
   exit-code:
     description: "Scanner exit code: 0 no failing check at or above fail-on, 1 failing checks, 2 usage error, 3 inconclusive checks, 4 unreachable target or interrupted scan."
     value: ${{ steps.scan.outputs.exit-code }}
@@ -106,6 +129,11 @@ runs:
         MAP_POSTURE: ${{ inputs.posture-report }}
         MAP_BEARER: ${{ inputs.bearer }}
         MAP_BEARER_HEADER: ${{ inputs.bearer-header }}
+        MAP_ACCESS_TOKEN: ${{ inputs.access-token }}
+        MAP_CLIENT_ID: ${{ inputs.client-id }}
+        MAP_REDIRECT_URI: ${{ inputs.redirect-uri }}
+        MAP_PRESET: ${{ inputs.preset }}
+        MAP_PROTOCOL: ${{ inputs.protocol }}
         MAP_RATE: ${{ inputs.rate-attempts }}
         MAP_THROTTLE: ${{ inputs.throttle-attempts }}
         MAP_TIMEOUT: ${{ inputs.timeout }}
@@ -137,6 +165,16 @@ runs:
           [ -n "$MAP_BEARER_HEADER" ] && args+=(--bearer-header "$MAP_BEARER_HEADER")
         fi
         unset MAP_BEARER
+        if [ -n "$MAP_ACCESS_TOKEN" ] && [ -z "$keyfile" ]; then
+          keyfile="$(umask 077 && mktemp "$RUNNER_TEMP/mcp-authprobe-token.XXXXXX")"
+          printf '%s\n' "$MAP_ACCESS_TOKEN" > "$keyfile"
+          args+=(--access-token-file "$keyfile")
+        fi
+        unset MAP_ACCESS_TOKEN
+        [ -n "$MAP_CLIENT_ID" ] && args+=(--client-id "$MAP_CLIENT_ID")
+        [ -n "$MAP_REDIRECT_URI" ] && args+=(--redirect-uri "$MAP_REDIRECT_URI")
+        [ -n "$MAP_PRESET" ] && args+=(--preset "$MAP_PRESET")
+        [ -n "$MAP_PROTOCOL" ] && args+=(--protocol "$MAP_PROTOCOL")
         [ -n "$MAP_THROTTLE" ] && args+=(--throttle-attempts "$MAP_THROTTLE")
         [ -n "$MAP_TIMEOUT" ] && args+=(--timeout "$MAP_TIMEOUT")
         [ "$MAP_ALLOW_PRIVATE" = "true" ] && args+=(--allow-private)
@@ -146,13 +184,16 @@ runs:
         code=$?
         [ -n "$keyfile" ] && rm -f "$keyfile"
         failed=0
+        coverage=""
         if [ -f "$out/report.json" ]; then
           failed=$(node -e 'const r=require(process.argv[1]);console.log(r.findings.filter(f=>f.status==="fail").length)' "$out/report.json")
+          coverage=$(node -e 'const r=require(process.argv[1]);console.log(r.summary?r.summary.coverage:"")' "$out/report.json")
         fi
         if [ -f "$out/report.md" ]; then cat "$out/report.md" >> "$GITHUB_STEP_SUMMARY"; fi
         {
           echo "exit-code=$code"
           echo "failed=$failed"
+          echo "coverage=$coverage"
           echo "json-file=$out/report.json"
           echo "sarif-file=$out/report.sarif"
           echo "markdown-file=$out/report.md"

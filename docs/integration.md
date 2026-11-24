@@ -8,7 +8,7 @@ This page is for a program that runs mcp-authprobe: a CI job, a scheduler, a web
 | --- | --- | --- |
 | Subprocess (`mcp-authprobe scan … --json`) | You want isolation, a pinned version, or another language | Options, exit codes, the JSON report |
 | Library (`import { runScan } from "mcp-authprobe"`) | You are in Node.js and want events and the grant state in memory | Everything exported by the package entry point |
-| MCP server (`mcp-authprobe mcp`) | An assistant runs the audit | The five tools; `scan` returns the same report as `structuredContent.report` |
+| MCP server (`mcp-authprobe mcp`) | An MCP client runs the audit | The five tools; `scan` returns the same report as `structuredContent.report` |
 
 `mcp-authprobe capabilities --json` prints what the installed version supports: report schema, MCP protocol eras, check IDs, reason codes, exit codes, lab profiles. Read it instead of comparing version numbers.
 
@@ -29,6 +29,11 @@ mcp-authprobe scan https://mcp.example.com/mcp \
 - **`--events <file>`** appends one JSON line per event: `scan_started`, `discovery_finished`, `check_started`, `check_finished` (with `status`, `reason`, `durationMs`), `scan_finished`. Checks that share requests (the three refresh token checks, the redirect URI checks, the MCP endpoint checks) start and finish together.
 - **`--deadline <seconds>`** and **`--max-requests <n>`** stop the scan with a partial report (`"complete": false`, exit 4). `SIGTERM` and `SIGINT` do the same: temporary clients are deleted first, then the reports are written. Prefer them to `SIGKILL`, which leaves registered test clients on the server and loses the report.
 - Report paths, option values and the target URL are checked before the first request: a mistake is exit 2 and consumes nothing.
+- **`mcp-authprobe plan <url> [the options of scan] --json -`** says what a scan with these options would run and why not the rest, with the reason codes of the report. It sends discovery and the ownership lookups only.
+- **`--preset passive|standard|intrusive`** chooses how much a scan does; `intrusive` is the default. `standard` leaves out the 12 MiB uploads and the request burst.
+- **`--journal <file>`** records the temporary clients as they are registered; after a scan that was killed, `mcp-authprobe cleanup --journal <file>` deletes what is left.
+- **`--allow-private`** accepts a private address for the scanned host only; `--allow-host <host>` names another one (an authorization server on its own private address).
+- **`--header-file <file>`** adds headers (`Name: value` lines) to requests to the scanned origin, and to no other: a gateway token in front of the server.
 
 ### Exit codes
 
@@ -53,7 +58,9 @@ The schema identifier is `mcp-authprobe/report/v1`, and the JSON Schema ships in
 | `complete` | `false` when the scan was interrupted; findings that did not run have `reason: "interrupted"` |
 | `summary` | `counts` per status, `total`, `judged` (pass + fail), `coverage` (judged / total), `highestFailingSeverity`, `exitCode` |
 | `discovery` | Metadata URLs, `issuer`, endpoints, `resource`, every announced authorization server, how a client can be obtained (`registration`: `dcr`, `cimd`), PKCE methods, the MCP `protocol` era and version, notes |
-| `ownership.hosts[]` | One entry per host an active check would contact: `host`, `verified`, `method`, `detail` |
+| `ownership.hosts[]` | One entry per host an active check would contact: `host`, `verified`, `method`, `detail`. A check runs when the hosts it sends requests to are proven: with a hosted authorization server whose host you cannot prove, the MCP endpoint checks still run. `ownership.verified` is true only when every host is |
+| `client` | `source`: how the checks that need an OAuth client obtain one (`pre-registered`, `metadata-document`, `dynamic-registration`, `none`) |
+| `preset` | The preset used, when one was |
 | `credential` | `kind` (`static` or `oauth`) and `header` of the credential used. Never its value |
 | `grant` | `used`, `rotated`, `consumed`, `state` (`valid`, `revoked`, `unknown`, `unused`), `rewritten` |
 | `leftovers[]` | Temporary clients the scanner could not delete (`clientId`, `endpoint`, `reason`) |

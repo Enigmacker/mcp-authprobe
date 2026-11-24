@@ -28,6 +28,7 @@ Passive scanners read what a remote [Model Context Protocol](https://modelcontex
 - [Try it in a minute: the lab](#try-it-in-a-minute-the-lab)
 - [Quick start](#quick-start)
 - [Ownership proof](#ownership-proof)
+- [What will run: plan](#what-will-run-plan)
 - [Refresh token checks](#refresh-token-checks)
 - [Interactive login](#interactive-login)
 - [Redirect URI checks](#redirect-uri-checks)
@@ -171,11 +172,13 @@ Loopback targets with `--allow-private` do not need a proof.
 
 Active checks register clients, rotate tokens and send failing requests. To make sure they only ever hit servers whose operator agreed to it, the scanner requires a proof for **every host it would contact**: the MCP server host and, when it differs, the authorization server host.
 
-The proof is a hash, bound to the host, of a secret that only you hold:
+The proof is a keyed hash, bound to the host, of a secret that only you hold:
 
 ```
-mcp-authprobe-verification=sha256:<hex(sha256("<host>:<secret>"))>
+mcp-authprobe-verification=v2:<hex(hmac-sha256(secret, "mcp-authprobe/v2\n<host>\n<expiry>"))>[;exp=YYYY-MM-DD]
 ```
+
+`ownership init` and `ownership proof` print it. `ownership proof <host> --expires 2027-01-31` makes a proof that stops being accepted after that day; the date is covered by the HMAC, so it cannot be moved. The first format, `mcp-authprobe-verification=sha256:<hex(sha256("<host>:<secret>"))>`, is still accepted, and is the only one versions before 0.13 know: both lines can be published side by side.
 
 Publish it in **one** of two places:
 
@@ -187,11 +190,44 @@ Publish it in **one** of two places:
 Design choices:
 
 - **The secret never leaves your machine.** Only its hash is published, so a proof found in the wild cannot be reused by someone else to scan your server.
-- **Proofs are host-bound.** A proof for `mcp.example.com` is useless for any other host.
+- **Proofs are host-bound.** A proof for `mcp.example.com` is useless for any other host. It covers the whole host, on any port: it is fetched on port 443 or read from DNS, and means "the operator of this host agrees".
+- **Each host is judged on its own.** A check runs when the hosts it sends requests to are proven. With the MCP host proven and the authorization server's not (a hosted identity provider where you cannot publish anything), the checks of the MCP endpoint still run with your key or token, and so do the endpoint checks of `login`; only the checks that send requests to the authorization server are skipped, with the reason `ownership_unproven`. Nothing active is ever sent to a host without a proof.
+- **Use a generated secret.** The proof is public: a secret that is not random could be guessed offline. `ownership proof` warns about one that does not look random.
 - **The secret is read from `MCP_AUTHPROBE_SECRET` or `--secret-file`, never from the command line**, so it does not land in shell history or process listings.
 - **Hosted authorization servers.** If your authorization server is a third-party service on its own domain, you can only publish a proof if you control that domain (for example a custom domain). Check the provider's penetration testing policy before running active checks against it.
 
 You can remove the proof as soon as you are done testing.
+
+## What will run: plan
+
+Depending on what you supply (nothing, the proof, a key, a token, a grant) and on what the server offers, a scan runs between 3 and 20 checks. `plan` tells you beforehand:
+
+```sh
+mcp-authprobe plan https://mcp.example.com/mcp --bearer-file test.key
+```
+
+It takes the options of `scan`, sends discovery and the ownership lookups only, and lists every check: whether it would run, why not (with the same reason codes as the report), how many requests it sends and what they do on the server. `--json -` prints it for a program. A test keeps `plan` and `scan` in agreement.
+
+| You supply | Checks that run |
+| --- | --- |
+| Nothing | `MAP-DSC01`, `MAP-ORG01` (anonymous), `MAP-COR01` |
+| The ownership proof | + `MAP-RDR01`, `MAP-RDR02`, `MAP-RDR04`, `MAP-THR01` (with dynamic registration, or `--client-id`) |
+| + `--bearer-file` | + the MCP endpoint checks with the key, and `MAP-THR02` |
+| + `--access-token-file` | + the MCP endpoint checks with the token (`MAP-THR02` only with `--only THR02`) |
+| + `--credentials-file` | + `MAP-RTK01` to `MAP-RTK03`, the results of `login`, and `MAP-AUD01` when an access token comes with it |
+| `consent-check` | `MAP-CSR01` |
+
+### Presets
+
+`--preset` chooses how much a scan does:
+
+| Preset | What runs |
+| --- | --- |
+| `passive` | Discovery, the anonymous `Origin` check and CORS: the requests any client sends. No credential is used, nothing is registered |
+| `standard` | Everything except the two 6 MiB uploads (`MAP-BOD01`) and the burst of requests (`MAP-THR02`). A sensible choice for production |
+| `intrusive` | Everything. **This is the default**, as before: making `standard` the default would silently drop two checks from existing scans |
+
+`--only` and `--skip` still apply on top of a preset.
 
 ## Refresh token checks
 
@@ -395,7 +431,8 @@ The server is built so that the assistant, or a prompt injection reaching it, ca
 - **A static key is bound to one URL** (`MCP_AUTHPROBE_BEARER_TARGET`): the assistant cannot send it anywhere else.
 - **`scan` is annotated as destructive**, so well-behaved clients ask for your confirmation before each call. It consumes the test grant and registers temporary clients.
 - **Only `https` targets** are accepted; plain `http` only for loopback or private-address labs with `MCP_AUTHPROBE_ALLOW_PRIVATE=1`. URLs with embedded credentials are refused, and only one scan runs at a time.
-- **Loopback targets still need a proof** in MCP mode, unless you list their origin in `MCP_AUTHPROBE_LAB_ORIGINS`. An assistant cannot point active requests at arbitrary local services.
+- **Loopback targets still need a proof** in MCP mode, unless you list their origin in `MCP_AUTHPROBE_LAB_ORIGINS`: the exact origin, so another service on another port of the same machine is not exempt. An assistant cannot point active requests at arbitrary local services.
+- **You can pin the hosts.** With `MCP_AUTHPROBE_ALLOWED_HOSTS`, the `scan` tool refuses any other host, so not even the read-only discovery requests can be pointed elsewhere.
 - **The test grant is only used if it names the scanned target** (grants created by `login` do), so it cannot be spent on another server.
 - **Reports are marked as data:** every scan result ends with a notice that server-controlled text in it must not be treated as instructions.
 
@@ -404,7 +441,9 @@ The server is built so that the assistant, or a prompt injection reaching it, ca
 | `MCP_AUTHPROBE_SECRET` or `MCP_AUTHPROBE_SECRET_FILE` | Ownership secret (prefer the file) |
 | `MCP_AUTHPROBE_CREDENTIALS_FILE` | Test grant for the refresh token checks |
 | `MCP_AUTHPROBE_ALLOW_PRIVATE=1` | Allow loopback and private targets (local labs only) |
-| `MCP_AUTHPROBE_LAB_ORIGINS` | Comma-separated lab origins (e.g. `http://127.0.0.1:8080`) exempt from the ownership proof |
+| `MCP_AUTHPROBE_LAB_ORIGINS` | Comma-separated lab origins (e.g. `http://127.0.0.1:8080`) exempt from the ownership proof. The exemption is for these exact origins: another port of the same machine still needs a proof |
+| `MCP_AUTHPROBE_ALLOWED_HOSTS` | Optional: the only hosts the `scan` tool accepts |
+| `MCP_AUTHPROBE_ALLOW_HOSTS` | With `MCP_AUTHPROBE_ALLOW_PRIVATE=1`: other hosts that may be on a private address |
 | `MCP_AUTHPROBE_TIMEOUT_MS` | Per-request timeout |
 | `MCP_AUTHPROBE_BEARER_FILE` and `MCP_AUTHPROBE_BEARER_TARGET` | Static API key, and the exact MCP URL it may be used for (both required) |
 | `MCP_AUTHPROBE_BEARER_HEADER` | Header for the key (default `Authorization`, sent as `Bearer`) |
@@ -415,14 +454,20 @@ The server is built so that the assistant, or a prompt injection reaching it, ca
 
 ### With Docker
 
-The repository's `Dockerfile` builds the same stdio MCP server:
+The repository's `Dockerfile` builds an image whose entry point is the CLI; without arguments it runs the stdio MCP server:
 
 ```sh
 docker build -t mcp-authprobe https://github.com/Enigmacker/mcp-authprobe.git
+
+# the MCP server
 docker run -i --rm -e MCP_AUTHPROBE_SECRET mcp-authprobe
+
+# the CLI: GitLab CI, Jenkins, a Kubernetes CronJob, a machine without Node.js
+docker run --rm -e MCP_AUTHPROBE_SECRET -v "$PWD/scan:/scan" mcp-authprobe \
+  scan https://mcp.example.com/mcp --json /scan/report.json --sarif /scan/report.sarif
 ```
 
-In a container, `--allow-private` labs on your machine are not reachable as `127.0.0.1`; use the npm package for the lab.
+Mount secrets as files (`--secret-file`, `--bearer-file`, `--access-token-file`, `--credentials-file`). The `Docker image` workflow of the repository builds the image for amd64 and arm64 with build provenance, on each release and once a week on a fresh base image. In a container, `--allow-private` labs on your machine are not reachable as `127.0.0.1`; use the npm package for the lab.
 
 ## What it checks
 
@@ -457,6 +502,8 @@ In a container, `--allow-private` labs on your machine are not reachable as `127
 `MAP-DSC01` also reports what a strict client would refuse: authorization server metadata whose `issuer` is not the one it was fetched for is **not used** (RFC 8414, and a MUST of the MCP specification), a `resource` that is not the scanned URL is remarked and not sent as the `resource` parameter, missing `code_challenge_methods_supported` is noted, and when the resource announces several authorization servers the others are listed (`--issuer <url>` examines another one).
 
 Families: **DSC** discovery, **RTK** refresh tokens, **RDR** redirect URIs, **THR** throttling, **CSR** consent CSRF, **PKC** PKCE, **COD** authorization codes, **AUD** token audience, **ORG** Origin validation, **TOK** token transport, **SES** sessions, **COR** CORS, **BAT** batches, **BOD** body size, **INJ** prompt injection.
+
+`MAP-ORG01` is listed as passive because of what it does without a credential; with a key or a token it sends authenticated requests, and then only runs once the MCP host is proven. When it fails on a server reached over https and authenticated by a header, with no credentialed CORS access, the evidence says so: the requirement targets DNS rebinding and browsers, and the risk is highest for servers on a local network or using cookies. The severity is not lowered, since the specification requires 403 for an invalid `Origin` on every server.
 
 `MAP-ORG01` runs in every scan without an ownership proof: it sends two ordinary `initialize` requests, one with a foreign `Origin`. Most servers ask for a token before looking at `Origin`; the scan then reports it as inconclusive, and `login` observes it with a valid token. `MAP-COR01` also runs in every scan: a CORS preflight and an ordinary request with a foreign `Origin`; it fails only when that origin is reflected together with `Access-Control-Allow-Credentials: true`.
 
@@ -601,7 +648,7 @@ jobs:
   scan:
     runs-on: ubuntu-latest
     steps:
-      - uses: Enigmacker/mcp-authprobe@v0.12.0
+      - uses: Enigmacker/mcp-authprobe@v0.13.0
         with:
           url: https://staging.example.com/mcp
           secret: ${{ secrets.MCP_AUTHPROBE_SECRET }}
@@ -620,12 +667,15 @@ The results table is added to the job summary. The step fails when a check fails
 | `only` / `skip` | | Same as `--only` / `--skip` |
 | `bearer` | | Static API key, from a repository secret; written to a private temporary file, never on the command line |
 | `bearer-header`, `rate-attempts` | | Same as `--bearer-header`, `--rate-attempts` |
+| `access-token` | | OAuth access token instead of a static key, from a repository secret or an earlier step |
+| `client-id`, `redirect-uri` | | A pre-registered client, for a server without dynamic client registration |
+| `preset`, `protocol` | | Same as `--preset`, `--protocol` |
 | `posture-report` | | An mcp-posture JSON report to merge, see [Combine with mcp-posture](#combine-with-mcp-posture) |
 | `throttle-attempts`, `timeout` | | Same as the CLI options |
 | `upload-sarif` | `false` | Upload the SARIF report to code scanning (needs `security-events: write`) |
 | `allow-private` | `false` | For a lab started in the same job only |
 | `node-version` | `22` | Node.js used to run the scanner |
-| `package` | this release | npm package spec to run, e.g. `mcp-authprobe@0.12.0` |
+| `package` | this release | npm package spec to run, e.g. `mcp-authprobe@0.13.0` |
 
 Both tools have an Action, so the passive and active views fit in one job:
 
@@ -635,14 +685,14 @@ Both tools have an Action, so the passive and active views fit in one job:
           targets: https://staging.example.com/mcp
           args: --json posture.json
           fail: false   # let the active scan run too; each tool reports its own findings
-      - uses: Enigmacker/mcp-authprobe@v0.12.0
+      - uses: Enigmacker/mcp-authprobe@v0.13.0
         with:
           url: https://staging.example.com/mcp
           secret: ${{ secrets.MCP_AUTHPROBE_SECRET }}
           posture-report: posture.json
 ```
 
-Outputs: `exit-code`, `failed` (number of failing checks), `json-file`, `sarif-file`, `markdown-file`.
+Outputs: `exit-code`, `failed` (number of failing checks), `coverage` (share of the checks that could be judged), `json-file`, `sarif-file`, `markdown-file`. SARIF results carry a fingerprint that is stable for a check and a target, so code scanning follows an alert from one run to the next.
 
 The secret is passed through the environment, never on a command line. The refresh token checks and the login checks are not run by the action: they need a test grant from an interactive `login`, and a grant is consumed by a scan. Run them by hand after a change to your authorization server.
 
@@ -669,7 +719,9 @@ The scanner talks to servers that may be hostile, and it may be driven by an AI 
 - **Ownership gate:** no active request without a valid proof for every contacted host (the only exception is `login`, which behaves like an ordinary MCP client; see above).
 - **HTTPS only:** every request, including endpoints announced by a server's metadata, must use HTTPS. Plain HTTP is accepted only for loopback or private-address labs with `--allow-private`, so tokens and secrets never travel in cleartext over the internet.
 - **Inconclusive is never a pass:** rate limits (429, `Retry-After`) and server errors (5xx) make a check report `error`, never `pass`; so does metadata that could not be read in full (`MAP-INJ01`). Checks that pass on a refusal send their control request again afterwards.
-- **SSRF protection:** loopback, private, link-local, CGNAT, multicast, reserved and cloud-metadata addresses are refused at connect time, after DNS resolution, unless `--allow-private` is passed.
+- **SSRF protection:** loopback, private, link-local, CGNAT, multicast, reserved and cloud-metadata addresses are refused at connect time, after DNS resolution, unless `--allow-private` is passed. Even then they are only accepted **for the scanned host** (and the other names of the loopback): metadata that points to another private address is not followed. `--allow-host <host>` names another host, for an authorization server on its own private address.
+- **Metadata is validated:** authorization server metadata whose issuer differs from the one it was fetched for is not used.
+- **Nothing is left behind:** temporary clients are deleted, also when the scan is interrupted; one that could not be deleted is listed in the report (`leftovers`). With `--journal <file>`, registered clients are recorded as they are created, and `mcp-authprobe cleanup --journal <file>` deletes what a killed scan left.
 - **No automatic redirects:** every redirect is inspected, never followed blindly.
 - **Bounded resources:** per-request timeouts, response bodies capped at 1 MiB, no compression requested.
 - **Secrets stay secret:** tokens and the ownership secret are never printed, and are redacted from every report.
@@ -725,7 +777,11 @@ The scanner talks to servers that may be hostile, and it may be driven by an AI 
 **0.12.0**
 - ~~MCP 2026-07-28 next to 2025-11-25; clients without dynamic registration; login in two steps~~ done.
 
+**0.13.0**
+- ~~Proof judged host by host, `plan`, presets, HMAC proofs, `cleanup`, a CLI Docker image~~ done.
+
 **Next**
+- A second browser session for `MAP-CSR01` and `MAP-RDR02` on servers that validate `redirect_uri` after login.
 - Ideas welcome in the issues.
 
 ## Development
@@ -736,6 +792,7 @@ npm run typecheck
 npm test          # unit and integration tests against a local fixture server
 npm run build
 npm run check     # all of the above
+npm run docs      # regenerate the tables of this README from the catalogue
 npm run demo      # re-record docs/demo/demo.gif (needs Chrome and ffmpeg)
 ```
 

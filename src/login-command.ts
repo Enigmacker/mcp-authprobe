@@ -15,9 +15,10 @@ import { TOOL_NAME, TOOL_VERSION } from "./version.js";
 import { writeFileSync } from "node:fs";
 import { verifyOwnership } from "./ownership.js";
 import { safeText } from "./redact.js";
-import { hostsToVerify } from "./scan.js";
 
 export interface LoginCommandOptions {
+  /** With allowPrivate, other hosts that may be on a private address (--allow-host). */
+  allowHosts?: readonly string[];
   mcpUrl: string;
   out: string;
   force: boolean;
@@ -47,25 +48,43 @@ const err = (t: string): void => {
   process.stderr.write(`${safeText(t, 4000)}\n`);
 };
 
-const httpFor = (o: { allowPrivate: boolean; requestTimeoutMs?: number }): HttpClient =>
-  new HttpClient({ allowPrivate: o.allowPrivate, ...(o.requestTimeoutMs !== undefined ? { timeoutMs: o.requestTimeoutMs } : {}) });
+/** Private addresses are accepted for the target and the hosts the operator named, not for wherever metadata points. */
+const httpFor = (o: { allowPrivate: boolean; requestTimeoutMs?: number; allowHosts?: readonly string[] }, urls: string[]): HttpClient =>
+  new HttpClient({
+    allowPrivate: o.allowPrivate,
+    privateHosts: [...urls.map((u) => new URL(u).hostname), ...(o.allowHosts ?? [])],
+    ...(o.requestTimeoutMs !== undefined ? { timeoutMs: o.requestTimeoutMs } : {}),
+  });
 
 const failure = (e: unknown): number => {
   err(`Login failed: ${(e as Error).message}`);
   return e instanceof NetworkError || e instanceof BlockedAddressError || e instanceof InsecureTransportError ? EXIT.unreachable : EXIT.error;
 };
 
-/** The login checks only run when every host they contact is proven. */
-async function proven(http: HttpClient, hosts: string[], secret: string | undefined): Promise<boolean> {
-  const results = [];
-  for (const host of hosts) results.push(await verifyOwnership(host, secret, { http }));
-  const ok = results.every((r) => r.verified);
-  if (!ok) err(`Ownership not proven for every host: the login checks (${LOGIN_CHECK_IDS.join(", ")}) will not be observed.`);
-  return ok;
+/** The login checks run host by host: those of a host whose ownership is not proven are left out. */
+async function proven(http: HttpClient, mcpUrl: string, asUrls: Array<string | null | undefined>, secret: string | undefined): Promise<{ authorizationServer: boolean; endpoint: boolean }> {
+  const host = (u: string): string => new URL(u).hostname;
+  const mcpHost = host(mcpUrl);
+  const asHosts = [...new Set(asUrls.filter((u): u is string => typeof u === "string").map(host))];
+  const verified = new Map<string, boolean>();
+  for (const h of new Set([mcpHost, ...asHosts])) verified.set(h, (await verifyOwnership(h, secret, { http })).verified);
+  const endpoint = verified.get(mcpHost) === true;
+  // A request to the authorization server on behalf of a target that is not proven makes no sense either.
+  const authorizationServer = endpoint && asHosts.every((h) => verified.get(h) === true);
+  const missing = [...verified].filter(([, ok]) => !ok).map(([h]) => h);
+  if (missing.length > 0) {
+    err(
+      endpoint
+        ? `Ownership not proven for ${missing.join(", ")} (the authorization server): MAP-PKC01, MAP-RDR03, MAP-COD01 and MAP-AUD01 will not be observed. The checks of the MCP endpoint will.`
+        : `Ownership not proven for ${missing.join(", ")}: the login checks (${LOGIN_CHECK_IDS.join(", ")}) will not be observed.`,
+    );
+  }
+  return { authorizationServer, endpoint };
 }
 
 /** Print the results, write the grant file (and the JSON report), and choose the exit code. */
-function finish(o: { mcpUrl: string; out: string; force: boolean; json?: string }, result: LoginResult, probe: boolean, startedAt: string): number {
+function finish(o: { mcpUrl: string; out: string; force: boolean; json?: string }, result: LoginResult, scope: { authorizationServer: boolean; endpoint: boolean }, startedAt: string): number {
+  const probe = scope.authorizationServer && scope.endpoint;
   for (const ob of result.observations) err(`${ob.checkId}: ${ob.status} - ${ob.message}`);
   for (const n of result.notes) err(`Note: ${n}`);
 
@@ -91,7 +110,7 @@ function finish(o: { mcpUrl: string; out: string; force: boolean; json?: string 
       finishedAt: new Date().toISOString(),
       target: new URL(o.mcpUrl).toString(),
       reachable: true,
-      ownership: { verified: probe, method: null, detail: probe ? "Ownership proven: the login checks were observed." : "Ownership not proven, or --no-probe: the login checks were not observed." },
+      ownership: { verified: probe, method: null, detail: probe ? "Ownership proven: the login checks were observed." : scope.endpoint ? "Ownership proven for the MCP host only: the checks of the authorization server were not observed." : "Ownership not proven, or --no-probe: the login checks were not observed." },
       findings: result.observations,
       summary: summarize(result.observations),
       ...(result.clientSource ? { client: { source: result.clientSource } } : {}),
@@ -122,11 +141,13 @@ function finish(o: { mcpUrl: string; out: string; force: boolean; json?: string 
 /** `mcp-authprobe login`: everything goes to stderr; tokens are only written to the grant file. */
 export async function runLoginCommand(o: LoginCommandOptions): Promise<number> {
   const startedAt = new Date().toISOString();
-  const http = httpFor(o);
+  const http = httpFor(o, [o.mcpUrl]);
   try {
     const discovery = await discover(o.mcpUrl, http, { ...(o.protocol ? { protocol: o.protocol } : {}), ...(o.issuer !== undefined ? { issuer: o.issuer } : {}) });
     for (const w of discovery.warnings ?? []) err(`Note: ${w}`);
-    const probe = o.probe ? await proven(http, hostsToVerify(o.mcpUrl, discovery), o.secret) : false;
+    const meta = discovery.as?.metadata;
+    const none = { authorizationServer: false, endpoint: false };
+    const probe = o.probe ? await proven(http, o.mcpUrl, [meta?.authorization_endpoint, meta?.token_endpoint, meta?.registration_endpoint], o.secret) : none;
     const result = await login({
       http,
       mcpUrl: o.mcpUrl,
@@ -153,6 +174,8 @@ export async function runLoginCommand(o: LoginCommandOptions): Promise<number> {
 }
 
 export interface LoginBeginOptions {
+  /** With allowPrivate, other hosts that may be on a private address (--allow-host). */
+  allowHosts?: readonly string[];
   mcpUrl: string;
   /** Where the state is written (mode 600): the PKCE verifier, the state, the expected issuer. */
   stateFile: string;
@@ -174,7 +197,7 @@ export interface LoginBeginOptions {
  * the tool). Prints the authorization URL; nothing listens.
  */
 export async function runLoginBegin(o: LoginBeginOptions): Promise<number> {
-  const http = httpFor(o);
+  const http = httpFor(o, [o.mcpUrl]);
   try {
     const discovery = await discover(o.mcpUrl, http, { ...(o.protocol ? { protocol: o.protocol } : {}), ...(o.issuer !== undefined ? { issuer: o.issuer } : {}) });
     for (const w of discovery.warnings ?? []) err(`Note: ${w}`);
@@ -202,6 +225,8 @@ export async function runLoginBegin(o: LoginBeginOptions): Promise<number> {
 }
 
 export interface LoginCompleteOptions {
+  /** With allowPrivate, other hosts that may be on a private address (--allow-host). */
+  allowHosts?: readonly string[];
   stateFile: string;
   /** The URL the user was sent back to, with its query string (or the query string alone). */
   callback: string;
@@ -227,10 +252,10 @@ export async function runLoginComplete(o: LoginCompleteOptions): Promise<number>
     err(e instanceof LoginError || e instanceof SecretFileError ? e.message : `The state file ${o.stateFile} is not valid JSON.`);
     return EXIT.usage;
   }
-  const http = httpFor(o);
+  // The endpoints in the state were accepted when the login began.
+  const http = httpFor(o, [state.target, state.authorizationEndpoint, state.tokenEndpoint, ...(state.registrationEndpoint ? [state.registrationEndpoint] : [])]);
   try {
-    const hosts = [...new Set([state.target, state.authorizationEndpoint, state.tokenEndpoint, ...(state.registrationEndpoint ? [state.registrationEndpoint] : [])].map((u) => new URL(u).hostname))];
-    const probe = o.probe ? await proven(http, hosts, o.secret) : false;
+    const probe = o.probe ? await proven(http, state.target, [state.authorizationEndpoint, state.tokenEndpoint, state.registrationEndpoint], o.secret) : { authorizationServer: false, endpoint: false };
     const result = await completeLogin({ http, state, callback: o.callback, probe, log: err, ...(o.protocol ? { era: o.protocol } : {}) });
     const code = finish({ mcpUrl: state.target, out: o.out, force: o.force, ...(o.json ? { json: o.json } : {}) }, result, probe, startedAt);
     // The code is spent and the verifier with it: the state is of no further use.

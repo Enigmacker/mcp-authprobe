@@ -1,9 +1,12 @@
-# mcp-authprobe as a stdio MCP server, built from this repository.
+# mcp-authprobe, built from this repository: the CLI is the entry point.
 #   docker build -t mcp-authprobe .
-#   docker run -i --rm mcp-authprobe
-# Configuration (ownership secret, lab origins...) goes through MCP_AUTHPROBE_*
-# environment variables; see the README. The CLI is available with
-#   docker run --rm --entrypoint node mcp-authprobe dist/cli.js --help
+#   docker run --rm mcp-authprobe scan https://mcp.example.com/mcp --json -
+#   docker run --rm -v "$PWD/scan:/scan" -e MCP_AUTHPROBE_SECRET mcp-authprobe \
+#     scan https://mcp.example.com/mcp --json /scan/report.json --sarif /scan/report.sarif
+# Without arguments it runs the stdio MCP server, as earlier images did:
+#   docker run -i --rm -e MCP_AUTHPROBE_SECRET mcp-authprobe
+# Secrets go through MCP_AUTHPROBE_SECRET or mounted files (--secret-file,
+# --bearer-file, --access-token-file, --credentials-file); see the README.
 FROM node:24-slim AS build
 WORKDIR /app
 COPY package.json package-lock.json tsconfig.json tsconfig.build.json ./
@@ -16,5 +19,8 @@ WORKDIR /app
 COPY --from=build /app/package.json ./
 COPY --from=build /app/node_modules ./node_modules
 COPY --from=build /app/dist ./dist
+COPY schema ./schema
+COPY LICENSE ./
 USER node
-ENTRYPOINT ["node", "dist/cli.js", "mcp"]
+ENTRYPOINT ["node", "/app/dist/cli.js"]
+CMD ["mcp"]

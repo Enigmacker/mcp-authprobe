@@ -10,8 +10,11 @@ import { isBlockedAddress } from "./net/address-policy.js";
 import { loadGrant, writeGrantFile, type LoadedGrant } from "./credentials.js";
 import { EXIT, exitCodeFor } from "./exit.js";
 import { HttpClient, plainHttpAllowed } from "./net/http.js";
-import { registerSecret } from "./redact.js";
-import { DNS_LABEL, generateSecret, proofFor, verifyOwnership, WELL_KNOWN_PATH } from "./ownership.js";
+import { registerSecret, safeText } from "./redact.js";
+import { DNS_LABEL, generateSecret, proofFor, proofV2For, verifyOwnership, weakSecretWarning, WELL_KNOWN_PATH } from "./ownership.js";
+import { deleteClient, pendingClients, setClientJournal } from "./oauth/registration.js";
+import { planScan, planToText } from "./plan.js";
+import { StaticKeyError, validateHeaderName } from "./static-key.js";
 import { toJson } from "./report/json.js";
 import { toMarkdown } from "./report/markdown.js";
 import { toSarif } from "./report/sarif.js";
@@ -36,6 +39,8 @@ Active authorization testing for remote MCP servers you own.
 
 Usage:
   ${TOOL_NAME} scan <mcp-url> [options]
+  ${TOOL_NAME} plan <mcp-url> [options]    Say what a scan with these options would run,
+                                           and why not the rest; sends discovery only
   ${TOOL_NAME} ownership init <host>       Create a secret and the proof to publish
   ${TOOL_NAME} ownership proof <host>      Print the proof for <host> from your secret
   ${TOOL_NAME} ownership verify <host>     Check that the proof is published
@@ -48,6 +53,7 @@ Usage:
                                            The same login in two steps, for an application
                                            that receives the redirect itself (no listener)
   ${TOOL_NAME} consent-check <mcp-url>     MAP-CSR01: consent CSRF, in a real browser
+  ${TOOL_NAME} cleanup --journal <file>    Delete test clients a killed scan left behind
   ${TOOL_NAME} mcp                         Run as an MCP server over stdio
   ${TOOL_NAME} lab [--profile <name>] [--port 8787]
                                            Run a local practice server (loopback only)
@@ -59,7 +65,18 @@ Scan options:
   --sarif <file>        Write a SARIF 2.1.0 report
   --markdown <file>     Write a Markdown report
   --fail-on <severity>  Exit 1 on a failing check at or above this severity (default: high)
-  --allow-private       Allow loopback/private addresses (local labs only)
+  --allow-private       Allow loopback/private addresses (local labs only), for the
+                        scanned host
+  --allow-host <host>   With --allow-private, also for this host (an authorization
+                        server on another private address); repeatable
+  --preset <name>       passive: discovery, anonymous Origin and CORS only, no
+                        credential used; standard: everything but the 12 MiB uploads
+                        (MAP-BOD01) and the request burst (MAP-THR02); intrusive:
+                        everything (the default)
+  --header-file <file>  Extra headers for requests to the scanned origin only, one
+                        "Name: value" per line (a gateway token in front of the server)
+  --journal <file>      Record the temporary clients registered, so that
+                        "cleanup --journal" can delete them after a killed scan
   --timeout <ms>        Per-request timeout (default: 10000)
   --secret-file <file>  Read the ownership secret from a file instead of ${SECRET_ENV}
   --throttle-attempts <n>
@@ -164,6 +181,11 @@ Exit codes:
      --fail-on-inconclusive never silences it
   5  login wrote its results but no test grant
 
+Ownership options:
+  --expires <YYYY-MM-DD>
+                        With "ownership proof": a proof that stops being accepted
+                        after that day
+
 The ownership secret is read from ${SECRET_ENV} or --secret-file, never from
 the command line, so it does not end up in shell history or process lists.
 
@@ -211,6 +233,32 @@ function clientOptions(values: Values): { client?: { clientId: string; clientSec
   return { client };
 }
 
+/** Extra headers from --header-file: "Name: value" lines, for the scanned origin only. Values are masked in reports. */
+function readHeaderFile(path: string): Record<string, string> {
+  const { text, warnings } = readSecretFile(path, { label: "header file", maxBytes: 16 * 1024, followLinks: true });
+  for (const w of warnings) err(`warning: ${w}\n`);
+  const headers: Record<string, string> = {};
+  for (const raw of text.split(/\r?\n/)) {
+    const line = raw.trim();
+    if (!line || line.startsWith("#")) continue;
+    const at = line.indexOf(":");
+    const value = at > 0 ? line.slice(at + 1).trim() : "";
+    if (at <= 0 || !value || /[\u0000-\u001f\u007f]/.test(value)) throw new SecretFileError(`${path}: every line must be "Name: value".`);
+    const name = validateHeaderName(line.slice(0, at));
+    registerSecret(value);
+    headers[name] = value;
+  }
+  if (Object.keys(headers).length > 20) throw new SecretFileError(`${path}: at most 20 headers.`);
+  return headers;
+}
+
+/** What the presets select. "intrusive" is everything, and the default. */
+export const PRESETS: Record<string, { description: string; select: (id: string) => boolean; credential: boolean }> = {
+  passive: { description: "discovery, anonymous Origin and CORS only; no credential is used", select: (id) => ["MAP-DSC01", "MAP-ORG01", "MAP-COR01"].includes(id), credential: false },
+  standard: { description: "everything but the 12 MiB uploads (MAP-BOD01) and the request burst (MAP-THR02)", select: (id) => id !== "MAP-BOD01" && id !== "MAP-THR02", credential: true },
+  intrusive: { description: "everything (the default)", select: () => true, credential: true },
+};
+
 /** --protocol as an era, undefined for auto, or null when invalid. */
 function parseProtocol(value: string | undefined): "legacy" | "modern" | undefined | null {
   if (value === undefined || value === "auto") return undefined;
@@ -237,6 +285,9 @@ export function capabilities(): Record<string, unknown> {
     reasonCodes: REASON_CODES,
     exitCodes: EXIT,
     labProfiles: Object.keys(LAB_PROFILES),
+    presets: Object.fromEntries(Object.entries(PRESETS).map(([k, v]) => [k, v.description])),
+    ownershipProofs: ["v1 (sha256)", "v2 (hmac-sha256, optional expiry)"],
+    commands: ["scan", "plan", "login", "login begin", "login complete", "consent-check", "ownership", "checks", "capabilities", "cleanup", "lab", "mcp"],
     credentials: ["bearer-file", "access-token-file", "credentials-file", "client-id", "client-secret-file"],
     login: ["interactive", "begin", "complete"],
     reports: ["json", "sarif", "markdown", "events"],
@@ -310,6 +361,11 @@ const CLI_OPTIONS = {
       "callback-url": { type: "string" },
       "callback-file": { type: "string" },
       "keep-state": { type: "boolean", default: false },
+      "allow-host": { type: "string", multiple: true },
+      "header-file": { type: "string" },
+      preset: { type: "string" },
+      journal: { type: "string" },
+      expires: { type: "string" },
       "credentials-out": { type: "string" },
       rtk: { type: "string" },
       "max-observation-age": { type: "string" },
@@ -369,7 +425,7 @@ export async function main(argv: string[]): Promise<number> {
     return await dispatch(command, sub, arg, values);
   } catch (e) {
     // A secret file that cannot be read is a usage error, whatever the command.
-    if (e instanceof SecretFileError) {
+    if (e instanceof SecretFileError || e instanceof StaticKeyError) {
       err(`${e.message}\n`);
       return EXIT.usage;
     }
@@ -384,6 +440,35 @@ function parseCli(argv: string[]) {
 }
 
 async function dispatch(command: string, sub: string | undefined, arg: string | undefined, values: Values): Promise<number> {
+  if (command === "cleanup") {
+    if (!values.journal) {
+      err("cleanup needs --journal <file>, the journal a scan wrote with --journal.\n");
+      return EXIT.usage;
+    }
+    const text = readSecretFile(values.journal, { label: "journal", maxBytes: 4 * 1024 * 1024, followLinks: true }).text;
+    const pending = pendingClients(text);
+    if (pending.length === 0) {
+      out("Nothing to clean up: every client in the journal was deleted.\n");
+      return EXIT.ok;
+    }
+    // Each client is deleted with its own management token, at the endpoint that issued it: what the scan itself would have done.
+    const http = new HttpClient({ allowPrivate: values["allow-private"] });
+    let left = 0;
+    try {
+      setClientJournal(values.journal);
+      for (const c of pending) {
+        const ok = await deleteClient(http, { clientId: c.clientId, clientSecret: null, redirectUris: [], registrationClientUri: c.registrationClientUri, registrationAccessToken: c.registrationAccessToken }, c.registrationEndpoint);
+        if (!ok) left += 1;
+        out(`${ok ? "deleted" : "NOT deleted"}  ${safeText(c.clientId, 120)}  (${safeText(c.registrationEndpoint, 200)})\n`);
+      }
+    } finally {
+      setClientJournal(null);
+      await http.close();
+    }
+    if (left > 0) err(`${left} client(s) could not be deleted (no RFC 7592 deletion, or the server refused): remove them by hand; they are named "mcp-authprobe test client (safe to delete)".\n`);
+    return left > 0 ? EXIT.findings : EXIT.ok;
+  }
+
   if (command === "capabilities") {
     out(values.json !== undefined || sub === "--json" ? `${JSON.stringify(capabilities(), null, 2)}\n` : `${TOOL_NAME} ${TOOL_VERSION}\nreport schema: ${REPORT_SCHEMA}\nchecks: ${CATALOGUE.length}\nlab profiles: ${Object.keys(LAB_PROFILES).join(", ")}\nUse --json for the full, machine-readable description.\n`);
     return EXIT.ok;
@@ -448,9 +533,13 @@ async function dispatch(command: string, sub: string | undefined, arg: string | 
           `Publish ONE of the following for ${arg}:`,
           ``,
           `  File  https://${arg}${WELL_KNOWN_PATH} containing the line:`,
-          `        ${proofFor(arg, secret)}`,
+          `        ${proofV2For(arg, secret)}`,
           ``,
           `  DNS   TXT record on ${DNS_LABEL}.${arg} with the value:`,
+          `        ${proofV2For(arg, secret)}`,
+          ``,
+          `The proof covers the whole host ${arg}, on any port. Versions before 0.13 need the`,
+          `earlier format instead (both lines may be published side by side):`,
           `        ${proofFor(arg, secret)}`,
           ``,
           `Repeat "ownership proof <host>" for the authorization server host if it differs.`,
@@ -465,7 +554,16 @@ async function dispatch(command: string, sub: string | undefined, arg: string | 
         err(`Set ${SECRET_ENV} or pass --secret-file.\n`);
         return EXIT.usage;
       }
-      out(`${proofFor(arg, secret)}\n`);
+      const weak = weakSecretWarning(secret);
+      if (weak) err(`warning: ${weak}\n`);
+      try {
+        out(`${proofV2For(arg, secret, values.expires)}\n`);
+      } catch (e) {
+        err(`--expires: ${(e as Error).message}\n`);
+        return EXIT.usage;
+      }
+      // Versions before 0.13 only know the first format; it stays accepted.
+      if (!values.expires) err(`Earlier format, for versions before 0.13 (both may be published): ${proofFor(arg, secret)}\n`);
       return EXIT.ok;
     }
     if (sub === "verify") {
@@ -477,7 +575,7 @@ async function dispatch(command: string, sub: string | undefined, arg: string | 
       const http = new HttpClient({ allowPrivate: values["allow-private"], ...(t !== undefined ? { timeoutMs: t } : {}) });
       try {
         const result = await verifyOwnership(arg, secret, { http });
-        out(`${result.verified ? "verified" : "NOT verified"}: ${result.detail}\n`);
+        out(`${result.verified ? "verified" : "NOT verified"}: ${result.detail}${result.proofVersion ? ` (proof format v${result.proofVersion})` : ""}\n`);
         return result.verified ? EXIT.ok : EXIT.findings;
       } finally {
         await http.close();
@@ -525,6 +623,7 @@ async function dispatch(command: string, sub: string | undefined, arg: string | 
       return EXIT.usage;
     }
     if (supplied.client) o.client = supplied.client;
+    if (values["allow-host"]) o.allowHosts = values["allow-host"];
     if (values.browser) o.browser = values.browser;
     if (values["browser-path"]) o.browserPath = values["browser-path"];
     if (values.json) o.json = values.json;
@@ -548,6 +647,7 @@ async function dispatch(command: string, sub: string | undefined, arg: string | 
     const client = supplied.client ? { clientId: supplied.client.clientId, ...(supplied.client.clientSecret ? { clientSecret: supplied.client.clientSecret } : {}) } : undefined;
     const common = {
       allowPrivate: values["allow-private"],
+      ...(values["allow-host"] ? { allowHosts: values["allow-host"] } : {}),
       ...(timeoutMs !== undefined ? { requestTimeoutMs: timeoutMs } : {}),
       ...(protocol ? { protocol } : {}),
     };
@@ -631,7 +731,7 @@ async function dispatch(command: string, sub: string | undefined, arg: string | 
     });
   }
 
-  if (command === "scan" && sub) {
+  if ((command === "scan" || command === "plan") && sub) {
     const failOn = values["fail-on"] as Severity;
     if (!SEVERITIES.includes(failOn)) {
       err(`--fail-on must be one of ${SEVERITIES.join(", ")}\n`);
@@ -663,6 +763,14 @@ async function dispatch(command: string, sub: string | undefined, arg: string | 
     }
 
     const options: Parameters<typeof runScan>[1] = { allowPrivate: values["allow-private"] };
+    if (values["allow-host"]) options.allowHosts = values["allow-host"];
+    if (values["header-file"]) options.extraHeaders = readHeaderFile(values["header-file"]);
+    const preset = values.preset === undefined ? undefined : PRESETS[values.preset];
+    if (values.preset !== undefined && !preset) {
+      err(`--preset must be one of ${Object.keys(PRESETS).join(", ")}\n`);
+      return EXIT.usage;
+    }
+    if (values.preset !== undefined) options.preset = values.preset;
     let select: ReturnType<typeof parseSelection>;
     try {
       select = parseSelection(values.only, values.skip);
@@ -695,6 +803,10 @@ async function dispatch(command: string, sub: string | undefined, arg: string | 
       const dropped = rtk === "off" ? ["MAP-RTK01", "MAP-RTK02", "MAP-RTK03"] : ["MAP-RTK02", "MAP-RTK03"];
       select = (id) => !dropped.includes(id) && (inner ? inner(id) : true);
     }
+    if (preset && values.preset !== "intrusive") {
+      const inner = select;
+      select = (id) => preset.select(id) && (inner ? inner(id) : true);
+    }
     if (select) options.select = select;
     const secret = readSecret(values["secret-file"]);
     if (secret) options.secret = secret;
@@ -724,7 +836,9 @@ async function dispatch(command: string, sub: string | undefined, arg: string | 
       err("Pass either --bearer-file (a static key) or --access-token-file (an OAuth access token), not both.\n");
       return EXIT.usage;
     }
-    if (values["bearer-file"] || values["access-token-file"]) {
+    if ((values["bearer-file"] || values["access-token-file"]) && preset?.credential === false) {
+      err(`warning: --preset ${values.preset} uses no credential: the key or token was not read.\n`);
+    } else if (values["bearer-file"] || values["access-token-file"]) {
       try {
         const loaded = values["bearer-file"] ? loadBearerFile(values["bearer-file"], values["bearer-header"]) : loadAccessTokenFile(values["access-token-file"] as string);
         for (const w of loaded.warnings) err(`warning: ${w}\n`);
@@ -776,6 +890,21 @@ async function dispatch(command: string, sub: string | undefined, arg: string | 
       }
     }
 
+    if (command === "plan") {
+      const plan = await planScan(url.toString(), options);
+      out(values.json === "-" ? `${JSON.stringify(plan, null, 2)}\n` : planToText(plan));
+      if (values.json && values.json !== "-") writeFileSync(values.json, `${JSON.stringify(plan, null, 2)}\n`);
+      return plan.reachable ? EXIT.ok : EXIT.unreachable;
+    }
+
+    if (values.journal) {
+      const p = outputProblem("journal", values.journal);
+      if (p) {
+        err(`${p}\n`);
+        return EXIT.usage;
+      }
+      setClientJournal(values.journal);
+    }
     if (values.events) {
       const p = outputProblem("events", values.events);
       if (p) {
@@ -812,6 +941,7 @@ async function dispatch(command: string, sub: string | undefined, arg: string | 
     } finally {
       process.off("SIGINT", onSignal);
       process.off("SIGTERM", onSignal);
+      setClientJournal(null);
     }
     const report = result.report;
     if (posture) report.posture = postureSection(report.findings, posture);

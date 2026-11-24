@@ -11,6 +11,15 @@ export interface HttpOptions {
   timeoutMs?: number;
   /** Maximum response body size in bytes. */
   maxBodyBytes?: number;
+  /**
+   * With `allowPrivate`, the only hosts for which a loopback or private
+   * address is accepted (the scan target, and --allow-host). A server's
+   * metadata then cannot send the scanner to other internal addresses.
+   * Left out, `allowPrivate` applies to every host.
+   */
+  privateHosts?: readonly string[];
+  /** Headers added to every request to this origin and to no other (a gateway token in front of the MCP server). */
+  extraHeaders?: { origin: string; headers: Record<string, string> };
   /** Pause before every request, in milliseconds (--delay-ms): a gentler scan. */
   delayMs?: number;
   /** Hard cap on the number of requests this client sends (--max-requests). */
@@ -47,7 +56,7 @@ export interface HttpResponse {
 
 export class BlockedAddressError extends Error {
   constructor(host: string, address: string) {
-    super(`Refusing to connect to ${host} (${address}): private or reserved address. Use --allow-private for a local lab.`);
+    super(`Refusing to connect to ${host} (${address}): private or reserved address. Use --allow-private for a local lab, and --allow-host ${host} when it is not the scanned host.`);
     this.name = "BlockedAddressError";
   }
 }
@@ -129,7 +138,9 @@ export function describeNetworkError(e: unknown): NetworkError {
 const DEFAULT_TIMEOUT_MS = 10_000;
 const DEFAULT_MAX_BODY = 1024 * 1024;
 
-function guardedLookup(allowPrivate: boolean) {
+const bareHost = (h: string): string => h.replace(/^\[|\]$/g, "").toLowerCase().replace(/\.$/, "");
+
+function guardedLookup(allowPrivateFor: (hostname: string) => boolean) {
   return (
     hostname: string,
     options: object,
@@ -138,7 +149,7 @@ function guardedLookup(allowPrivate: boolean) {
     dnsLookup(hostname, { ...options, all: true }, (err, addresses) => {
       if (err) return callback(err, []);
       const list = addresses as LookupAddress[];
-      if (!allowPrivate) {
+      if (!allowPrivateFor(hostname)) {
         const bad = list.find((a) => isBlockedAddress(a.address));
         if (bad) return callback(new BlockedAddressError(hostname, bad.address) as NodeJS.ErrnoException, []);
       }
@@ -160,6 +171,8 @@ export class HttpClient {
   private readonly timeoutMs: number;
   private readonly maxBodyBytes: number;
   readonly allowPrivate: boolean;
+  private readonly privateHosts: Set<string> | null;
+  private readonly extraHeaders: { origin: string; headers: Record<string, string> } | null;
   private readonly delayMs: number;
   private readonly maxRequests: number;
   private readonly signal: AbortSignal | undefined;
@@ -171,14 +184,29 @@ export class HttpClient {
     this.maxRequests = options.maxRequests ?? Number.POSITIVE_INFINITY;
     this.signal = options.signal;
     this.allowPrivate = options.allowPrivate ?? false;
+    this.privateHosts = options.privateHosts ? new Set(options.privateHosts.map(bareHost)) : null;
+    this.extraHeaders = options.extraHeaders ?? null;
     this.timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
     this.maxBodyBytes = options.maxBodyBytes ?? DEFAULT_MAX_BODY;
     this.dispatcher = new Agent({
-      connect: { lookup: guardedLookup(this.allowPrivate), timeout: this.timeoutMs },
+      connect: { lookup: guardedLookup((h) => this.privateAllowedFor(h)), timeout: this.timeoutMs },
       headersTimeout: this.timeoutMs,
       bodyTimeout: this.timeoutMs,
       connections: 4,
     });
+  }
+
+  /** Whether a loopback or private address is acceptable for this host. */
+  privateAllowedFor(hostname: string): boolean {
+    if (!this.allowPrivate) return false;
+    if (this.privateHosts === null || this.privateHosts.has(bareHost(hostname))) return true;
+    // Every name of this machine's loopback is the same place: a lab scanned as localhost may announce 127.0.0.1.
+    return isLoopbackHost(hostname) && [...this.privateHosts].some((h) => isLoopbackHost(h));
+  }
+
+  /** Accept private addresses for one more host (an authorization server the operator named). */
+  allowPrivateHost(hostname: string): void {
+    this.privateHosts?.add(bareHost(hostname));
   }
 
   /** True once the scan was stopped or its request budget is spent. */
@@ -204,13 +232,14 @@ export class HttpClient {
     }
     // IP-literal hosts never go through DNS lookup, so check them here.
     const literal = url.hostname.replace(/^\[|\]$/g, "");
-    if (!this.allowPrivate && /^[\d.]+$|:/.test(literal) && isBlockedAddress(literal)) {
+    if (!this.privateAllowedFor(literal) && /^[\d.]+$|:/.test(literal) && isBlockedAddress(literal)) {
       throw new BlockedAddressError(url.hostname, literal);
     }
 
     const headers: Record<string, string> = {
       "user-agent": USER_AGENT,
       "accept-encoding": "identity",
+      ...(this.extraHeaders && url.origin === this.extraHeaders.origin ? this.extraHeaders.headers : {}),
       ...req.headers,
     };
     // Lets a request that only reads the start of an endless stream drop its connection afterwards.

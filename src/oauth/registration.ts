@@ -1,3 +1,4 @@
+import { appendFileSync } from "node:fs";
 import type { HttpClient } from "../net/http.js";
 import { registerSecret, safeErrorCode } from "../redact.js";
 
@@ -13,6 +14,50 @@ import { registerSecret, safeErrorCode } from "../redact.js";
 export const SAFE_DOMAIN = "mcp-authprobe.invalid";
 export const REGISTERED_REDIRECT = `https://client.${SAFE_DOMAIN}/callback`;
 const CLIENT_NAME = "mcp-authprobe test client (safe to delete)";
+
+/**
+ * Journal of the clients the scanner registers (opt-in, --journal): one JSON
+ * line when a client is created, one when it is deleted. After a scan that
+ * was killed, `mcp-authprobe cleanup --journal <file>` deletes what is left.
+ * The file holds registration access tokens: it is created with mode 600.
+ */
+let journalPath: string | null = null;
+export function setClientJournal(path: string | null): void {
+  journalPath = path;
+}
+function journal(entry: Record<string, unknown>): void {
+  if (!journalPath) return;
+  try {
+    appendFileSync(journalPath, `${JSON.stringify({ ...entry, at: new Date().toISOString() })}\n`, { mode: 0o600 });
+  } catch {
+    /* the journal is a convenience: a scan never fails because of it */
+  }
+}
+
+export interface JournalEntry {
+  clientId: string;
+  registrationEndpoint: string;
+  registrationClientUri: string | null;
+  registrationAccessToken: string | null;
+}
+
+/** Clients a journal says were created and never deleted. */
+export function pendingClients(text: string): JournalEntry[] {
+  const created = new Map<string, JournalEntry>();
+  for (const line of text.split(/\r?\n/)) {
+    if (!line.trim()) continue;
+    try {
+      const e = JSON.parse(line) as { event?: string } & Partial<JournalEntry>;
+      if (typeof e.clientId !== "string" || typeof e.registrationEndpoint !== "string") continue;
+      const key = `${e.registrationEndpoint}\u0000${e.clientId}`;
+      if (e.event === "created") created.set(key, { clientId: e.clientId, registrationEndpoint: e.registrationEndpoint, registrationClientUri: e.registrationClientUri ?? null, registrationAccessToken: e.registrationAccessToken ?? null });
+      else if (e.event === "deleted") created.delete(key);
+    } catch {
+      /* a torn last line: ignored */
+    }
+  }
+  return [...created.values()];
+}
 
 export interface RegisteredClient {
   clientId: string;
@@ -84,6 +129,7 @@ export async function registerClient(
   const rat = json["registration_access_token"];
   registerSecret(typeof secret === "string" ? secret : null);
   registerSecret(typeof rat === "string" ? rat : null);
+  journal({ event: "created", clientId, registrationEndpoint, registrationClientUri: typeof rcu === "string" ? rcu : null, registrationAccessToken: typeof rat === "string" ? rat : null });
   return {
     status: res.status,
     retryAfter,
@@ -114,7 +160,9 @@ export async function deleteClient(http: HttpClient, client: RegisteredClient, r
       cleanup: true,
       headers: { authorization: `Bearer ${client.registrationAccessToken}` },
     });
-    return res.status === 204 || res.status === 200;
+    const ok = res.status === 204 || res.status === 200;
+    if (ok) journal({ event: "deleted", clientId: client.clientId, registrationEndpoint });
+    return ok;
   } catch {
     return false;
   }

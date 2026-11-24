@@ -31,6 +31,9 @@ import { registerSecret, safeErrorCode, safeText } from "./redact.js";
  * redirect_uri, which a compliant token endpoint must refuse.
  */
 
+/** Which login checks may run, by the host they send requests to. */
+export type ProbeScope = boolean | { authorizationServer: boolean; endpoint: boolean };
+
 /** A client the operator supplies instead of dynamic registration: pre-registered, or a client ID metadata document URL. */
 export interface ClientConfig {
   clientId: string;
@@ -45,8 +48,12 @@ export interface LoginOptions {
   discovery: DiscoveryResult;
   /** Opens the authorization URL (a browser in the CLI, a scripted agent in tests). */
   openUrl: (url: string) => Promise<void>;
-  /** Run the login checks. Only set when ownership of every contacted host is proven. */
-  probe: boolean;
+  /**
+   * Run the login checks: all of them (true), none (false), or by host. The
+   * checks of the token endpoint need the authorization server's host
+   * proven; those of the MCP endpoint need the MCP host proven.
+   */
+  probe: ProbeScope;
   /** How long to wait for the user to finish in the browser. */
   timeoutMs?: number;
   /** Status lines for the user (stderr in the CLI). Never receives secrets. */
@@ -363,8 +370,8 @@ export interface CompleteLoginOptions {
   state: LoginState;
   /** The URL the authorization server sent the user back to (or its query string, or its parameters). */
   callback: string | URLSearchParams;
-  /** Run the login checks. Only set when ownership of every contacted host is proven. */
-  probe: boolean;
+  /** Run the login checks (see LoginOptions.probe). */
+  probe: ProbeScope;
   /** Pre-exchange checks to run (default MAP-PKC01 then MAP-RDR03). */
   preProbes?: readonly string[];
   /** Run the checks that follow the exchange (endpoint checks, MAP-AUD01, MAP-COD01). Default true. */
@@ -387,6 +394,8 @@ export async function completeLogin(o: CompleteLoginOptions): Promise<LoginResul
   const observations: Observation[] = [];
   let keepClient = st.clientSource !== "dynamic-registration"; // only a client this login registered is ever deleted
   const cb = callbackParams(o.callback);
+  const probeAs = typeof o.probe === "boolean" ? o.probe : o.probe.authorizationServer;
+  const probeMcp = typeof o.probe === "boolean" ? o.probe : o.probe.endpoint;
 
   try {
     if (cb.state === null || !equalStrings(cb.state, st.state)) throw new LoginError("The authorization response does not carry the expected state; it was not used.");
@@ -411,7 +420,7 @@ export async function completeLogin(o: CompleteLoginOptions): Promise<LoginResul
     const classify = (r: CodeExchangeOutcome): Verdict =>
       r.accessTokenIssued ? "accepted" : r.status >= 400 && r.status < 500 && !r.throttled ? "refused" : "inconclusive";
 
-    if (o.probe) {
+    if (probeAs) {
       const all: Array<{ checkId: string; label: string; params: Parameters<typeof exchangeCode>[2] }> = [
         { checkId: "MAP-PKC01", label: "code presented without a code_verifier (PKCE)", params: { ...exchangeParams, redirectUri: st.redirectUri } },
         { checkId: "MAP-PKC01", label: "code presented with a wrong code_verifier (PKCE)", params: { ...correct, codeVerifier: randomBytes(32).toString("base64url") } },
@@ -432,8 +441,10 @@ export async function completeLogin(o: CompleteLoginOptions): Promise<LoginResul
           tokensFromProbe = true;
         }
       }
-    } else {
+    } else if (!probeMcp) {
       notes.push(`${LOGIN_CHECK_IDS.join(", ")} were not observed: ownership of the contacted hosts is not proven, or --no-probe was used.`);
+    } else {
+      notes.push("MAP-PKC01, MAP-RDR03, MAP-COD01 and MAP-AUD01 were not observed: they send requests to the authorization server, whose host is not proven. The checks of the MCP endpoint were.");
     }
 
     // --- The real exchange ---
@@ -442,9 +453,9 @@ export async function completeLogin(o: CompleteLoginOptions): Promise<LoginResul
     if (!tokens) {
       tokens = await exchangeCode(http, tokenEndpoint, correct);
       if (!tokens.accessTokenIssued) {
-        if (o.probe && tokens.error === "invalid_grant" && results.length > 0) {
+        if (probeAs && tokens.error === "invalid_grant" && results.length > 0) {
           codeBurnt = true;
-        } else if (o.probe && results.some((r) => r.verdict !== "not_run")) {
+        } else if (probeAs && results.some((r) => r.verdict !== "not_run")) {
           // Keep what the probes observed; only the first refusal is trusted.
           codeBurnt = true;
           exchangeFailure = safeText(describeOutcome(tokens), 200);
@@ -508,8 +519,8 @@ export async function completeLogin(o: CompleteLoginOptions): Promise<LoginResul
     } : null;
     if (grant && st.clientSecret) grant.clientSecret = st.clientSecret;
 
-    if (o.probe && o.postProbes !== false) {
-      await postExchangeProbes({ http, target, tokenEndpoint, grant, tokens, correct, tokensFromProbe, observations, notes, results, resource: st.resource, ...(o.era ? { era: o.era } : {}) });
+    if ((probeAs || probeMcp) && o.postProbes !== false) {
+      await postExchangeProbes({ http, target, tokenEndpoint, grant, tokens, correct, tokensFromProbe, observations, notes, results, resource: st.resource, probeAs, probeMcp, ...(o.era ? { era: o.era } : {}) });
       if (notes.some((n) => n.startsWith(REVOKED_NOTE))) return { grant: null, observations, notes, clientSource: st.clientSource };
     }
     if (!grant) {
@@ -551,7 +562,7 @@ export async function login(opts: LoginOptions): Promise<LoginResult> {
 
     // A probe that obtained tokens spent the code before MAP-RDR03 could be observed: a second code settles it.
     const unobserved = result.observations.find((x) => x.checkId === "MAP-RDR03" && x.status === "skipped");
-    if (opts.probe && unobserved && (opts.rounds ?? 1) >= 2) {
+    if (opts.probe !== false && (opts.probe === true || opts.probe.authorizationServer) && unobserved && (opts.rounds ?? 1) >= 2) {
       log("Second authorization, to observe MAP-RDR03 with a code of its own.");
       // The same client: the redirect URI is the one it was registered with.
       const client: ClientConfig = { clientId: begun.state.clientId, authMethod: begun.state.authMethod, ...(begun.state.clientSecret ? { clientSecret: begun.state.clientSecret } : {}) };
@@ -620,6 +631,9 @@ interface PostExchange {
   /** The RFC 8707 resource the tokens were requested for. */
   resource?: string;
   era?: Era;
+  /** Hosts proven: the authorization server's, the MCP server's (default both). */
+  probeAs?: boolean;
+  probeMcp?: boolean;
 }
 
 const is2xx = (s: number | null): s is number => s !== null && s >= 200 && s < 300;
@@ -646,7 +660,11 @@ async function postExchangeProbes(c: PostExchange): Promise<void> {
   let control: number | null = null;
   let era: Era | undefined = c.era;
   const accessToken = tokens.accessToken;
-  if (accessToken) {
+  const probeAs = c.probeAs ?? true;
+  const probeMcp = c.probeMcp ?? true;
+  if (!probeMcp) {
+    /* the MCP host is not proven: its checks are not observed */
+  } else if (accessToken) {
     const ep = await runEndpointChecks(http, target, bearerCredential(accessToken), c.era ? { era: c.era } : {});
     control = ep.control;
     if (ep.era) era = ep.era;
@@ -657,13 +675,14 @@ async function postExchangeProbes(c: PostExchange): Promise<void> {
     }
   }
 
-  await guard("MAP-AUD01", async () => {
+  // MAP-AUD01 asks the authorization server for a token and presents it to the MCP server: both hosts.
+  if (probeAs && probeMcp) await guard("MAP-AUD01", async () => {
     const f = await runAudienceCheck({ http, target, tokenEndpoint, grant, control, ...(era ? { era } : {}), ...(c.resource ? { ownAudiences: [c.resource] } : {}) });
     observations.push({ ...f, source: "login", observedAt: new Date().toISOString() });
   });
 
   // Last: a compliant server may revoke the grant here.
-  await guard("MAP-COD01", async () => {
+  if (probeAs) await guard("MAP-COD01", async () => {
     const reuse = await exchangeCode(http, tokenEndpoint, c.correct);
     const lines = [`code presented a second time: ${describeOutcome(reuse)}`];
     if (c.tokensFromProbe) lines.unshift("the code had already been exchanged by an earlier probe");
@@ -689,7 +708,7 @@ async function postExchangeProbes(c: PostExchange): Promise<void> {
     // Were the tokens issued from that code revoked? (recommended)
     if (!grant) {
       // No refresh token: look at the access token instead.
-      const st = accessToken ? await initializeStatus(http, target, { token: accessToken, ...(era ? { era } : {}) }) : null;
+      const st = accessToken && probeMcp ? await initializeStatus(http, target, { token: accessToken, ...(era ? { era } : {}) }) : null;
       lines.push(`access token after the reuse attempt: ${st === null ? "not available" : `HTTP ${st}`}`);
       const message =
         st !== null && (st === 401 || st === 403) && is2xx(control)
