@@ -110,6 +110,11 @@ Log in with the account `test` / `test` and click **Allow**.
 | `secure` | Every check passes (or is not applicable); `MAP-CSR01` runs with `consent-check`. |
 | `static-bearer` | No OAuth: the MCP endpoint takes a static API key, printed when the lab starts (scan with `--bearer-file`). JSON-RPC batches executed, 6 MiB bodies accepted, key accepted in the URL, any `Origin` accepted, session ID enough without the key, no rate limit. |
 | `static-bearer-secure` | The same server done right: every key check passes or is not applicable. |
+| `modern` | The `secure` profile speaking **MCP 2026-07-28 only**: stateless, `server/discover`, the `MCP-Protocol-Version` and `Mcp-Method` headers required, no session, no `ping`, 405 to GET and DELETE. |
+| `dual` | The `secure` profile speaking both 2026-07-28 and 2025-11-25 on the same endpoint. |
+| `preregistered` | The `secure` profile **without dynamic client registration**: one pre-registered client, whose ID and redirect URIs are printed when the lab starts (scan and log in with `--client-id`). |
+
+`--auto-approve` makes the OAuth profiles approve every valid authorization request at once, without the login and consent pages, so a script or a CI job can run `login` (with `--no-browser`, then fetching the printed URL). The limit on failed token requests is per client and lifts after 60 seconds, so the lab can be scanned again without restarting it.
 
 The lab only listens on `127.0.0.1` or `::1` (`--host`, `--port`, default 8787; names such as `localhost` are refused so that no resolver can move it elsewhere), keeps everything in memory, and stops with Ctrl-C. Its access tokens are unsigned JWTs, so `MAP-AUD01` can read their audience. It is vulnerable on purpose: never expose it.
 

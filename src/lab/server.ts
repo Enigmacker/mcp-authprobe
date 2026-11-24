@@ -26,8 +26,10 @@ export interface TokenBehaviour {
   bindRedirect?: boolean;
   /** Invalidate a code after any failed exchange attempt (default false). */
   consumeCodeOnFailure?: boolean;
-  /** Answer 429 once this many failed token requests have been seen. */
+  /** Answer 429 once this many failed token requests have been seen from one client within the window. */
   rateLimitAfter?: number;
+  /** Length of that window in milliseconds (default 60 s): the limit lifts by itself, so the lab can be scanned again. */
+  rateLimitWindowMs?: number;
   /** Signal throttling with an OAuth slow_down error in a 400 instead of 429. */
   rateLimitStyle?: "429" | "slow_down";
   /** Answer every token request with 503 and Retry-After (outage). */
@@ -71,6 +73,12 @@ export interface AuthorizationBehaviour {
   management?: boolean;
   /** Answer 429 to authorize and register requests once this many have been seen. */
   rateLimitAfter?: number;
+  /** Clients that exist without registration (pre-registered, or resolved from a client ID metadata document). */
+  clients?: Array<{ clientId: string; redirectUris: string[]; secret?: string }>;
+  /** Announce client_id_metadata_document_supported (the lab resolves no URL: declare the documents in `clients`). */
+  clientIdMetadataDocuments?: boolean;
+  /** Omit code_challenge_methods_supported from the metadata. */
+  hidePkceMethods?: boolean;
 }
 
 /** Consent page behaviour, for MAP-CSR01. */
@@ -159,7 +167,19 @@ export interface FixtureOptions {
     rateLimit?: number;
     /** Tools, prompts and resources announced (default none): plain ones, or ones with a hidden injection (MAP-INJ01). */
     metadata?: "clean" | "poisoned";
+    /**
+     * MCP revisions spoken: "legacy" (default: 2025-11-25, initialize, sessions),
+     * "modern" (2026-07-28 only: stateless, server/discover, required headers,
+     * no session, no ping) or "dual" (both, chosen from how the client opens).
+     */
+    protocol?: "legacy" | "modern" | "dual";
+    /** Announce the per-credential limit in RateLimit-Limit / RateLimit-Remaining headers. */
+    rateLimitHeaders?: boolean;
   };
+  /** Override fields of the Protected Resource Metadata (tests of metadata validation). */
+  prmOverrides?: Record<string, unknown>;
+  /** Override fields of the Authorization Server Metadata. */
+  asOverrides?: Record<string, unknown>;
 }
 
 export interface Fixture {
@@ -249,6 +269,33 @@ const LAB_METADATA = {
   },
 } as const;
 
+const LEGACY_VERSION = "2025-11-25";
+const MODERN_VERSION = "2026-07-28";
+const META_VERSION = "io.modelcontextprotocol/protocolVersion";
+const MODERN_METHODS = new Set(["server/discover", "tools/list", "prompts/list", "resources/list", "resources/templates/list"]);
+
+/** Results of the 2026-07-28 revision: stateless, with resultType and cache hints. */
+function modernResult(method: string, metadata: "clean" | "poisoned" | undefined, versions: string[]): Record<string, unknown> {
+  const m = metadata ? LAB_METADATA[metadata] : undefined;
+  const serverInfo = { "io.modelcontextprotocol/serverInfo": { name: "fixture", version: "0" } };
+  if (method === "server/discover") {
+    return {
+      resultType: "complete",
+      supportedVersions: versions,
+      capabilities: m ? { tools: {}, prompts: {}, resources: {} } : {},
+      _meta: serverInfo,
+      ...(m ? { instructions: m.instructions } : {}),
+      ttlMs: 60_000,
+      cacheScope: "public",
+    };
+  }
+  const cache = { resultType: "complete", ttlMs: 60_000, cacheScope: "private", _meta: serverInfo };
+  if (method === "tools/list") return { ...cache, tools: m?.tools ?? [] };
+  if (method === "prompts/list") return { ...cache, prompts: m?.prompts ?? [] };
+  if (method === "resources/list") return { ...cache, resources: m?.resources ?? [] };
+  return { ...cache, resourceTemplates: [] };
+}
+
 function rpcResult(method: string | undefined, metadata: "clean" | "poisoned" | undefined): Record<string, unknown> {
   const m = metadata ? LAB_METADATA[metadata] : undefined;
   if (method === "initialize") {
@@ -271,8 +318,19 @@ const newToken = (prefix: string): string => `${prefix}_${randomBytes(16).toStri
 
 export async function startFixture(options: FixtureOptions = {}): Promise<Fixture> {
   const opts = { challenge: true, prm: true, asMetadata: true, ownershipFile: null, anonymous: false, ...options };
-  let failures = 0;
-  const tok: Required<Omit<TokenBehaviour, "clientSecret" | "rateLimitAfter" | "throttleRefreshAfter">> & { clientSecret?: string; rateLimitAfter?: number; throttleRefreshAfter?: number } = {
+  /** Failed token requests per client, as timestamps: the limit is per client and lifts after the window. */
+  const failureTimes = new Map<string, number[]>();
+  const failuresOf = (client: string): number => {
+    const now = Date.now();
+    const kept = (failureTimes.get(client) ?? []).filter((t) => now - t < (tok.rateLimitWindowMs ?? 60_000));
+    failureTimes.set(client, kept);
+    return kept.length;
+  };
+  const failed = (client: string | null): void => {
+    const key = client ?? "";
+    failureTimes.set(key, [...(failureTimes.get(key) ?? []), Date.now()]);
+  };
+  const tok: Required<Omit<TokenBehaviour, "clientSecret" | "rateLimitAfter" | "throttleRefreshAfter" | "rateLimitWindowMs">> & { clientSecret?: string; rateLimitAfter?: number; throttleRefreshAfter?: number; rateLimitWindowMs?: number } = {
     rotate: true,
     returnSameRefresh: false,
     rejectReplay: true,
@@ -292,7 +350,7 @@ export async function startFixture(options: FixtureOptions = {}): Promise<Fixtur
     ...options.tokens,
   };
   let authzRequests = 0;
-  const authz: Required<Omit<AuthorizationBehaviour, "rateLimitAfter">> & { rateLimitAfter?: number } = { match: "exact", noSession: "login", registration: "strict", management: true, issInResponse: true, ...options.authorization };
+  const authz: Required<Omit<AuthorizationBehaviour, "rateLimitAfter" | "clients" | "clientIdMetadataDocuments" | "hidePkceMethods">> & Pick<AuthorizationBehaviour, "rateLimitAfter" | "clients" | "clientIdMetadataDocuments" | "hidePkceMethods"> = { match: "exact", noSession: "login", registration: "strict", management: true, issInResponse: true, ...options.authorization };
   const codes = new Map<string, { clientId: string; redirectUri: string; challenge: string; used: boolean; family?: string }>();
   const mcpOpts = { checkAudience: true, validateOrigin: true, sessions: true, cors: "none", ...options.mcp };
   const mcpSessions = new Set<string>();
@@ -300,6 +358,8 @@ export async function startFixture(options: FixtureOptions = {}): Promise<Fixtur
   /** access token -> { audience, family } */
   const accessTokens = new Map<string, { audience: string; family: string }>();
   const clients = new Map<string, { redirectUris: string[]; managementToken: string }>();
+  for (const c of options.authorization?.clients ?? []) clients.set(c.clientId, { redirectUris: c.redirectUris, managementToken: newToken("rat") });
+  const fixedClientIds = new Set((options.authorization?.clients ?? []).map((c) => c.clientId));
   const requests: Fixture["requests"] = [];
   const refreshTokens = new Map<string, RefreshRecord>();
   const revokedFamilies = new Set<string>();
@@ -311,10 +371,6 @@ export async function startFixture(options: FixtureOptions = {}): Promise<Fixtur
     tokenCount += 1;
     if (tok.throttle) return json(res, 429, { error: "slow_down" }, { "retry-after": "30" });
     if (tok.outage) return json(res, 503, { error: "temporarily_down" }, { "retry-after": "30" });
-    if (tok.rateLimitAfter !== undefined && failures >= tok.rateLimitAfter) {
-      return tok.rateLimitStyle === "429" ? json(res, 429, { error: "too_many_requests" }, { "retry-after": "60" }) : json(res, 400, { error: "slow_down" });
-    }
-
     const form = new URLSearchParams(body);
     let clientId = form.get("client_id");
     let secret = form.get("client_secret");
@@ -324,12 +380,18 @@ export async function startFixture(options: FixtureOptions = {}): Promise<Fixtur
       clientId = decodeURIComponent(id ?? "");
       secret = decodeURIComponent(sec ?? "");
     }
+    if (tok.rateLimitAfter !== undefined && failuresOf(clientId ?? "") >= tok.rateLimitAfter) {
+      const wait = String(Math.ceil((tok.rateLimitWindowMs ?? 60_000) / 1000));
+      return tok.rateLimitStyle === "429" ? json(res, 429, { error: "too_many_requests" }, { "retry-after": wait }) : json(res, 400, { error: "slow_down" });
+    }
     if (tok.clientSecret !== undefined && secret !== tok.clientSecret) return json(res, 401, { error: "invalid_client" });
+    const fixed = (authz.clients ?? []).find((c) => c.clientId === clientId);
+    if (fixed?.secret !== undefined && secret !== fixed.secret) return json(res, 401, { error: "invalid_client" });
     if (form.get("grant_type") === "authorization_code") {
       const code = codes.get(form.get("code") ?? "");
       if (tok.crashOnBadCode && (!code || code.used)) return json(res, 500, { error: "server_error" });
       if (!code || code.clientId !== clientId) {
-        failures += 1;
+        failed(clientId);
         return json(res, 400, { error: "invalid_grant" });
       }
       if (code.used && tok.codeReuse !== "allow") {
@@ -366,7 +428,7 @@ export async function startFixture(options: FixtureOptions = {}): Promise<Fixtur
     const presented = form.get("refresh_token") ?? "";
     const record = refreshTokens.get(presented);
     if (!record || record.clientId !== clientId || revokedFamilies.has(record.family)) {
-      failures += 1;
+      failed(clientId);
       return json(res, 400, { error: "invalid_grant" });
     }
     if (record.used && tok.rejectReplay) {
@@ -439,7 +501,7 @@ export async function startFixture(options: FixtureOptions = {}): Promise<Fixtur
 
   function manageEndpoint(req: IncomingMessage, clientId: string, res: ServerResponse): void {
     const c = clients.get(clientId);
-    if (!c || req.headers.authorization !== `Bearer ${c.managementToken}`) return json(res, 401, { error: "invalid_token" });
+    if (!c || fixedClientIds.has(clientId) || req.headers.authorization !== `Bearer ${c.managementToken}`) return json(res, 401, { error: "invalid_token" });
     if (req.method === "DELETE") {
       clients.delete(clientId);
       res.writeHead(204);
@@ -666,7 +728,7 @@ ${formTag}${hidden}${token}${challenge}${checkbox}
           if (mcpOpts.cors === "reflect-credentials") cors["access-control-allow-credentials"] = "true";
         }
         if (req.method === "OPTIONS") {
-          res.writeHead(204, { ...cors, ...(mcpOpts.cors !== "none" ? { "access-control-allow-methods": "POST, GET, DELETE", "access-control-allow-headers": "authorization, content-type, mcp-session-id, mcp-protocol-version" } : {}) });
+          res.writeHead(204, { ...cors, ...(mcpOpts.cors !== "none" ? { "access-control-allow-methods": "POST, GET, DELETE", "access-control-allow-headers": "authorization, content-type, mcp-session-id, mcp-protocol-version, mcp-method, mcp-name" } : {}) });
           res.end();
           return;
         }
@@ -694,6 +756,11 @@ ${formTag}${hidden}${token}${challenge}${checkbox}
           hits.push(now);
           rateHits.set(bearer, hits);
           if (hits.length > mcpOpts.rateLimit) return json(res, 429, { error: "rate_limited" }, { "retry-after": "60" });
+          if (mcpOpts.rateLimitHeaders) {
+            res.setHeader("ratelimit-limit", String(mcpOpts.rateLimit));
+            res.setHeader("ratelimit-remaining", String(mcpOpts.rateLimit - hits.length));
+            res.setHeader("ratelimit-reset", "60");
+          }
         }
         if (tokenOk && mcpOpts.hangUpAuthenticated) {
           req.socket.destroy();
@@ -701,6 +768,13 @@ ${formTag}${hidden}${token}${challenge}${checkbox}
         }
         if (tokenOk && mcpOpts.authenticatedStatus !== undefined) return json(res, mcpOpts.authenticatedStatus, { error: "unavailable" });
         if (bearer && !tokenOk && mcpOpts.invalidTokenStatus !== undefined) return json(res, mcpOpts.invalidTokenStatus, { error: "invalid_token" });
+        const protocol = mcpOpts.protocol ?? "legacy";
+        // 2026-07-28 only: no GET stream and no session to end.
+        if (protocol === "modern" && (req.method === "GET" || req.method === "DELETE")) {
+          res.writeHead(405, { allow: "POST" });
+          res.end();
+          return;
+        }
         if (req.method === "DELETE") {
           if (tokenOk && typeof sessionId === "string") mcpSessions.delete(sessionId);
           res.writeHead(tokenOk ? 204 : 401);
@@ -716,6 +790,31 @@ ${formTag}${hidden}${token}${challenge}${checkbox}
             if (!Array.isArray(parsed)) rpc = parsed as { method?: string };
           } catch {
             /* not JSON-RPC */
+          }
+          // Which revision does this request speak? Modern requests carry Mcp-Method and per-request _meta.
+          const meta = (rpc as { params?: { _meta?: Record<string, unknown> } }).params?._meta;
+          const first = Array.isArray(parsed) ? (parsed[0] as { method?: string; params?: { _meta?: Record<string, unknown> } } | undefined) : undefined;
+          const looksModern = req.headers["mcp-method"] !== undefined || meta?.[META_VERSION] !== undefined || first?.params?._meta?.[META_VERSION] !== undefined;
+          if (protocol === "modern" || (protocol === "dual" && looksModern)) {
+            const versions = protocol === "dual" ? [MODERN_VERSION, LEGACY_VERSION] : [MODERN_VERSION];
+            const rid = typeof rpc.id === "number" || typeof rpc.id === "string" ? rpc.id : null;
+            const refuse = (status: number, code: number, message: string, data?: unknown): void =>
+              json(res, status, { jsonrpc: "2.0", id: rid, error: { code, message, ...(data !== undefined ? { data } : {}) } });
+            if (Array.isArray(parsed)) {
+              if (!mcpOpts.batch) return refuse(400, -32600, "A request body carries a single JSON-RPC message");
+              return json(res, 200, parsed.map((m: { id?: unknown; method?: string }) => ({ jsonrpc: "2.0", id: m?.id ?? null, result: modernResult(m?.method ?? "", mcpOpts.metadata, versions) })));
+            }
+            const headerVersion = req.headers["mcp-protocol-version"];
+            const headerMethod = req.headers["mcp-method"];
+            if (typeof headerVersion !== "string" || typeof headerMethod !== "string") {
+              return refuse(400, -32020, `Header mismatch: MCP-Protocol-Version and Mcp-Method are required. This server supports MCP ${versions.join(", ")}.`);
+            }
+            if (headerMethod !== rpc.method) return refuse(400, -32020, "Header mismatch: Mcp-Method does not match the request body");
+            if (meta?.[META_VERSION] !== headerVersion) return refuse(400, -32020, "Header mismatch: MCP-Protocol-Version does not match the request body");
+            if (headerVersion !== MODERN_VERSION) return refuse(400, -32022, "Unsupported protocol version", { supported: versions, requested: headerVersion });
+            if (!MODERN_METHODS.has(rpc.method ?? "")) return refuse(404, -32601, "Method not found");
+            // No session: an Mcp-Session-Id is ignored, none is minted.
+            return json(res, 200, { jsonrpc: "2.0", id: rid, result: modernResult(rpc.method as string, mcpOpts.metadata, versions) });
           }
           if (rpc.method?.startsWith("notifications/")) {
             res.writeHead(202);
@@ -748,7 +847,7 @@ ${formTag}${hidden}${token}${challenge}${checkbox}
         return json(res, 401, { error: "unauthorized" }, headers);
       }
       if (path === "/.well-known/oauth-protected-resource/mcp" && opts.prm) {
-        return json(res, 200, { resource: `${base}/mcp`, authorization_servers: [base], scopes_supported: ["mcp"] });
+        return json(res, 200, { resource: `${base}/mcp`, authorization_servers: [base], scopes_supported: ["mcp"], ...options.prmOverrides });
       }
       if (path === "/.well-known/oauth-authorization-server" && opts.asMetadata) {
         return json(res, 200, {
@@ -758,9 +857,11 @@ ${formTag}${hidden}${token}${challenge}${checkbox}
           ...(authz.registration === "disabled" ? {} : { registration_endpoint: `${base}/register` }),
           response_types_supported: ["code"],
           grant_types_supported: ["authorization_code", "refresh_token"],
-          code_challenge_methods_supported: ["S256"],
+          ...(authz.hidePkceMethods ? {} : { code_challenge_methods_supported: ["S256"] }),
           authorization_response_iss_parameter_supported: authz.issInResponse,
           token_endpoint_auth_methods_supported: tok.clientSecret ? ["client_secret_post", "client_secret_basic"] : ["none"],
+          ...(authz.clientIdMetadataDocuments ? { client_id_metadata_document_supported: true } : {}),
+          ...options.asOverrides,
         });
       }
       if (path === "/token" && req.method === "POST") return tokenEndpoint(req, body, res);
@@ -817,7 +918,7 @@ ${formTag}${hidden}${token}${challenge}${checkbox}
       return token;
     },
     tokenRequests: () => tokenCount,
-    registeredClients: () => [...clients.keys()],
+    registeredClients: () => [...clients.keys()].filter((id) => !fixedClientIds.has(id)),
     issueSession: () => newSession(),
     consentsGranted: () => granted,
     close: () =>

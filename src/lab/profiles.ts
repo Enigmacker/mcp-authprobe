@@ -7,6 +7,17 @@ import type { FixtureOptions } from "./server.js";
  * against them. The two "static-bearer" profiles have no OAuth at all: the
  * MCP endpoint takes a static API key, generated when the lab starts.
  */
+/** The client of the `preregistered` profile: no registration, three redirect URIs (checks, a web application, a native loopback). */
+export const LAB_CLIENT = {
+  clientId: "lab-preregistered-client",
+  redirectUris: ["https://client.mcp-authprobe.invalid/callback", "https://app.mcp-authprobe.invalid/oauth/callback", "http://127.0.0.1:8765/callback"],
+} as const;
+
+const SECURE_OAUTH = {
+  tokens: { rateLimitAfter: 5, codeReuse: "refuse" },
+  consent: { csrf: "token", sameSite: "Lax" },
+} as const;
+
 export const LAB_PROFILES = {
   vulnerable: {
     description: "Deliberately misconfigured: most checks fail.",
@@ -20,10 +31,33 @@ export const LAB_PROFILES = {
   secure: {
     description: "Compliant: every check passes or is not applicable.",
     options: {
-      tokens: { rateLimitAfter: 5, codeReuse: "refuse" },
+      ...SECURE_OAUTH,
       authorization: { match: "exact", registration: "strict" },
-      consent: { csrf: "token", sameSite: "Lax" },
-      mcp: { checkAudience: true, validateOrigin: true, metadata: "clean" },
+      mcp: { checkAudience: true, validateOrigin: true, metadata: "clean", rateLimit: 300, rateLimitHeaders: true },
+    },
+  },
+  modern: {
+    description: "Compliant, MCP 2026-07-28 only: stateless, server/discover, required headers, no session, no ping.",
+    options: {
+      ...SECURE_OAUTH,
+      authorization: { match: "exact", registration: "strict" },
+      mcp: { checkAudience: true, validateOrigin: true, metadata: "clean", protocol: "modern", sessions: false, rateLimit: 300, rateLimitHeaders: true },
+    },
+  },
+  dual: {
+    description: "Compliant, MCP 2026-07-28 and 2025-11-25 on the same endpoint.",
+    options: {
+      ...SECURE_OAUTH,
+      authorization: { match: "exact", registration: "strict" },
+      mcp: { checkAudience: true, validateOrigin: true, metadata: "clean", protocol: "dual", rateLimit: 300, rateLimitHeaders: true },
+    },
+  },
+  preregistered: {
+    description: "Compliant, without dynamic client registration: one pre-registered client (its ID is printed when the lab starts).",
+    options: {
+      ...SECURE_OAUTH,
+      authorization: { match: "exact", registration: "disabled", clients: [{ clientId: LAB_CLIENT.clientId, redirectUris: [...LAB_CLIENT.redirectUris] }] },
+      mcp: { checkAudience: true, validateOrigin: true, metadata: "clean", protocol: "dual", rateLimit: 300, rateLimitHeaders: true },
     },
   },
   "static-bearer": {

@@ -119,6 +119,8 @@ Login options:
 Lab options:
   --profile <name>      One of (default: vulnerable):
 ${Object.entries(LAB_PROFILES).map(([name, p]) => `                        ${name}: ${p.description}`).join("\n")}
+  --auto-approve        Approve every valid authorization request at once, without the
+                        login and consent pages: for scripts and CI (not for consent-check)
   --port <n>            Port on 127.0.0.1 (default: 8787; 0 picks a free port)
   --host <address>      127.0.0.1 (default) or ::1; nothing else is accepted
 
@@ -232,6 +234,7 @@ function err(text: string): void {
 const CLI_OPTIONS = {
       json: { type: "string" },
       quiet: { type: "boolean", default: false },
+      "auto-approve": { type: "boolean", default: false },
       "credentials-out": { type: "string" },
       rtk: { type: "string" },
       "max-observation-age": { type: "string" },
@@ -320,7 +323,7 @@ async function dispatch(command: string, sub: string | undefined, arg: string | 
   if (command === "lab") {
     const { LabUsageError, startLab } = await import("./lab-command.js");
     try {
-      const { lab, banner } = await startLab({ profile: values.profile, port: values.port, host: values.host });
+      const { lab, banner } = await startLab({ profile: values.profile, port: values.port, host: values.host, autoApprove: values["auto-approve"] });
       err(banner);
       const stop = (): void => {
         void lab.close().finally(() => process.exit(EXIT.ok));

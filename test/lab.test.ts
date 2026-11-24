@@ -131,3 +131,85 @@ describe("lab", () => {
     expect(status["MAP-COR01"]).toBe(expected);
   });
 });
+
+describe("lab profiles for MCP 2026-07-28 and pre-registered clients", () => {
+  const modernHeaders = { "content-type": "application/json", "mcp-protocol-version": "2026-07-28" };
+  const meta = { "io.modelcontextprotocol/protocolVersion": "2026-07-28", "io.modelcontextprotocol/clientInfo": { name: "t", version: "0" }, "io.modelcontextprotocol/clientCapabilities": {} };
+  const post = (url: string, headers: Record<string, string>, body: unknown): Promise<Response> => fetch(url, { method: "POST", headers, body: JSON.stringify(body) });
+  let lab: Awaited<ReturnType<typeof startLab>>["lab"] | undefined;
+  afterEach(async () => {
+    await lab?.close();
+    lab = undefined;
+  });
+
+  it("modern: speaks 2026-07-28 only, as the specification describes", async () => {
+    ({ lab } = await startLab({ profile: "modern", port: 0, host: "127.0.0.1" }));
+    const { startFixture } = await import("../src/lab/server.js");
+    await lab.close();
+    lab = await startFixture({ anonymous: true, mcp: { protocol: "modern", sessions: false, metadata: "clean" } });
+    const url = lab.mcpUrl;
+    // A legacy client: no required header.
+    const legacy = await post(url, { "content-type": "application/json" }, { jsonrpc: "2.0", id: 1, method: "initialize", params: {} });
+    expect(legacy.status).toBe(400);
+    const legacyBody = (await legacy.json()) as { error: { code: number; message: string } };
+    expect(legacyBody.error.code).toBe(-32020);
+    expect(legacyBody.error.message).toContain("2026-07-28");
+    // server/discover
+    const ok = await post(url, { ...modernHeaders, "mcp-method": "server/discover" }, { jsonrpc: "2.0", id: 1, method: "server/discover", params: { _meta: meta } });
+    expect(ok.status).toBe(200);
+    expect(ok.headers.get("mcp-session-id")).toBeNull();
+    expect(((await ok.json()) as { result: { supportedVersions: string[]; resultType: string } }).result).toMatchObject({ supportedVersions: ["2026-07-28"], resultType: "complete" });
+    // Header and body disagree.
+    expect((await post(url, { ...modernHeaders, "mcp-method": "tools/list" }, { jsonrpc: "2.0", id: 1, method: "server/discover", params: { _meta: meta } })).status).toBe(400);
+    // Removed and unknown methods.
+    const ping = await post(url, { ...modernHeaders, "mcp-method": "ping" }, { jsonrpc: "2.0", id: 1, method: "ping", params: { _meta: meta } });
+    expect(ping.status).toBe(404);
+    expect(((await ping.json()) as { error: { code: number } }).error.code).toBe(-32601);
+    // Unsupported version.
+    const old = await post(url, { "content-type": "application/json", "mcp-protocol-version": "2025-11-25", "mcp-method": "server/discover" }, { jsonrpc: "2.0", id: 1, method: "server/discover", params: { _meta: { ...meta, "io.modelcontextprotocol/protocolVersion": "2025-11-25" } } });
+    expect(old.status).toBe(400);
+    expect(((await old.json()) as { error: { code: number; data: { supported: string[] } } }).error).toMatchObject({ code: -32022, data: { supported: ["2026-07-28"] } });
+    // No GET stream, no session to end.
+    expect((await fetch(url)).status).toBe(405);
+    expect((await fetch(url, { method: "DELETE" })).status).toBe(405);
+  });
+
+  it("dual: answers initialize with a session and server/discover without one", async () => {
+    const { startFixture } = await import("../src/lab/server.js");
+    lab = await startFixture({ anonymous: true, mcp: { protocol: "dual" } });
+    const init = await post(lab.mcpUrl, { "content-type": "application/json" }, { jsonrpc: "2.0", id: 1, method: "initialize", params: {} });
+    expect(init.status).toBe(200);
+    expect(init.headers.get("mcp-session-id")).not.toBeNull();
+    const discover = await post(lab.mcpUrl, { ...modernHeaders, "mcp-method": "server/discover" }, { jsonrpc: "2.0", id: 2, method: "server/discover", params: { _meta: meta } });
+    expect(discover.headers.get("mcp-session-id")).toBeNull();
+    expect(((await discover.json()) as { result: { supportedVersions: string[] } }).result.supportedVersions).toEqual(["2026-07-28", "2025-11-25"]);
+  });
+
+  it("preregistered: no registration endpoint, one client that works", async () => {
+    let banner: string;
+    ({ lab, banner } = await startLab({ profile: "preregistered", port: 0, host: "127.0.0.1", autoApprove: true }));
+    expect(banner).toContain("lab-preregistered-client");
+    const as = (await (await fetch(`${lab.baseUrl}/.well-known/oauth-authorization-server`)).json()) as Record<string, unknown>;
+    expect(as["registration_endpoint"]).toBeUndefined();
+    expect((await fetch(`${lab.baseUrl}/register`, { method: "POST", body: "{}" })).status).toBe(404);
+    const authorize = new URL(`${lab.baseUrl}/authorize`);
+    for (const [k, v] of Object.entries({ response_type: "code", client_id: "lab-preregistered-client", redirect_uri: "https://app.mcp-authprobe.invalid/oauth/callback", state: "s", code_challenge: "c".repeat(43), code_challenge_method: "S256" })) authorize.searchParams.set(k, v);
+    const res = await fetch(authorize, { redirect: "manual" });
+    expect(res.status).toBe(302);
+    expect(new URL(res.headers.get("location") as string).searchParams.get("code")).toMatch(/^code_/);
+    authorize.searchParams.set("redirect_uri", "https://elsewhere.mcp-authprobe.invalid/callback");
+    expect((await fetch(authorize, { redirect: "manual" })).status).toBe(400);
+    expect(lab.registeredClients()).toEqual([]);
+  });
+
+  it("the limit on failed token requests is per client and lifts after its window", async () => {
+    const { startFixture } = await import("../src/lab/server.js");
+    lab = await startFixture({ tokens: { rateLimitAfter: 2, rateLimitWindowMs: 150 } });
+    const attempt = async (client: string): Promise<number> =>
+      (await fetch(`${lab!.baseUrl}/token`, { method: "POST", headers: { "content-type": "application/x-www-form-urlencoded" }, body: new URLSearchParams({ grant_type: "refresh_token", refresh_token: "nope", client_id: client }) })).status;
+    expect([await attempt("a"), await attempt("a"), await attempt("a")]).toEqual([400, 400, 429]);
+    expect(await attempt("b")).toBe(400);
+    await new Promise((r) => setTimeout(r, 200));
+    expect(await attempt("a")).toBe(400);
+  });
+});
