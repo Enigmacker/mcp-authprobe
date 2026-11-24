@@ -1,5 +1,6 @@
 import type { TestGrant } from "../credentials.js";
 import type { HttpClient } from "../net/http.js";
+import { registerSecret, safeErrorCode } from "../redact.js";
 
 /**
  * Minimal token endpoint client for the refresh_token grant.
@@ -26,6 +27,9 @@ function formEncode(params: Record<string, string>): string {
 }
 
 export async function refresh(http: HttpClient, tokenEndpoint: string, grant: TestGrant, refreshToken: string, resource?: string): Promise<RefreshOutcome> {
+  // Whatever is presented may come back in an error message: mask it everywhere.
+  registerSecret(refreshToken);
+  registerSecret(grant.clientSecret);
   const params: Record<string, string> = { grant_type: "refresh_token", refresh_token: refreshToken };
   if (resource) params["resource"] = resource;
   const headers: Record<string, string> = {
@@ -55,10 +59,12 @@ export async function refresh(http: HttpClient, tokenEndpoint: string, grant: Te
   const accessToken = body["access_token"];
   const newRefresh = body["refresh_token"];
   const error = body["error"];
+  registerSecret(typeof accessToken === "string" ? accessToken : null);
+  registerSecret(typeof newRefresh === "string" ? newRefresh : null);
 
   return {
     status: res.status,
-    error: typeof error === "string" ? error : null,
+    error: safeErrorCode(error),
     accessTokenIssued: res.status === 200 && typeof accessToken === "string" && accessToken.length > 0,
     accessToken: res.status === 200 && typeof accessToken === "string" && accessToken.length > 0 ? accessToken : null,
     refreshToken: typeof newRefresh === "string" && newRefresh.length > 0 ? newRefresh : null,
@@ -82,6 +88,9 @@ export async function exchangeCode(
   tokenEndpoint: string,
   params: { clientId: string; clientSecret?: string | null; code: string; codeVerifier?: string; redirectUri: string; resource?: string },
 ): Promise<CodeExchangeOutcome> {
+  registerSecret(params.code);
+  registerSecret(params.codeVerifier);
+  registerSecret(params.clientSecret);
   const form: Record<string, string> = {
     grant_type: "authorization_code",
     code: params.code,
@@ -107,9 +116,11 @@ export async function exchangeCode(
   const access = body["access_token"];
   const refreshToken = body["refresh_token"];
   const error = body["error"];
+  registerSecret(typeof access === "string" ? access : null);
+  registerSecret(typeof refreshToken === "string" ? refreshToken : null);
   return {
     status: res.status,
-    error: typeof error === "string" ? error : null,
+    error: safeErrorCode(error),
     accessTokenIssued: res.status === 200 && typeof access === "string" && access.length > 0,
     accessToken: res.status === 200 && typeof access === "string" && access.length > 0 ? access : null,
     refreshToken: typeof refreshToken === "string" && refreshToken.length > 0 ? refreshToken : null,

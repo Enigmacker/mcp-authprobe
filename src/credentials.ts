@@ -1,4 +1,5 @@
 import { closeSync, constants, fchmodSync, openSync, readFileSync, statSync, writeSync } from "node:fs";
+import { registerSecret } from "./redact.js";
 import type { Finding } from "./types.js";
 
 /**
@@ -82,6 +83,8 @@ export function parseGrant(raw: unknown): TestGrant {
   if (!AUTH_METHODS.includes(method as TokenEndpointAuthMethod)) {
     throw new Error(`Credentials file: token_endpoint_auth_method must be one of ${AUTH_METHODS.join(", ")}.`);
   }
+  registerSecret(refreshToken);
+  registerSecret(typeof secret === "string" ? secret : null);
   const grant: TestGrant = { clientId, refreshToken, authMethod: method as TokenEndpointAuthMethod };
   if (method !== "none") {
     if (typeof secret !== "string" || secret === "") throw new Error(`Credentials file: "client_secret" is required for ${String(method)}.`);

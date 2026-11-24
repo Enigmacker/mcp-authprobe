@@ -1,4 +1,5 @@
 import type { HttpClient } from "../net/http.js";
+import { registerSecret, safeErrorCode } from "../redact.js";
 
 /**
  * Dynamic Client Registration (RFC 7591) with cleanup (RFC 7592).
@@ -61,7 +62,7 @@ export async function registerClient(
   }
   const clientId = json["client_id"];
   const accepted = res.status >= 200 && res.status < 300 && typeof clientId === "string";
-  const error = typeof json["error"] === "string" ? (json["error"] as string) : null;
+  const error = safeErrorCode(json["error"]);
   const retryAfter = res.headers["retry-after"] !== undefined;
   if (!accepted) return { status: res.status, retryAfter, accepted: false, error, client: null };
 
@@ -69,6 +70,8 @@ export async function registerClient(
   const secret = json["client_secret"];
   const rcu = json["registration_client_uri"];
   const rat = json["registration_access_token"];
+  registerSecret(typeof secret === "string" ? secret : null);
+  registerSecret(typeof rat === "string" ? rat : null);
   return {
     status: res.status,
     retryAfter,

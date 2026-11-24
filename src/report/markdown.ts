@@ -1,8 +1,22 @@
 import { SEVERITY_ORDER, type Finding, type ScanReport } from "../types.js";
 
-function escapeCell(text: string): string {
-  return text.replace(/\|/g, "\\|").replace(/\r?\n/g, "<br>");
+/**
+ * Text for a Markdown table cell, or any inline position. Report text mixes
+ * the tool's words with server-controlled values, and the report is pasted
+ * into pull request comments and job summaries: nothing in it may become a
+ * link, an image, a mention, HTML or formatting.
+ */
+export function escapeMarkdown(text: string): string {
+  return text
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/@/g, "&#64;")
+    .replace(/[\\`*_[\]{}()#!|~]/g, "\\$&")
+    .replace(/\r?\n/g, "<br>");
 }
+
+const escapeCell = escapeMarkdown;
 
 const STATUS_LABEL: Record<Finding["status"], string> = {
   fail: "FAIL",
@@ -24,8 +38,8 @@ export function toMarkdown(report: ScanReport): string {
   const lines = [
     `# mcp-authprobe report`,
     ``,
-    `- **Target:** \`${report.target}\``,
-    `- **Ownership:** ${report.ownership.verified ? `verified (${report.ownership.method})` : "not verified"}: ${report.ownership.detail}`,
+    `- **Target:** \`${report.target.replace(/`/g, "%60")}\``,
+    `- **Ownership:** ${report.ownership.verified ? `verified (${escapeMarkdown(report.ownership.method ?? "")})` : "not verified"}: ${escapeMarkdown(report.ownership.detail)}`,
     `- **Started:** ${report.startedAt}`,
     `- **Tool:** ${report.tool.name} ${report.tool.version}`,
     `- **Failing checks:** ${failures}`,
@@ -40,20 +54,20 @@ export function toMarkdown(report: ScanReport): string {
   if (report.posture) {
     const p = report.posture;
     lines.push(
-      `## Passive results from ${p.tool.name} ${p.tool.version}`,
+      `## Passive results from ${escapeMarkdown(p.tool.name)} ${escapeMarkdown(p.tool.version)}`,
       ``,
-      `What the server announces (${p.tool.name}${p.generatedAt ? `, ${p.generatedAt}` : ""}) next to what it enforces (mcp-authprobe).`,
+      `What the server announces (${escapeMarkdown(p.tool.name)}${p.generatedAt ? `, ${escapeMarkdown(p.generatedAt)}` : ""}) next to what it enforces (mcp-authprobe).`,
       ``,
     );
     if (p.correlations.length > 0) {
       lines.push(`| Check | Relation | mcp-posture | Note |`, `| --- | --- | --- | --- |`);
-      for (const c of p.correlations) lines.push(`| ${c.checkId} | ${c.kind} | ${c.postureIds.join(", ") || "-"} | ${escapeCell(c.message)} |`);
+      for (const c of p.correlations) lines.push(`| ${c.checkId} | ${c.kind} | ${escapeCell(c.postureIds.join(", ")) || "-"} | ${escapeCell(c.message)} |`);
       lines.push(``);
     }
     if (p.findings.length > 0) {
       lines.push(`| Severity | mcp-posture check | Message |`, `| --- | --- | --- |`);
       for (const f of [...p.findings].sort((a, b) => SEVERITY_ORDER.indexOf(b.severity) - SEVERITY_ORDER.indexOf(a.severity))) {
-        lines.push(`| ${f.severity} | ${f.checkId} | ${escapeCell(f.message)} |`);
+        lines.push(`| ${f.severity} | ${escapeCell(f.checkId)} | ${escapeCell(f.message)} |`);
       }
       lines.push(``);
     }
