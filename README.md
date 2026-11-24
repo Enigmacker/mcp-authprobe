@@ -11,7 +11,7 @@ Passive scanners read what a remote [Model Context Protocol](https://modelcontex
 
 `mcp-authprobe` runs those active checks, against servers whose ownership you have proven, and reports the results as JSON, SARIF and Markdown.
 
-> **19 checks**, field-tested against a certified OpenID provider: OAuth discovery, refresh token rotation and replay, redirect URI strictness, PKCE enforcement, single-use codes, token audience, `Origin` validation, tokens in URLs, session IDs used as credentials, CORS, throttling and consent CSRF (in a real browser). It works as a CLI with an interactive `login`, as an MCP server so an AI assistant can run the audit, and as a GitHub Action. A deliberately vulnerable [lab](#try-it-in-a-minute-the-lab) lets you try everything in a minute.
+> **<!-- generated:checks-count -->21 checks<!-- /generated -->**, field-tested against a certified OpenID provider: OAuth discovery, refresh token rotation and replay, redirect URI strictness, PKCE enforcement, single-use codes, token audience, `Origin` validation, tokens in URLs, session IDs used as credentials, CORS, throttling and consent CSRF (in a real browser). It works as a CLI with an interactive `login`, as an MCP server so an AI assistant can run the audit, and as a GitHub Action. A deliberately vulnerable [lab](#try-it-in-a-minute-the-lab) lets you try everything in a minute.
 
 > **Only test servers you own or are explicitly authorized to test.** Active checks change state on the target. The tool enforces an ownership proof before running them, but responsibility stays with the operator.
 
@@ -221,7 +221,7 @@ mcp-authprobe login https://mcp.example.com/mcp --out ./test-grant.json
 - `login` itself does not require an ownership proof: it only does what any MCP client does when you connect it (one registration, your own browser login, one code exchange). Only the extra login checks below require the proof.
 - If login fails, the client it registered is deleted when the server allows it.
 
-**Seven checks are observed during login**, because they need a fresh authorization code or a valid access token. They run only when ownership of every contacted host is proven (`--no-probe` skips them), in this order:
+**<!-- generated:login-checks -->10 checks are observed during login (`MAP-PKC01`, `MAP-RDR03`, `MAP-ORG01`, `MAP-TOK01`, `MAP-SES01`, `MAP-BAT01`, `MAP-BOD01`, `MAP-INJ01`, `MAP-AUD01`, `MAP-COD01`)<!-- /generated -->**, because they need a fresh authorization code or a valid access token. They run only when ownership of every contacted host is proven (`--no-probe` skips them), in this order:
 
 | Check | What `login` does | Fails when |
 | --- | --- | --- |
@@ -232,6 +232,7 @@ mcp-authprobe login https://mcp.example.com/mcp --out ./test-grant.json
 | `MAP-TOK01` | Sends `initialize` with the token as `?access_token=` and no `Authorization` header, then the control again | The token in the URL is accepted (the MCP specification forbids it: URLs end up in logs, history and `Referer` headers). The token never appears in the report |
 | `MAP-SES01` | Opens an MCP session with its token, sends `ping` with the session ID and the token (control), then with the session ID only, and ends the session | The request without a token is processed. Not applicable to stateless servers that assign no session ID |
 | `MAP-AUD01` | Uses the refresh token to request a token for `https://other.mcp-authprobe.invalid/mcp` and presents it to your MCP endpoint (only after a successful control) | The MCP endpoint accepts a token whose audience is the other resource (read from a JWT `aud`). Passes when the authorization server answers `invalid_target`, or the MCP endpoint answers 401/403. When the token is opaque, or the authorization server ignored `resource` and issued a token for your server, the result is inconclusive with an explanation, because the MCP server cannot be blamed |
+| `MAP-BAT01`, `MAP-BOD01`, `MAP-INJ01` | With the access token, the same requests as with a static key: a JSON-RPC batch, two 6 MiB bodies, and a reading of the tool, prompt and resource metadata (see [Servers with a static API key](#servers-with-a-static-api-key)) | As in that section |
 | `MAP-COD01` | Presents the already used code a second time, then tries the newest refresh token once | The code is exchanged again. Revoking the tokens issued from a reused code (`invalid_grant` on that refresh) is reported as recommended; any other answer leaves revocation unknown |
 
 The results are stored in the grant file and reported by the next scan of the same target. The refresh token kept in the grant is always the newest one, so rotation during these probes does not break the scan. A network failure during a probe makes that check inconclusive; it never loses the grant or the other results.
@@ -267,7 +268,7 @@ Without rate limiting, refresh tokens, authorization codes and client secrets ca
 - It sends **10** token requests by default (`--throttle-attempts`, between **5 and 20**, hard-capped), **one at a time**.
 - Each request carries a **freshly generated random refresh token** that cannot be valid. Nothing is guessed, and **user passwords and login forms are never involved**. If the very first one gets a server error or `unsupported_grant_type` (a server without a working refresh grant), the check switches once to random authorization codes and starts counting again.
 - It uses your test client when a grant is supplied (your real refresh token is not sent), otherwise a temporary client that is deleted afterwards.
-- It stops at the first sign of throttling: HTTP 429, a `Retry-After` header, or an OAuth `slow_down` / `temporarily_unavailable` error.
+- It stops at the first sign of throttling: HTTP 429, a `Retry-After` header on a 4xx answer, or an OAuth `slow_down` / `temporarily_unavailable` error. A 5xx with `Retry-After` is an outage, not throttling: the result is then inconclusive. When the endpoint is already limiting at the very first request, the result says so: the limit exists, but this check did not trigger it.
 - It runs **last** in a scan, so a throttled token endpoint cannot disturb the other checks.
 
 A failure means no throttling was seen within the cap. Your limit may simply be higher than 20; the finding asks you to confirm that one exists.
@@ -365,29 +366,31 @@ In a container, `--allow-private` labs on your machine are not reachable as `127
 
 `mcp-authprobe checks list` prints the catalogue, and `mcp-authprobe checks show <ID>` explains a check: why it matters, how to fix it, and references. IDs are stable and never reused.
 
-| ID | Mode | Status | Check |
-| --- | --- | --- | --- |
-| `MAP-DSC01` | passive | available | Authorization endpoints are discoverable (401 challenge, RFC 9728, RFC 8414) |
-| `MAP-RTK01` | active | available | Refresh tokens for public clients are rotated |
-| `MAP-RTK02` | active | available | A rotated refresh token cannot be replayed |
-| `MAP-RTK03` | active | available | Refresh token replay revokes the token family |
-| `MAP-RDR01` | active | available | Unregistered `redirect_uri` is refused at the authorization endpoint |
-| `MAP-RDR02` | active | available | `redirect_uri` matching is exact, not prefix or pattern based |
-| `MAP-RDR03` | active | available (via `login`) | Token endpoint enforces the `redirect_uri` used at authorization |
-| `MAP-RDR04` | active | available | Dynamic client registration refuses unsafe redirect URIs |
-| `MAP-THR01` | active | available | Repeated failed token requests are throttled (5 to 20 sequential requests with random values) |
-| `MAP-CSR01` | active | available (via `consent-check`) | Consent decision is protected against CSRF |
-| `MAP-PKC01` | active | available (via `login`) | Token endpoint enforces PKCE (no `code_verifier`, wrong `code_verifier`) |
-| `MAP-COD01` | active | available (via `login`) | An authorization code cannot be used twice |
-| `MAP-AUD01` | active | available (via `login`) | Tokens are bound to their audience (RFC 8707) |
-| `MAP-ORG01` | passive | available | MCP endpoint rejects requests from a foreign, `null` or malformed `Origin` |
-| `MAP-TOK01` | active | available (via `login` or a static key) | MCP endpoint refuses access tokens and keys in the URL |
-| `MAP-SES01` | active | available (via `login` or a static key) | An MCP session ID is not accepted instead of a token |
-| `MAP-COR01` | passive | available | MCP endpoint does not allow credentialed requests from any origin (CORS) |
-| `MAP-BAT01` | active | available (via `login` or a static key) | MCP endpoint refuses JSON-RPC batches |
-| `MAP-BOD01` | active | available (via `login` or a static key) | MCP endpoint limits the request body size (6 MiB, with and without `Content-Length`) |
-| `MAP-THR02` | active | available (with a static key) | MCP endpoint rate-limits each credential (10 to 100 `ping` requests) |
-| `MAP-INJ01` | active | available (via `login`, a static key, or anonymous servers) | Tool, prompt and resource metadata carry no hidden instructions (tool poisoning) |
+<!-- generated:checks-table -->
+| ID | Severity | Mode | Runs with | Check |
+| --- | --- | --- | --- | --- |
+| `MAP-DSC01` | info | passive | every scan | Authorization endpoints are discoverable |
+| `MAP-RTK01` | high | active | a test grant (`--credentials-file`) | Refresh tokens for public clients are rotated |
+| `MAP-RTK02` | critical | active | a test grant (`--credentials-file`) | A rotated refresh token cannot be replayed |
+| `MAP-RTK03` | high | active | a test grant (`--credentials-file`) | Refresh token replay revokes the token family |
+| `MAP-RDR01` | critical | active | every scan with ownership proven | Unregistered redirect_uri is refused at the authorization endpoint |
+| `MAP-RDR02` | high | active | every scan with ownership proven | redirect_uri matching is exact, not prefix or pattern based |
+| `MAP-RDR03` | medium | active | `login` | Token endpoint enforces the redirect_uri used at authorization |
+| `MAP-RDR04` | high | active | every scan with ownership proven | Dynamic client registration refuses unsafe redirect URIs |
+| `MAP-PKC01` | high | active | `login` | Token endpoint enforces PKCE |
+| `MAP-COD01` | high | active | `login` | An authorization code cannot be used twice |
+| `MAP-AUD01` | high | active | `login` | Tokens are bound to their audience |
+| `MAP-ORG01` | medium | passive | every scan; with a credential through `login` or a static key | MCP endpoint rejects requests from a foreign Origin |
+| `MAP-TOK01` | medium | active | `login` or a static key | MCP endpoint refuses access tokens and keys in the URL |
+| `MAP-SES01` | high | active | `login` or a static key | An MCP session ID is not accepted instead of a token |
+| `MAP-COR01` | medium | passive | every scan | MCP endpoint does not allow credentialed requests from any origin |
+| `MAP-BAT01` | medium | active | `login` or a static key | MCP endpoint refuses JSON-RPC batches |
+| `MAP-BOD01` | low | active | `login` or a static key | MCP endpoint limits the request body size |
+| `MAP-INJ01` | high | active | `login`, a static key, or an anonymous server | Tool, prompt and resource metadata carry no hidden instructions |
+| `MAP-THR02` | low | active | a static key (`--bearer-file`) | MCP endpoint rate-limits each credential |
+| `MAP-THR01` | medium | active | every scan with ownership proven | Repeated failed token requests are throttled |
+| `MAP-CSR01` | high | active | `consent-check` | Consent decision is protected against cross-site request forgery |
+<!-- /generated -->
 
 Families: **DSC** discovery, **RTK** refresh tokens, **RDR** redirect URIs, **THR** throttling, **CSR** consent CSRF, **PKC** PKCE, **COD** authorization codes, **AUD** token audience, **ORG** Origin validation, **TOK** token transport, **SES** sessions, **COR** CORS, **BAT** batches, **BOD** body size, **INJ** prompt injection.
 
@@ -402,7 +405,7 @@ mcp-authprobe scan https://mcp.example.com/mcp --skip THR        # production: n
 mcp-authprobe scan https://mcp.example.com/mcp --only RDR02      # re-check one fix
 ```
 
-A check that is not selected sends **no request** and is listed as `skipped (not selected)`, so a report never suggests it passed. The three refresh token checks are one sequence: selecting any of them runs the three (the others are then reported as not selected), and skipping all three leaves the test grant untouched. The MCP server's `scan` tool takes the same `only` and `skip` arguments.
+A check that is not selected sends **no request** and is listed as `skipped (not selected)`, so a report never suggests it passed. The three refresh token checks are one sequence, and only the steps the selected checks need are sent: `--only RTK01` is a single refresh, which leaves the grant usable; `RTK02` adds the replay; `RTK03` adds the use of the newest token after the replay. When a selected check needs the request of an unselected one, that one is still listed as not selected, and says which request was sent. Skipping all three leaves the test grant untouched. The MCP server's `scan` tool takes the same `only` and `skip` arguments.
 
 ## Servers with a static API key
 
@@ -437,13 +440,15 @@ Use a dedicated test key: `MAP-THR02` may get it rate-limited for a few minutes.
 
 The client's model reads what a server says about itself (tool, prompt and resource descriptions, input schemas, the `instructions` of the `initialize` result) as trusted context. An instruction hidden there reaches every user of the server: this is *tool poisoning*, a prompt injection that needs no attacker in the conversation. It often arrives by accident, through a description generated from a third-party API or copied from a package.
 
-`MAP-INJ01` reads that metadata with the list methods only (`tools/list`, `prompts/list`, `resources/list`, `resources/templates/list`, at most 10 pages and 1,000 items each; nothing is called or read) and fails on:
+`MAP-INJ01` reads that metadata with the list methods only (`tools/list`, `prompts/list`, `resources/list`, `resources/templates/list`; nothing is called or read) and fails on:
 
 - **invisible characters:** Unicode tags (which can spell a whole hidden sentence; the scanner decodes them before matching), zero-width and bidi controls, ANSI escapes and other controls. Emoji sequences are fine;
 - **instruction-like text:** "ignore previous instructions", `<IMPORTANT>` and similar pseudo-tags, "do not tell the user", "without asking the user", paths such as `~/.ssh` or `mcp.json`, "you are now…";
 - **tool names with non-ASCII characters**, which can imitate another tool. Names outside the recommended format (1 to 128 of `A-Z a-z 0-9 _ - .`) are only noted.
 
 The report names where something matched and which pattern, **never the suspicious text itself**, so the report cannot carry the injection further, for instance into an assistant that runs the scanner through MCP. This is pattern matching, aimed at known idioms: a pass is not a proof, and a match is something to review.
+
+The reading is bounded: answers of up to 8 MiB, 10 pages and 1,000 items per list, 2,000 strings per item (the name, title and description always first). When a list the server announces could not be read in full (a larger answer, an error, a bound reached), the result is **inconclusive**, never a pass: a server must not be able to hide a description behind a large answer.
 
 It runs with the key (`--bearer-file`), during `login` with the access token, or, on a server that answers anonymous requests, without any credential once ownership is proven. The `vulnerable` and `static-bearer` lab profiles announce a poisoned tool, prompt and resource; the secure ones, clean ones.
 
@@ -492,7 +497,7 @@ The report must be mcp-posture's JSON (`schema_version` 1.x) and contain a resul
 | `0` | No failing check at or above `--fail-on` (default `high`) |
 | `1` | At least one failing check at or above `--fail-on` (or `ownership verify` failed) |
 | `2` | Usage error |
-| `3` | A check was inconclusive, or the target was unreachable. With `--fail-on-inconclusive false`, inconclusive checks no longer change the exit code; a scan that cannot run still exits 3 |
+| `3` | A check was inconclusive, or the target was unreachable. With `--fail-on-inconclusive false`, inconclusive checks no longer change the exit code; an unreachable target (no HTTP answer: the report says `"reachable": false` and one finding gives the cause, such as `ECONNREFUSED`) still exits 3 |
 
 All server-controlled text is neutralized before it reaches a report: terminal escape sequences, bidi overrides and invisible characters are escaped, and token-shaped values are redacted.
 
@@ -515,7 +520,7 @@ jobs:
   scan:
     runs-on: ubuntu-latest
     steps:
-      - uses: Enigmacker/mcp-authprobe@v0.10.1
+      - uses: Enigmacker/mcp-authprobe@v0.10.2
         with:
           url: https://staging.example.com/mcp
           secret: ${{ secrets.MCP_AUTHPROBE_SECRET }}
@@ -539,7 +544,7 @@ The results table is added to the job summary. The step fails when a check fails
 | `upload-sarif` | `false` | Upload the SARIF report to code scanning (needs `security-events: write`) |
 | `allow-private` | `false` | For a lab started in the same job only |
 | `node-version` | `22` | Node.js used to run the scanner |
-| `package` | this release | npm package spec to run, e.g. `mcp-authprobe@0.10.1` |
+| `package` | this release | npm package spec to run, e.g. `mcp-authprobe@0.10.2` |
 
 Both tools have an Action, so the passive and active views fit in one job:
 
@@ -549,7 +554,7 @@ Both tools have an Action, so the passive and active views fit in one job:
           targets: https://staging.example.com/mcp
           args: --json posture.json
           fail: false   # let the active scan run too; each tool reports its own findings
-      - uses: Enigmacker/mcp-authprobe@v0.10.1
+      - uses: Enigmacker/mcp-authprobe@v0.10.2
         with:
           url: https://staging.example.com/mcp
           secret: ${{ secrets.MCP_AUTHPROBE_SECRET }}
@@ -582,7 +587,7 @@ The scanner talks to servers that may be hostile, and it may be driven by an AI 
 
 - **Ownership gate:** no active request without a valid proof for every contacted host (the only exception is `login`, which behaves like an ordinary MCP client; see above).
 - **HTTPS only:** every request, including endpoints announced by a server's metadata, must use HTTPS. Plain HTTP is accepted only for loopback or private-address labs with `--allow-private`, so tokens and secrets never travel in cleartext over the internet.
-- **Inconclusive is never a pass:** rate limits (429, `Retry-After`) and server errors (5xx) make a check report `error`, never `pass`.
+- **Inconclusive is never a pass:** rate limits (429, `Retry-After`) and server errors (5xx) make a check report `error`, never `pass`; so does metadata that could not be read in full (`MAP-INJ01`). Checks that pass on a refusal send their control request again afterwards.
 - **SSRF protection:** loopback, private, link-local, CGNAT, multicast, reserved and cloud-metadata addresses are refused at connect time, after DNS resolution, unless `--allow-private` is passed.
 - **No automatic redirects:** every redirect is inspected, never followed blindly.
 - **Bounded resources:** per-request timeouts, response bodies capped at 1 MiB, no compression requested.

@@ -6,6 +6,31 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.10.2] - 2026-11-24
+
+Corrections only: wrong results, and gaps between the documentation and the tool. No option or report field is removed.
+
+### Fixed
+
+- **False passes on a rate limit.** `MAP-BAT01` and `MAP-BOD01` passed on any 4xx, so a 429 arriving at the right moment turned a server that runs batches and accepts 6 MiB bodies green. Every endpoint check now classifies answers the same way: 429, a `Retry-After` on an error and 5xx are inconclusive, never a refusal. Both checks send their control request again after the attempt, and only a JSON-RPC 2.0 error (`"jsonrpc": "2.0"`, numeric `error.code`) counts as a refused batch: any JSON object with an `error` key no longer does. `MAP-ORG01` and `MAP-TOK01` no longer take a 429 for a refusal either.
+- **False passes of `MAP-INJ01` on metadata it had not read.** A list answer larger than the 1 MiB response cap was cut, could not be parsed, and the check concluded "pass" with "read: 0 tool(s)"; an item with more than 200 strings was no longer inspected past the 200th, so a large schema could hide a poisoned description. List answers are now read up to 8 MiB, the name, title and description of every item are inspected first, up to 2,000 strings per item are read, and whenever a list the server announces was not read in full (larger answer, JSON-RPC error, page, item or string bound reached) the result is inconclusive with the reason.
+- **`--only RTK01` sent the replay and consumed the test grant.** Selecting one refresh token check ran the three steps. Only the steps the selected checks need are sent now: `RTK01` alone is one refresh, `RTK02` adds the replay, `RTK03` adds the use of the newest token. A check that is not selected but whose request a selected one needs says which request was sent.
+- **An unreachable target could exit 0** with `--fail-on-inconclusive false`, although the documentation said otherwise. The report now says `"reachable": false`, one finding gives the cause (`connection refused (ECONNREFUSED)`, `host not found (ENOTFOUND)`, a TLS error code, a timeout) instead of four "fetch failed", the other checks are listed as not run, and the exit code is 3 whatever the flag.
+- **Configuration mistakes reported as test results.** Plain `http` without `--allow-private`, a private address without it, a URL with credentials, an unwritable `--json`, `--sarif` or `--markdown` path: all are usage errors (exit 2) found before any request, and no longer after a scan that consumed the test grant.
+- **Opaque tokens in reports.** Only JWTs, `Bearer` values and a few parameter names were masked, so a server echoing the refresh token it was sent in its `error` member got it into the report. Every secret the tool loads or receives (ownership secret, test grant, client secret, access and refresh tokens, authorization code, registration access token) is now masked by exact value, and the `error` member of an OAuth answer is only copied when it looks like an error code. The `code` pattern no longer eats ordinary words ("unicode: …", "status code: 4001", JSON-RPC error codes).
+- **Markdown reports did not escape Markdown.** A server-controlled value could put a link, a mention, an image or HTML into a pull request comment or a job summary. Every inline value is escaped.
+- `--timeout` was documented for `login` and `consent-check` but ignored; it is applied and validated there and for `ownership verify`.
+- `checks show rtk02` is accepted, like `--only RTK02` and the MCP tool `explain_check`.
+- `MAP-THR01` counts a `Retry-After` on a 4xx as throttling, as documented, and says when the endpoint was already limiting at the very first request.
+- Checks that are observed during `login` no longer advise running `login` on a server without dynamic client registration, where it cannot work.
+- `MAP-BOD01` gives its two 6 MiB uploads a 60 s timeout instead of the per-request default.
+
+### Changed
+
+- The README's check table, check count and list of login checks are generated from the catalogue (`npm run docs`), and a test fails when they drift. The README said 19 checks (there are 21) and seven login checks (there are ten); the help listed two of the four lab profiles.
+- The published package no longer ships source maps that pointed at sources it does not contain.
+- `SECURITY.md` names the supported version correctly (the latest release).
+
 ## [0.10.1] - 2026-11-13
 
 ### Changed
@@ -145,7 +170,10 @@ First release.
 - Hardening from an independent review before release: HTTPS is required for every request outside loopback/private labs; rate limits and server errors make redirect URI, registration and throttling checks inconclusive instead of passing; test grants record their target and token endpoint and are never used elsewhere (and must name their target in MCP mode); loopback targets need a proof in MCP mode unless listed in `MCP_AUTHPROBE_LAB_ORIGINS`; `login` output is neutralized; more IPv6 transition ranges are refused; a malformed issuer no longer aborts discovery.
 - Local fixture server with a stateful token endpoint, dynamic registration and an authorization endpoint and test suite; GitHub Actions CI.
 
-[Unreleased]: https://github.com/Enigmacker/mcp-authprobe/compare/v0.9.0...HEAD
+[Unreleased]: https://github.com/Enigmacker/mcp-authprobe/compare/v0.10.2...HEAD
+[0.10.2]: https://github.com/Enigmacker/mcp-authprobe/compare/v0.10.1...v0.10.2
+[0.10.1]: https://github.com/Enigmacker/mcp-authprobe/compare/v0.10.0...v0.10.1
+[0.10.0]: https://github.com/Enigmacker/mcp-authprobe/compare/v0.9.0...v0.10.0
 [0.9.0]: https://github.com/Enigmacker/mcp-authprobe/compare/v0.8.0...v0.9.0
 [0.8.0]: https://github.com/Enigmacker/mcp-authprobe/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/Enigmacker/mcp-authprobe/compare/v0.6.0...v0.7.0

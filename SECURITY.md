@@ -6,7 +6,8 @@ Until 1.0, only the latest release (and `main`) receives security fixes.
 
 | Version | Supported |
 | --- | --- |
-| 0.1.x (development) | yes |
+| latest release on npm, and `main` | yes |
+| any earlier release | no: upgrade first |
 
 ## Reporting a vulnerability in mcp-authprobe
 
