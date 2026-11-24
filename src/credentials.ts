@@ -1,4 +1,4 @@
-import { closeSync, constants, fchmodSync, openSync, readFileSync, statSync, writeSync } from "node:fs";
+import { readSecretFile, SecretFileError, writeSecretFile } from "./secret-file.js";
 import { registerSecret } from "./redact.js";
 import type { Finding } from "./types.js";
 
@@ -40,6 +40,11 @@ export interface TestGrant {
  */
 export interface Observation extends Finding {
   observedAt: string;
+}
+
+/** Where an observation's result comes from (older grant files carry none: they were written by `login`). */
+export function observationSource(o: Observation): "login" | "consent-check" {
+  return o.source === "consent-check" ? "consent-check" : "login";
 }
 
 export interface LoadedGrant {
@@ -104,13 +109,17 @@ export function parseGrant(raw: unknown): TestGrant {
 }
 
 export function loadGrant(path: string): LoadedGrant {
-  const warnings: string[] = [];
-  if (process.platform !== "win32" && (statSync(path).mode & 0o077) !== 0) {
-    warnings.push(`Credentials file ${path} is readable by other users; restrict it with chmod 600.`);
+  let file: { text: string; warnings: string[] };
+  try {
+    file = readSecretFile(path, { label: "credentials file", maxBytes: 4 * 1024 * 1024, followLinks: true });
+  } catch (e) {
+    if (e instanceof SecretFileError) throw new Error(e.message);
+    throw e;
   }
+  const warnings = file.warnings.map((w) => `Credentials file ${w}`);
   let raw: unknown;
   try {
-    raw = JSON.parse(readFileSync(path, "utf8"));
+    raw = JSON.parse(file.text);
   } catch {
     // Never echo file content: it holds secrets.
     throw new Error(`Credentials file ${path} is not valid JSON.`);
@@ -126,8 +135,9 @@ export function loadGrant(path: string): LoadedGrant {
 }
 
 /**
- * Write a grant file with mode 600. Refuses to follow a symbolic link and,
- * unless `overwrite` is set, to replace an existing file.
+ * Write a grant file with mode 600, atomically (a new file, then a rename:
+ * an interruption never destroys the grant). Refuses to write through a
+ * symbolic link and, unless `overwrite` is set, to replace an existing file.
  */
 export function writeGrantFile(path: string, grant: TestGrant | null, observations: Observation[], overwrite = false): void {
   const data: Record<string, unknown> = {};
@@ -141,14 +151,5 @@ export function writeGrantFile(path: string, grant: TestGrant | null, observatio
   }
   if (observations.length > 0) data["observations"] = observations;
 
-  const nofollow = constants.O_NOFOLLOW ?? 0;
-  const flags = constants.O_WRONLY | constants.O_CREAT | nofollow | (overwrite ? constants.O_TRUNC : constants.O_EXCL);
-  const fd = openSync(path, flags, 0o600);
-  try {
-    // An overwritten file keeps its old mode: force 600.
-    if (process.platform !== "win32") fchmodSync(fd, 0o600);
-    writeSync(fd, `${JSON.stringify(data, null, 2)}\n`);
-  } finally {
-    closeSync(fd);
-  }
+  writeSecretFile(path, `${JSON.stringify(data, null, 2)}\n`, overwrite);
 }

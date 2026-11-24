@@ -1,6 +1,6 @@
-import { closeSync, fstatSync, openSync, readSync, constants } from "node:fs";
 import { bearerCredential, type Credential } from "./oauth/mcp-call.js";
 import { registerSecret } from "./redact.js";
+import { readSecretLine, SecretFileError } from "./secret-file.js";
 
 /**
  * Static API key for MCP servers authenticated without OAuth (`--bearer-file`).
@@ -24,33 +24,29 @@ export function validateHeaderName(name: string): string {
 }
 
 export function loadBearerFile(path: string, header = "authorization"): { credential: Credential; warnings: string[] } {
+  return loadCredentialFile(path, header, "static");
+}
+
+/**
+ * An OAuth access token for the MCP endpoint (`--access-token-file`): the
+ * same file rules as a static key, but reported as a token, and always sent
+ * as `Authorization: Bearer`.
+ */
+export function loadAccessTokenFile(path: string): { credential: Credential; warnings: string[] } {
+  return loadCredentialFile(path, "authorization", "oauth");
+}
+
+function loadCredentialFile(path: string, header: string, kind: Credential["kind"]): { credential: Credential; warnings: string[] } {
   const h = validateHeaderName(header);
-  const warnings: string[] = [];
-  let fd: number;
+  const label = kind === "static" ? "key file" : "access token file";
+  let loaded: { value: string; warnings: string[] };
   try {
-    fd = openSync(path, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
+    // Short values could not be redacted reliably and are not real keys.
+    loaded = readSecretLine(path, { label, maxBytes: MAX_KEY_BYTES, minLength: MIN_KEY_LENGTH });
   } catch (e) {
-    throw new StaticKeyError(`Cannot read the key file ${path}: ${(e as NodeJS.ErrnoException).code ?? "error"}.`);
+    if (e instanceof SecretFileError) throw new StaticKeyError(e.message);
+    throw e;
   }
-  let text: string;
-  try {
-    const st = fstatSync(fd);
-    if (!st.isFile()) throw new StaticKeyError(`${path} is not a regular file.`);
-    if (st.size > MAX_KEY_BYTES) throw new StaticKeyError(`${path} is larger than 8 KiB; expected one key.`);
-    if (process.platform !== "win32" && (st.mode & 0o077) !== 0) {
-      warnings.push(`${path} is readable by other users (mode ${(st.mode & 0o777).toString(8)}); chmod 600 it.`);
-    }
-    const buf = Buffer.alloc(st.size);
-    readSync(fd, buf, 0, st.size, 0);
-    text = buf.toString("utf8");
-  } finally {
-    closeSync(fd);
-  }
-  const key = text.trim();
-  if (!key) throw new StaticKeyError(`${path} is empty.`);
-  // Short values could not be redacted reliably and are not real keys.
-  if (key.length < MIN_KEY_LENGTH) throw new StaticKeyError(`${path} holds fewer than ${MIN_KEY_LENGTH} characters; expected an API key.`);
-  if (/[\s\u0000-\u001f\u007f]/.test(key)) throw new StaticKeyError(`${path} must contain one key on one line, without spaces.`);
-  registerSecret(key);
-  return { credential: bearerCredential(key, h, "static"), warnings };
+  registerSecret(loaded.value);
+  return { credential: bearerCredential(loaded.value, h, kind), warnings: loaded.warnings };
 }
